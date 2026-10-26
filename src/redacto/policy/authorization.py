@@ -34,7 +34,12 @@ def issue_approval(
         raise ValueError("plan_not_found")
     # EXECUTING is recoverable: a crashed apply may be re-approved with a new
     # single-use token. Per-action idempotency prevents duplicate work.
-    if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED", "EXECUTING"}:
+    if plan["state"] not in {
+        "READY_FOR_APPROVAL",
+        "APPROVED",
+        "EXECUTING",
+        "FAILED",
+    }:
         raise ValueError("plan_not_approvable")
     ref = approval_ref.strip()
     if not (MIN_APPROVAL_REF_LEN <= len(ref) <= MAX_APPROVAL_REF_LEN):

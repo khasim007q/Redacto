@@ -40,13 +40,12 @@ from redacto.status import collect_status
 TARGET_KINDS = {"source", "fact", "secret"}
 MODES = {"source_revocation", "fact_revocation"}
 TERMINAL_PLAN_STATES = {
-    # EXECUTING is deliberately not terminal: a crashed apply can be retried, and
-    # per-action idempotency keys make the retry safe.
+    # EXECUTING and FAILED are deliberately recoverable: a crashed or failed apply
+    # can be re-approved, and per-action keys make retries safe.
     "VERIFYING",
     "VERIFIED_WITHIN_SCOPE",
     "PARTIAL",
     "NEEDS_REVIEW",
-    "FAILED",
     "CANCELLED",
 }
 RELATION_TO_CLASS = {
@@ -802,16 +801,33 @@ class Engine:
         candidate_edges: dict[str, dict[str, Any]],
         enabled: bool,
     ) -> dict[str, Any]:
-        assessor = self.assessor()
-        provider_configured = assessor.model_id != "none"
+        try:
+            assessor = self.assessor()
+            model_id = assessor.model_id
+        except Exception as exc:  # a custom assessor must never break scan
+            assessor = None
+            model_id = "error"
+            assessor_error = f"assessor_unavailable:{type(exc).__name__}"
+        else:
+            assessor_error = None
+        provider_configured = model_id != "none"
         meta: dict[str, Any] = {
             "provider": self.settings.model_provider,
-            "model_id": assessor.model_id,
+            "model_id": model_id,
             "used": False,
             "assessed": 0,
             "unassessed": 0,
             "errors": {},
         }
+        if assessor_error is not None:
+            meta["provider_error"] = assessor_error
+            meta["detail"] = "Assessor could not be constructed; all candidates are unassessed."
+            meta["unassessed"] = sum(
+                1
+                for c in candidates.values()
+                if c["evidence_class"] in {classify.SUSPECTED_DERIVATIVE, classify.UNKNOWN}
+            )
+            return meta
         if not enabled or not provider_configured or target_kind == "secret":
             if target_kind == "secret":
                 meta["detail"] = (
@@ -850,7 +866,13 @@ class Engine:
             )
             for candidate in eligible
         ]
-        outcome = assessor.assess(contexts)
+        try:
+            outcome = assessor.assess(contexts)
+        except Exception as exc:  # custom/broken assessor: unassessed, never destructive
+            meta["provider_error"] = f"assessor_exception:{type(exc).__name__}"
+            meta["unassessed"] = len(eligible)
+            meta["errors"] = {c.candidate_id: "unassessed_provider_error" for c in contexts}
+            return meta
         meta["used"] = True
         meta["provider_error"] = outcome.provider_error
         meta["assessed"] = len(outcome.assessments)
@@ -1701,7 +1723,7 @@ class Engine:
     # --------------------------------------------------------------- approve
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
-        recovery = bool(plan and plan["state"] == "EXECUTING")
+        recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED"})
         try:
             issued = authorization.issue_approval(
                 self.repo, plan_id=plan_id, approval_ref=approval_ref, ttl_seconds=ttl_seconds
@@ -1884,6 +1906,12 @@ class Engine:
         plan = self.repo.get_plan(plan_id)
         if plan is None:
             raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
+        if plan["state"] == "CANCELLED":
+            raise RedactoError(
+                "plan_cancelled",
+                "This plan was cancelled and cannot be applied.",
+                {"plan_id": plan_id},
+            )
         if plan["state"] in TERMINAL_PLAN_STATES:
             return {
                 "ok": True,
@@ -1975,11 +2003,21 @@ class Engine:
             idempotency_key = f"{key_prefix}:{plan_id}:{item['item_id']}:{action}"
             existing = self.repo.get_action_by_key(idempotency_key)
             if existing is not None:
-                results.append(existing)
-                counts["succeeded" if existing["result"] == "success" else existing["result"]] = (
-                    counts.get(existing["result"], 0) + 1
-                )
-                continue
+                if existing["result"] == "failed":
+                    # A recovery apply retries failed actions. If the first attempt
+                    # actually mutated the record, the adapter reports not_found and
+                    # it is counted as already absent.
+                    self.repo.delete_action_by_key(idempotency_key)
+                    self.repo.set_item_state(item["item_id"], "planned")
+                else:
+                    results.append(existing)
+                    if existing["result"] == "success":
+                        counts["succeeded"] += 1
+                    elif existing["result"] == "already_absent":
+                        counts["already_absent"] += 1
+                    elif existing["result"] == "dry_run":
+                        counts["dry_run"] += 1
+                    continue
 
             record = self.repo.get_record(item["record_id"])
             started = now_iso()

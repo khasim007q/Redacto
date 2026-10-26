@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from redacto.adapters.base import AdapterError, StoreAdapter
 from redacto.config import Settings
+from redacto.errors import HmacKeyError
 
 
 @dataclass
@@ -31,7 +32,7 @@ def build_adapters(settings: Settings) -> dict[str, AdapterSlot]:
     def _add(adapter_id: str, factory) -> None:
         try:
             slots[adapter_id] = AdapterSlot(adapter_id, factory())
-        except AdapterError as exc:
+        except (AdapterError, HmacKeyError) as exc:
             slots[adapter_id] = AdapterSlot(adapter_id, None, str(exc))
 
     _add("filesystem", lambda: FilesystemAdapter(settings.workspace_root, settings.current_hmac_key))

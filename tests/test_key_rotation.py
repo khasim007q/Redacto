@@ -280,3 +280,27 @@ def test_related_version_is_in_use_for_retirement(tmp_path):
     with pytest.raises(RedactoError) as excinfo:
         engine_v2.keyring_report(retire_version=1)
     assert excinfo.value.code == "version_still_in_use"
+
+
+def test_broken_keyring_status_does_not_crash(tmp_path):
+    settings = seeded_settings(tmp_path)
+    broken = _rotate(settings, {1: OLD_KEY}, 2)  # current v2 missing
+    engine = Engine(broken)
+    status = engine.status(transport="test")
+    assert status["service"] == "redacto"
+    assert status["revocation"]["protection_degraded"] is True
+    assert status["revocation"]["current_key_version"] == 2
+    assert all(
+        adapter.get("reachable") is False or adapter.get("health", {}).get("reachable")
+        for adapter in status["adapters"]
+    )
+
+
+def test_non_canonical_key_versions_are_rejected(monkeypatch):
+    from redacto.config import load_settings
+
+    monkeypatch.setenv("REDACTO_HMAC_KEYS", '{"01": "a", "1": "b"}')
+    monkeypatch.setenv("REDACTO_HMAC_KEY_VERSION", "1")
+    settings = load_settings()
+    assert settings.keyring_error is not None
+    assert "canonical" in settings.keyring_error

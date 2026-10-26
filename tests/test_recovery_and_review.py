@@ -143,14 +143,14 @@ def test_cancel_plan_prevents_approval_and_apply(engine):
     with pytest.raises(RedactoError) as excinfo:
         engine.approve_plan(plan_id=plan["plan_id"], approval_ref="too-late")
     assert excinfo.value.code == "plan_not_approvable"
-    result = engine.apply(
-        plan_id=plan["plan_id"],
-        plan_version=plan["plan_version"],
-        approval_ref="too-late",
-        confirmation_token="none",
-    )
-    assert result["already_completed"] is True
-    assert result["plan_state"] == "CANCELLED"
+    with pytest.raises(RedactoError) as excinfo:
+        engine.apply(
+            plan_id=plan["plan_id"],
+            plan_version=plan["plan_version"],
+            approval_ref="too-late",
+            confirmation_token="none",
+        )
+    assert excinfo.value.code == "plan_cancelled"
 
 
 def test_all_actions_failing_marks_the_plan_failed(engine, monkeypatch):
@@ -222,3 +222,97 @@ def test_reviewing_an_item_invalidates_the_prior_approval(tmp_path):
             confirmation_token=before["confirmation_token"],
         )
     assert excinfo.value.code == "stale_plan"
+
+
+def test_failed_plan_can_be_reapproved_and_resumed(engine, monkeypatch):
+    from redacto.adapters.filesystem import FilesystemAdapter
+
+    original = FilesystemAdapter.delete_record
+    calls = {"count": 0}
+
+    def flaky(self, locator):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("crash before recording the action")
+        return original(self, locator)
+
+    monkeypatch.setattr(FilesystemAdapter, "delete_record", flaky)
+    plan = engine.plan(target_id=SOURCE_ID)
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="first")
+    with pytest.raises(RedactoError) as excinfo:
+        engine.apply(
+            plan_id=plan["plan_id"],
+            plan_version=plan["plan_version"],
+            approval_ref="first",
+            confirmation_token=approval["confirmation_token"],
+        )
+    assert excinfo.value.code == "apply_failed"
+    assert engine.repo.get_plan(plan["plan_id"])["state"] == "FAILED"
+
+    monkeypatch.setattr(FilesystemAdapter, "delete_record", original)
+    recovery = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
+    assert recovery["recovery"] is True
+    resumed = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="recovery",
+        confirmation_token=recovery["confirmation_token"],
+    )
+    assert resumed["counts"]["failed"] == 0
+    assert (
+        resumed["counts"]["succeeded"] + resumed["counts"]["already_absent"] == 7
+    )
+    assert resumed["plan_state"] == "VERIFYING"
+
+
+def test_recorded_failed_actions_are_retried_after_failed_plan(engine, monkeypatch):
+    from redacto.adapters.filesystem import FilesystemAdapter
+    from redacto.adapters.jsonl_logs import JsonlLogAdapter
+    from redacto.adapters.sqlite_store import SqliteMemoryAdapter
+    from redacto.adapters.vector_fixture import VectorFixtureAdapter
+
+    originals = {
+        "fs": FilesystemAdapter.delete_record,
+        "mem": SqliteMemoryAdapter.delete_record,
+        "cache": SqliteMemoryAdapter.invalidate_derived,
+        "log": JsonlLogAdapter.delete_record,
+        "vec": VectorFixtureAdapter.invalidate_derived,
+    }
+
+    def boom(*args, **kwargs):
+        raise AdapterError("simulated failure", code="delete_failed")
+
+    monkeypatch.setattr(FilesystemAdapter, "delete_record", boom)
+    monkeypatch.setattr(SqliteMemoryAdapter, "delete_record", boom)
+    monkeypatch.setattr(SqliteMemoryAdapter, "invalidate_derived", boom)
+    monkeypatch.setattr(JsonlLogAdapter, "delete_record", boom)
+    monkeypatch.setattr(VectorFixtureAdapter, "invalidate_derived", boom)
+
+    plan = engine.plan(target_id=SOURCE_ID)
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="first")
+    failed = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="first",
+        confirmation_token=approval["confirmation_token"],
+    )
+    assert failed["plan_state"] == "FAILED"
+    assert failed["counts"]["failed"] == 7
+
+    monkeypatch.setattr(FilesystemAdapter, "delete_record", originals["fs"])
+    monkeypatch.setattr(SqliteMemoryAdapter, "delete_record", originals["mem"])
+    monkeypatch.setattr(SqliteMemoryAdapter, "invalidate_derived", originals["cache"])
+    monkeypatch.setattr(JsonlLogAdapter, "delete_record", originals["log"])
+    monkeypatch.setattr(VectorFixtureAdapter, "invalidate_derived", originals["vec"])
+
+    recovery = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
+    resumed = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="recovery",
+        confirmation_token=recovery["confirmation_token"],
+    )
+    assert resumed["counts"]["failed"] == 0
+    assert (
+        resumed["counts"]["succeeded"] + resumed["counts"]["already_absent"] == 7
+    )

@@ -639,6 +639,12 @@ class Repository:
             conn.commit()
         return action_id
 
+    def delete_action_by_key(self, idempotency_key: str) -> None:
+        """Remove a failed action so a recovery apply can retry it."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM actions WHERE idempotency_key = ?", (idempotency_key,))
+            conn.commit()
+
     def actions_for_request(self, request_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(

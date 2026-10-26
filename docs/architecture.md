@@ -210,9 +210,10 @@ sequenceDiagram
   returns `already_completed` with the recorded results instead of repeating work.
 - **Single-use approvals**: the token is claimed with an atomic conditional update
   before the first mutation, so two concurrent applies cannot both win.
-- **Crash recovery**: an `EXECUTING` plan can be re-approved with a new token; completed
-  actions are skipped by idempotency. A plan can be `CANCELLED` before execution, and
-  `FAILED` is set when every approved action fails.
+- **Crash/failure recovery**: an `EXECUTING` or `FAILED` plan can be re-approved with a
+  new token; completed actions are skipped and failed action rows are cleared for a safe
+  retry. A plan can be `CANCELLED` before execution, and a cancelled plan cannot be
+  applied.
 - **Item review**: `review-item` rewrites a `REVIEW_REQUIRED` item to a concrete adapter
   action and bumps the plan version, so the changed plan needs a fresh token. Rejections
   are recorded without admitting the item.

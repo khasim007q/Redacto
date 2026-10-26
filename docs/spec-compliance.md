@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **150 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **156 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -319,7 +319,7 @@ Fixed after the readiness review:
 
 Fixed after the readiness/collateral review:
 
-- crashed `EXECUTING` plan recovery through re-approval;
+- crashed `EXECUTING` and failed `FAILED` plan recovery through re-approval;
 - `review-item` approval/rejection with plan-version bump and audit;
 - partial secret matches above 50% coverage auto-delete; below 50% are reviewable;
 - non-ASCII bearer headers return 401 instead of 500;

@@ -160,3 +160,19 @@ def test_stdio_client_rejects_out_of_scope_store(tmp_path):
     result = asyncio.run(_with_session(_env_for(settings), scenario))
     assert result["ok"] is False
     assert result["error"]["code"] == "out_of_scope_store"
+
+
+def test_status_survives_a_broken_key_ring(tmp_path):
+    settings = seeded_settings(tmp_path)
+    env = _env_for(settings)
+    env["REDACTO_HMAC_KEYS"] = '{"2": "rotated-only"}'
+    env["REDACTO_HMAC_KEY_VERSION"] = "1"
+
+    async def scenario(session: ClientSession):
+        return _payload(await session.call_tool("redacto_status", {}))
+
+    result = asyncio.run(_with_session(env, scenario))
+    assert result.get("ok") is not False
+    assert result["service"] == "redacto"
+    assert result["revocation"]["protection_degraded"] is True
+    assert result["revocation"]["keyring_error"]

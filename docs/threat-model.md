@@ -64,7 +64,12 @@ destructive or leaking component**.
 | T35 | A non-ASCII bearer header crashes the HTTP server | Header and token are compared as UTF-8 bytes; malformed headers return 401 | `test_non_ascii_bearer_is_rejected_not_a_500` |
 | T36 | Key rotation loses protection for old derivative fingerprints | Related fingerprints store their producing key version; the guard evaluates each version and fails closed if one is missing | `test_related_fingerprints_are_versioned_across_rotation`, `test_missing_related_key_version_fails_closed` |
 | T37 | An assessor exception escapes and breaks a scan | The assessor catches unexpected exceptions and returns unassessed; non-HTTP provider URLs are disabled | `test_assessor_unexpected_exception_is_unassessed`, `test_non_http_assessor_url_is_disabled` |
-| T38 | The model prompt receives the secret target | Only minimized candidate snippets are sent; a test captures the request and asserts the secret is absent | `test_assessor_request_never_contains_the_secret` |
+| T38 | The model prompt receives the secret target | Secret targets skip model assessment entirely; fact candidates use minimized snippets with long values masked | `test_assessor_request_never_contains_the_secret` |
+| T39 | A failed apply strands the revocation | FAILED plans can be re-approved; failed action rows are cleared and retried, while successful rows are skipped | `test_failed_plan_can_be_reapproved_and_resumed`, `test_recorded_failed_actions_are_retried_after_failed_plan` |
+| T40 | A cancelled plan can still be applied | Apply rejects CANCELLED with `plan_cancelled` instead of reporting already applied | `test_cancel_plan_prevents_approval_and_apply` |
+| T41 | A broken key ring crashes status | Adapter construction catches keyring errors; status reports `protection_degraded` and the MCP status tool returns structured data | `test_status_survives_a_broken_key_ring`, `test_broken_keyring_status_does_not_crash` |
+| T42 | Non-canonical key versions collide | Key versions must be canonical integers; leading zeros/signs and duplicate versions are rejected | `test_non_canonical_key_versions_are_rejected` |
+| T43 | A raising custom assessor breaks a scan | Assessor construction and invocation are both guarded; failures become `unassessed` | `test_engine_guards_a_raising_custom_assessor` |
 
 ## Residual risks (accepted, disclosed)
 

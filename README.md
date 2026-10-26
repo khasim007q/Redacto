@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 150 automated tests pass (`pytest`).
+- 156 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -204,8 +204,10 @@ Full diagrams (component flow, ER model, revocation sequence) are in
   candidates. It is not exposed as an MCP tool.
 - **Plan states**: `READY_FOR_APPROVAL -> APPROVED -> EXECUTING -> VERIFYING` then
   `VERIFIED_WITHIN_SCOPE`, `PARTIAL` or `NEEDS_REVIEW`. `EXECUTING` is set before the
-  first mutation. `CANCELLED` is available before execution and `FAILED` is set when
-  every approved action fails. There is no editable `DRAFT` stage.
+  first mutation. `CANCELLED` is available before execution and cannot be applied.
+  `FAILED` is set when every approved action fails; a FAILED plan can be re-approved
+  and retried, with failed action rows cleared for a safe retry. There is no editable
+  `DRAFT` stage.
 - **Recovery**: a crashed `EXECUTING` plan can be re-approved with a new single-use
   token; completed actions are skipped by idempotency.
 - **Item review**: `review-item` is an application action. Approving rewrites the item
@@ -251,8 +253,9 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Failures are never reported as success: adapter errors produce per-record failures
   and a `PARTIAL` result.
 - Approval consumption is atomic: one token cannot authorize two concurrent applies.
-- A crashed apply is recoverable: re-approving an `EXECUTING` plan issues a new token,
-  and completed actions are skipped by idempotency.
+- A crashed or failed apply is recoverable: re-approving an `EXECUTING`/`FAILED` plan
+  issues a new token; completed actions are skipped and failed actions are retried.
+  A cancelled plan cannot be applied.
 - Plan item reviews are audited; approving one bumps the plan version and invalidates
   the old token.
 - JSONL event identity is stable even without `event_id` (keyed line hash), and
@@ -279,7 +282,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-150 passed in 43.55s
+156 passed in 45.98s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -397,8 +400,9 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 - Quarantine approval is a human/application action; approving an uncertain record
   overrides uncertainty, but can never override a hard tombstone block.
 - Model assessment is unbenchmarked in this MVP and advisory only.
-- No editable `DRAFT` plan stage. `CANCELLED` is available before execution and
-  `FAILED` when every approved action fails; a partially successful plan is `PARTIAL`.
+- No editable `DRAFT` plan stage. `CANCELLED` is available before execution,
+  `FAILED` when every approved action fails (and is retryable), and `PARTIAL` when only
+  some actions fail.
 - `find_exact` is implemented centrally in discovery rather than per adapter, and
   `REDACT_SPAN`/regeneration have no supported adapter yet.
 - Partial matches below half the record are reviewed rather than redacted in place; a

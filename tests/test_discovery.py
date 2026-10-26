@@ -251,3 +251,30 @@ def test_non_http_assessor_url_is_disabled():
         provider="openai_compatible", base_url="file:///etc/passwd", model="x"
     )
     assert assessor.model_id == "none"
+
+
+def test_engine_guards_a_raising_custom_assessor(tmp_path, monkeypatch):
+    from helpers import seeded_settings
+    from redacto.engine import Engine
+    from redacto.fixtures import SOURCE_ID
+
+    class RaisingAssessor:
+        model_id = "raising-model"
+
+        def assess(self, candidates):
+            raise RuntimeError("custom assessor exploded")
+
+    settings = seeded_settings(
+        tmp_path,
+        model_provider="openai_compatible",
+        model_base_url="http://127.0.0.1:9/v1",
+        model_name="raising-model",
+    )
+    engine = Engine(settings)
+    monkeypatch.setattr(engine, "assessor", lambda: RaisingAssessor())
+    result = engine.scan(target_id=SOURCE_ID)
+    assert result["model"]["assessed"] == 0
+    assert result["model"]["provider_error"].startswith("assessor_exception")
+    assert result["model"]["unassessed"] >= 1
+    # No destructive escalation from a broken assessor.
+    assert all(c["approved"] is False for c in result["candidates"] if c["candidate_only"])
