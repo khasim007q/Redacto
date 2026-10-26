@@ -1,0 +1,11 @@
+{
+  "name": "redacto",
+  "version": "0.1.0",
+  "description": "Provenance-aware revocation engine for AI context: scan, trace, plan, approve, apply, verify, tombstones and quarantine.",
+  "author": {
+    "name": "Khasim Quadri"
+  },
+  "homepage": "https://github.com/khasim007q/Redacto",
+  "repository": "https://github.com/khasim007q/Redacto",
+  "keywords": ["mcp", "privacy", "revocation", "provenance", "redaction"]
+}

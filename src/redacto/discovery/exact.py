@@ -14,6 +14,8 @@ from redacto.adapters.base import Record
 from redacto.discovery.normalization import normalize_loose, variants
 
 MIN_SUBSTRING_LEN = 8
+MIN_COMPACT_SECRET_LEN = 12
+_COMPACT_SEPARATORS = re.compile(r"[\s\-_.]+")
 
 _ENTITY_PHRASE = re.compile(r"\b[A-Z][a-zA-Z0-9&'\-]*(?:\s+[A-Z][a-zA-Z0-9&'\-]*){1,3}\b")
 _ENTITY_STOPWORDS = {
@@ -41,7 +43,7 @@ class ExactMatch:
 
     @property
     def is_partial(self) -> bool:
-        return self.kind == "normalized_variant" and self.record_chars > 0
+        return self.kind in {"normalized_variant", "compact_variant"} and self.record_chars > 0
 
 
 class ExactMatcher:
@@ -62,6 +64,8 @@ class ExactMatcher:
             for value in variants(target_text)
             if len(normalize_loose(value)) >= MIN_SUBSTRING_LEN
         ]
+        compact = _COMPACT_SEPARATORS.sub("", target_text).casefold()
+        self._compact = compact if len(compact) >= MIN_COMPACT_SECRET_LEN else ""
 
     def match(self, record: Record) -> ExactMatch | None:
         length = len(record.content)
@@ -83,6 +87,15 @@ class ExactMatcher:
                         len(variant),
                         length,
                     )
+        if self._target_kind == "secret" and self._compact:
+            compact_record = _COMPACT_SEPARATORS.sub("", record.content).casefold()
+            if self._compact in compact_record:
+                return ExactMatch(
+                    "compact_variant",
+                    "Contains a separator-insensitive variant of the secret.",
+                    len(self._compact),
+                    length,
+                )
         return None
 
 

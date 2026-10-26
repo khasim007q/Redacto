@@ -177,3 +177,77 @@ def test_valid_model_output_stays_a_candidate(tmp_path, monkeypatch):
     assert candidate["evidence_class"] != "CONFIRMED_DESCENDANT"
     assert candidate["approved"] is False
     assert result["model"]["assessed"] == 1
+
+
+def test_spaced_secret_is_detected_by_compact_variant():
+    secret = "sk-test-ABCDEF123456"
+    spaced = "s k - t e s t - A B C D E F 1 2 3 4 5 6"
+    matcher = ExactMatcher(
+        target_text=secret,
+        target_record_id="secret:1",
+        target_locator={"id": "1"},
+        target_kind="secret",
+    )
+    match = matcher.match(_record(spaced))
+    assert match is not None
+    assert match.kind == "compact_variant"
+
+
+def test_spaced_secret_file_is_a_direct_match(tmp_path):
+    from helpers import seeded_settings
+    from redacto.engine import Engine
+    from redacto.fixtures import SOURCE_ID
+
+    settings = seeded_settings(tmp_path)
+    secret = "sk-test-ABCDEF123456"
+    (settings.workspace_root / "leak.txt").write_text(
+        "key: s k - t e s t - A B C D E F 1 2 3 4 5 6\n", encoding="utf-8"
+    )
+    plan = Engine(settings).plan(
+        target_id=SOURCE_ID, target_kind="secret", target_text=secret, mode="fact_revocation"
+    )
+    item = next(i for i in plan["items"] if i["record_id"] == "fs:leak.txt")
+    assert item["evidence_class"] == "DIRECT_MATCH"
+    assert item["match_kind"] == "compact_variant"
+
+
+def test_assessor_unexpected_exception_is_unassessed(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected transport failure")
+
+    monkeypatch.setattr(ra.httpx, "post", boom)
+    engine = Engine(_fake_settings(tmp_path))
+    result = engine.scan(target_id=SOURCE_ID)
+    assert result["model"]["assessed"] == 0
+    assert result["model"]["provider_error"].startswith("unexpected_provider_error")
+    assert result["model"]["unassessed"] >= 1
+
+
+def test_assessor_request_never_contains_the_secret(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": json.dumps({"assessments": []})}}]}
+
+    def capture(*args, **kwargs):
+        captured["body"] = json.dumps(kwargs.get("json", {}))
+        return FakeResponse()
+
+    monkeypatch.setattr(ra.httpx, "post", capture)
+    secret = "sk-synthetic-NEVER-IN-PROMPT-9876543210"
+    engine = Engine(_fake_settings(tmp_path))
+    result = engine.scan(target_id=SOURCE_ID, target_kind="secret", target_text=secret)
+    # Secret targets skip model assessment entirely.
+    assert not captured
+    assert "skipped for secret targets" in result["model"]["detail"]
+
+
+def test_non_http_assessor_url_is_disabled():
+    assessor = ra.build_assessor(
+        provider="openai_compatible", base_url="file:///etc/passwd", model="x"
+    )
+    assert assessor.model_id == "none"

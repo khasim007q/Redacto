@@ -20,14 +20,19 @@ def test_runtime_dependencies_include_http_clients_and_server():
 
 def test_plugin_manifests_are_valid_and_point_at_the_stdio_server():
     mcp = json.loads((ROOT / ".mcp.json").read_text(encoding="utf-8"))
-    plugin = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+    plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     server = mcp["mcpServers"]["redacto"]
-    assert server["args"] == ["-m", "redacto.mcp.stdio_server"]
-    assert server["cwd"] == "."
-    assert "REDACTO_WORKSPACE_ROOT" in server["env"]
-    assert plugin["skills"] == ["skills/redacto"]
-    assert plugin["mcp"]["config"] == ".mcp.json"
+    assert server["args"][-2:] == ["-m", "redacto.mcp.stdio_server"]
+    # cwd is not a supported stdio MCP field in Claude Code; every path is absolute.
+    assert "cwd" not in server
+    assert server["env"]["REDACTO_WORKSPACE_ROOT"].startswith("${CLAUDE_PLUGIN_ROOT}/")
+    assert server["env"]["REDACTO_DB_PATH"].startswith("${CLAUDE_PLUGIN_DATA}/")
+    assert server["env"]["UV_PROJECT_ENVIRONMENT"].startswith("${CLAUDE_PLUGIN_DATA}/")
+    assert plugin["name"] == "redacto"
+    assert plugin["version"] == "0.1.0"
     assert (ROOT / "skills" / "redacto" / "SKILL.md").is_file()
+    # The custom root-level manifest was replaced by the standard plugin layout.
+    assert not (ROOT / "plugin.json").exists()
 
 
 def test_ci_covers_linux_and_windows_and_runtime_install():

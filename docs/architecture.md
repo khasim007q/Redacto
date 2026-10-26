@@ -210,12 +210,19 @@ sequenceDiagram
   returns `already_completed` with the recorded results instead of repeating work.
 - **Single-use approvals**: the token is claimed with an atomic conditional update
   before the first mutation, so two concurrent applies cannot both win.
+- **Crash recovery**: an `EXECUTING` plan can be re-approved with a new token; completed
+  actions are skipped by idempotency. A plan can be `CANCELLED` before execution, and
+  `FAILED` is set when every approved action fails.
+- **Item review**: `review-item` rewrites a `REVIEW_REQUIRED` item to a concrete adapter
+  action and bumps the plan version, so the changed plan needs a fresh token. Rejections
+  are recorded without admitting the item.
 - **Capacity honesty**: stores are asked for `limit + 1`; a full extra record marks
   the store `truncated`. Scan reports it and verification returns `not_verifiable`
   rather than claiming absence for unscanned records.
 - **Blast radius**: plan items carry `size_bytes`, `matched_bytes`, `match_ratio`,
-  `match_kind`, `partial_match` and a collateral note. Substring matches are
-  review-only; low overlap raises risk to high. Source scans also detect shared
+  `match_kind`, `partial_match` and a collateral note. Substring matches below half the
+  record are review-only; above half the normal delete path applies. Low overlap raises
+  risk to high. Source scans also detect shared
   8-word passages and raise them as suspected derivatives.
 - **Verification**: rescan reachable in-scope stores, check planned record IDs and
   the keyed whole-target fingerprint, and report residuals. Unreachable stores are

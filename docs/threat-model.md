@@ -58,6 +58,13 @@ destructive or leaking component**.
 | T29 | Scan/verify silently stop at the record cap and claim clean | Stores that reach the cap are marked `truncated`; verification becomes `not_verifiable` and the receipt is `PARTIAL` | `test_scan_reports_stores_cut_off_by_the_record_cap`, `test_verification_is_partial_when_the_record_cap_is_reached` |
 | T30 | A tiny match deletes a mostly useful record | Plans expose size/match share/risk; substring matches are review-only; low overlap raises risk to high | `tests/test_hardening_collateral.py` |
 | T31 | A verbatim leak is labelled non-disclosing | Source scans detect 8-word shared passages and classify them as suspected derivatives for review | `test_verbatim_sentence_inside_other_notes_is_never_nondisclosing` |
+| T32 | A crashed apply is unrecoverable because its token was consumed | Re-approving an `EXECUTING` plan issues a new single-use token; completed actions are skipped by idempotency | `test_crashed_executing_plan_can_be_reapproved_and_resumed` |
+| T33 | A review item can never be actioned, so a leaked key survives | `review-item` is an application action that rewrites the item to a concrete action and bumps the plan version for fresh approval | `test_review_item_approval_requires_a_new_plan_version_and_token`, `test_review_item_rejection_keeps_the_item_unapproved` |
+| T34 | Spacing a secret evades exact matching | Secrets also match a separator-insensitive compact variant; the match remains review/delete by coverage, never automatic approval of unrelated content | `test_spaced_secret_is_detected_by_compact_variant`, `test_spaced_secret_file_is_a_direct_match` |
+| T35 | A non-ASCII bearer header crashes the HTTP server | Header and token are compared as UTF-8 bytes; malformed headers return 401 | `test_non_ascii_bearer_is_rejected_not_a_500` |
+| T36 | Key rotation loses protection for old derivative fingerprints | Related fingerprints store their producing key version; the guard evaluates each version and fails closed if one is missing | `test_related_fingerprints_are_versioned_across_rotation`, `test_missing_related_key_version_fails_closed` |
+| T37 | An assessor exception escapes and breaks a scan | The assessor catches unexpected exceptions and returns unassessed; non-HTTP provider URLs are disabled | `test_assessor_unexpected_exception_is_unassessed`, `test_non_http_assessor_url_is_disabled` |
+| T38 | The model prompt receives the secret target | Only minimized candidate snippets are sent; a test captures the request and asserts the secret is absent | `test_assessor_request_never_contains_the_secret` |
 
 ## Residual risks (accepted, disclosed)
 

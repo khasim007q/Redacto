@@ -45,14 +45,16 @@ tombstone with its own version's key. New tombstones use the current version.
    the v1 key. Run `redacto keyring`; both versions may show active tombstones.
 
 3. **Wait** until every v1 tombstone is retired. A tombstone is retired when you
-   decide its retention period is over (there is no automatic expiry yet). Then:
+   decide its retention period is over (there is no automatic expiry yet). The
+   current key version can never be retired. Then:
 
    ```powershell
    redacto keyring --retire 1
    ```
 
    If any active tombstone still references version 1, the command refuses with
-   `version_still_in_use`. If it succeeds, `retirable_versions` includes 1.
+   `version_still_in_use`. If version 1 is the current version, it refuses with
+   `current_version_in_use`. If it succeeds, `retirable_versions` includes 1.
 
 4. **Remove** the old key from `REDACTO_HMAC_KEYS` and restart. Removing a version
    that no active tombstone references is safe.
@@ -74,6 +76,9 @@ tombstone with its own version's key. New tombstones use the current version.
 ## What rotation does **not** do
 
 - It does not re-derive old tombstones. They remain bound to their original version.
+- Related derivative fingerprints are stored with the version that produced them, so
+  a tombstone created after rotation can still block a derivative fingerprinted under
+  an older version.
 - It does not delete or expire tombstones. Retention is a policy decision and a
   future feature; until then, old keys must remain available.
 - It does not rotate store encryption or adapter credentials.

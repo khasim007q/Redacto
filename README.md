@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 131 automated tests pass (`pytest`).
+- 150 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -66,6 +66,8 @@ python -m redacto trace  --source-id "fs:acquisition-plan.md"
 python -m redacto scan   --target-id "fs:acquisition-plan.md"
 python -m redacto plan   --target-id "fs:acquisition-plan.md"
 python -m redacto approve --plan-id <PLAN_ID> --ref "operator approval"
+python -m redacto review-item --plan-id <PLAN_ID> --item-id <ITEM_ID> --decision approved|rejected --reviewer "reviewer-id"
+python -m redacto cancel --plan-id <PLAN_ID> --reason "operator stopped"
 python -m redacto apply  --plan-id <PLAN_ID> --version 1 --ref "operator approval" --token <TOKEN> [--dry-run]
 python -m redacto verify --request-id <REQUEST_ID> --out var\receipt.json --markdown var\receipt.md
 python -m redacto tombstones                       # active tombstones, no content
@@ -125,9 +127,14 @@ relative to whatever folder the client launches it from and sees no stores. Repl
 client's PATH, use the absolute interpreter path plus `-m redacto.mcp.stdio_server`
 and keep the same `cwd`/`env`.
 
-The repo also ships `.mcp.json` and a repo-local `plugin.json` (MCP command plus the
-`skills/redacto` wiring) for clients that load a plugin manifest. Validate the
-manifest against your client's schema; it is not an Alan-marketplace listing.
+The repo also ships a Claude Code style plugin layout: `.claude-plugin/plugin.json`
+plus `.mcp.json`. The MCP entry uses `${CLAUDE_PLUGIN_ROOT}` for every store path and
+`uv run --project`, so it does not depend on the shell's working directory. `uv` must
+be installed. `cwd` is deliberately absent: it is not a supported stdio MCP field.
+The graph database is written under `${CLAUDE_PLUGIN_DATA}`, not the read-only plugin
+root; point `REDACTO_WORKSPACE_ROOT` at your own data for real use.
+This layout is **not verified against Alan's plugin format**; for Alan, register the
+connector manually with the stdio or HTTP configuration above.
 
 Streamable HTTP (for connectors that expect a URL). A bearer token is mandatory:
 
@@ -195,9 +202,15 @@ Full diagrams (component flow, ER model, revocation sequence) are in
 - **Lineage hook**: `Engine.record_lineage` is internal-only. Instrumented, imported
   or human-verified evidence can confirm an edge; model/heuristic claims become
   candidates. It is not exposed as an MCP tool.
-- **Plan states**: `READY_FOR_APPROVAL ? APPROVED ? EXECUTING ? VERIFYING` then
+- **Plan states**: `READY_FOR_APPROVAL -> APPROVED -> EXECUTING -> VERIFYING` then
   `VERIFIED_WITHIN_SCOPE`, `PARTIAL` or `NEEDS_REVIEW`. `EXECUTING` is set before the
-  first mutation. There is no editable `DRAFT` stage in the MVP.
+  first mutation. `CANCELLED` is available before execution and `FAILED` is set when
+  every approved action fails. There is no editable `DRAFT` stage.
+- **Recovery**: a crashed `EXECUTING` plan can be re-approved with a new single-use
+  token; completed actions are skipped by idempotency.
+- **Item review**: `review-item` is an application action. Approving rewrites the item
+  to a concrete adapter action and bumps the plan version, so a fresh token is needed.
+  Rejecting leaves the item unapproved. Both decisions are audited.
 - **Action vocabulary**: `DELETE_RECORD`, `INVALIDATE_INDEX`, `INVALIDATE_CACHE`,
   `REVIEW_REQUIRED`, `SKIP_PRESERVE`, `UNREACHABLE` are exercised. `REDACT_SPAN` and
   `REGENERATE_FROM_ALLOWED_SOURCES` are defined but unsupported by current adapters.
@@ -238,6 +251,10 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Failures are never reported as success: adapter errors produce per-record failures
   and a `PARTIAL` result.
 - Approval consumption is atomic: one token cannot authorize two concurrent applies.
+- A crashed apply is recoverable: re-approving an `EXECUTING` plan issues a new token,
+  and completed actions are skipped by idempotency.
+- Plan item reviews are audited; approving one bumps the plan version and invalidates
+  the old token.
 - JSONL event identity is stable even without `event_id` (keyed line hash), and
   malformed lines are matched by that identity rather than a shifted line number.
 - Record-cap truncation is reported in scan coverage and verification; absence is not
@@ -262,7 +279,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-131 passed in 40.83s
+150 passed in 43.55s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -297,8 +314,11 @@ These are fixture-level engineering targets, not production accuracy claims.
 - **Blast radius:** every plan item carries `size_bytes`, `matched_bytes`,
   `match_ratio`, `match_kind`, `partial_match` and a `collateral_note`. Approved
   actions whose match covers less than 34% of the record are marked `risk: high`.
-- **Partial matches:** a fact/secret found as a substring of a larger record is
-  `REVIEW_REQUIRED`, not an automatic delete. Whole-copy matches keep the normal path.
+- **Partial matches:** a fact/secret found as a substring covering less than half of a
+  record is `REVIEW_REQUIRED`. At or above half, the normal delete path still applies,
+  so a leaked key that dominates its record is removable. Reviewers can approve or
+  reject a review item with `review-item`; approval bumps the plan version and requires
+  a new token.
 - **Buried verbatim copies:** source-mode scans compare 8-word shingles against the
   target. A record quoting a target passage inside other notes becomes
   `SUSPECTED_DERIVATIVE` for review, never `RELATED_NONDISCLOSING`.
@@ -377,12 +397,12 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 - Quarantine approval is a human/application action; approving an uncertain record
   overrides uncertainty, but can never override a hard tombstone block.
 - Model assessment is unbenchmarked in this MVP and advisory only.
-- No editable `DRAFT` plan stage and no user-facing `CANCELLED`/`FAILED` transition;
-  exceptional outcomes are expressed through `PARTIAL`/`NEEDS_REVIEW`.
+- No editable `DRAFT` plan stage. `CANCELLED` is available before execution and
+  `FAILED` when every approved action fails; a partially successful plan is `PARTIAL`.
 - `find_exact` is implemented centrally in discovery rather than per adapter, and
   `REDACT_SPAN`/regeneration have no supported adapter yet.
-- Partial matches are reviewed rather than redacted in place; a reviewer still chooses
-  whole-record deletion or rejection. There is no undo/trash window yet.
+- Partial matches below half the record are reviewed rather than redacted in place; a
+  reviewer chooses whole-record deletion or rejection. There is no undo/trash window yet.
 - The plan flags collateral risk but does not automatically regenerate a descendant
   from its other parents (option 6 in the review).
 - Two revocation modes exist in code; **source revocation** is the tested path.
@@ -402,7 +422,8 @@ src/redacto/
   adapters/    base.py registry.py filesystem.py sqlite_store.py jsonl_logs.py vector_fixture.py
   mcp/         server.py stdio_server.py http_server.py
 skills/redacto/SKILL.md
-.mcp.json      plugin.json
+.claude-plugin/plugin.json
+.mcp.json
 .github/workflows/ci.yml
 scripts/       mcp_smoke.py mcp_http_smoke.py
 fixtures/      workspace/ expected_results.json
@@ -410,6 +431,7 @@ tests/         test_graph.py test_discovery.py test_policy.py test_execution.py
                test_verification.py test_security.py test_mcp_tools.py test_transport.py
                test_tombstones.py test_quarantine.py test_key_rotation.py test_embeddings.py
                test_evaluation.py test_jsonl.py test_hardening_collateral.py
+               test_recovery_and_review.py test_packaging.py
 docs/          architecture.md threat-model.md demo-script.md key-rotation.md
                spec-compliance.md
 ```

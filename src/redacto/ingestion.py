@@ -248,13 +248,13 @@ class TombstoneGuard:
         self._current = int(current_version)
         self._embedder = embedder
         self._embedding_threshold = embedding_threshold
-        self._missing_versions = sorted(
-            {
-                int(tombstone.get("key_version") or 1)
-                for tombstone in self._tombstones
-                if int(tombstone.get("key_version") or 1) not in self._keyring
-            }
-        )
+        required_versions: set[int] = set()
+        for tombstone in self._tombstones:
+            required_versions.add(int(tombstone.get("key_version") or 1))
+            for entry in tombstone.get("related_fingerprints", []):
+                if isinstance(entry, dict) and entry.get("version"):
+                    required_versions.add(int(entry["version"]))
+        self._missing_versions = sorted(v for v in required_versions if v not in self._keyring)
 
     @classmethod
     def from_repo(
@@ -297,9 +297,13 @@ class TombstoneGuard:
                 degraded=True,
             )
 
-        versions = {
+        versions: set[int] = {
             int(tombstone.get("key_version") or 1) for tombstone in self._tombstones
         }
+        for tombstone in self._tombstones:
+            for entry in tombstone.get("related_fingerprints", []):
+                if isinstance(entry, dict) and entry.get("version"):
+                    versions.add(int(entry["version"]))
         materials: dict[int, tuple[str, set[str], set[str], set[str]]] = {}
         for version in versions:
             key = self._keyring[version]
@@ -318,7 +322,11 @@ class TombstoneGuard:
         for tombstone in self._tombstones:
             version = int(tombstone.get("key_version") or 1)
             decision = self._evaluate_one(
-                tombstone, record_id, *materials[version], record_embedding=record_embedding
+                tombstone,
+                record_id,
+                *materials[version],
+                record_embedding=record_embedding,
+                fingerprints_by_version={v: material[0] for v, material in materials.items()},
             )
             if _SEVERITY[decision.decision] > _SEVERITY[best.decision] or (
                 decision.decision == best.decision and decision.match_score > best.match_score
@@ -341,6 +349,7 @@ class TombstoneGuard:
         record_anchors: set[str],
         record_tokens: set[str],
         record_embedding: list[float] | None = None,
+        fingerprints_by_version: dict[int, str] | None = None,
     ) -> GuardDecision:
         base = {
             "tombstone_id": tombstone["tombstone_id"],
@@ -357,8 +366,14 @@ class TombstoneGuard:
         # 2. Byte-for-byte (normalized) copy of the target or a removed derivative.
         if record_fingerprint == tombstone["fingerprint"]:
             return GuardDecision(BLOCKED, "exact_fingerprint", 1.0, **base)
-        if record_fingerprint in set(tombstone["related_fingerprints"]):
-            return GuardDecision(BLOCKED, "exact_derivative_fingerprint", 1.0, **base)
+        for entry in tombstone.get("related_fingerprints", []):
+            if isinstance(entry, dict):
+                version = int(entry.get("version") or tombstone.get("key_version") or 1)
+                expected = entry.get("fingerprint")
+                if expected and (fingerprints_by_version or {}).get(version) == expected:
+                    return GuardDecision(BLOCKED, "exact_derivative_fingerprint", 1.0, **base)
+            elif entry == record_fingerprint:
+                return GuardDecision(BLOCKED, "exact_derivative_fingerprint", 1.0, **base)
 
         # 3. Substantial partial copy, e.g. a rebuilt index chunk.
         tombstone_shingles = set(tombstone["shingles"])

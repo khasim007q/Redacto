@@ -14,7 +14,7 @@ from pathlib import Path
 
 from redacto.config import load_settings
 from redacto.engine import Engine
-from redacto.errors import RedactoError
+from redacto.errors import HmacKeyError, RedactoError
 from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID, seed_workspace
 from redacto.receipts import to_json, to_markdown
 
@@ -87,6 +87,26 @@ def cmd_plan(args: argparse.Namespace) -> int:
 def cmd_approve(args: argparse.Namespace) -> int:
     engine = _engine()
     _print(engine.approve_plan(plan_id=args.plan_id, approval_ref=args.ref, ttl_seconds=args.ttl))
+    return 0
+
+
+def cmd_review_item(args: argparse.Namespace) -> int:
+    engine = _engine()
+    _print(
+        engine.review_plan_item(
+            plan_id=args.plan_id,
+            item_id=args.item_id,
+            decision=args.decision,
+            reviewer=args.reviewer,
+            note=args.note,
+        )
+    )
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    engine = _engine()
+    _print(engine.cancel_plan(plan_id=args.plan_id, reason=args.reason or ""))
     return 0
 
 
@@ -345,6 +365,21 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--ttl", type=int, default=600)
     approve.set_defaults(func=cmd_approve)
 
+    review_item = sub.add_parser(
+        "review-item", help="approve or reject one REVIEW_REQUIRED plan item"
+    )
+    review_item.add_argument("--plan-id", required=True)
+    review_item.add_argument("--item-id", required=True)
+    review_item.add_argument("--decision", required=True, choices=["approved", "rejected"])
+    review_item.add_argument("--reviewer", default="local-operator")
+    review_item.add_argument("--note")
+    review_item.set_defaults(func=cmd_review_item)
+
+    cancel = sub.add_parser("cancel", help="cancel a plan before it starts executing")
+    cancel.add_argument("--plan-id", required=True)
+    cancel.add_argument("--reason")
+    cancel.set_defaults(func=cmd_cancel)
+
     apply_cmd = sub.add_parser("apply", help="apply an approved plan (destructive)")
     apply_cmd.add_argument("--plan-id", required=True)
     apply_cmd.add_argument("--version", type=int, required=True)
@@ -409,6 +444,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args) or 0)
+    except HmacKeyError as exc:
+        _print({"ok": False, "error": {"code": exc.code, "message": exc.message}})
+        return 2
     except RedactoError as exc:
         _print(exc.as_dict())
         return 2

@@ -471,6 +471,56 @@ class Repository:
             )
             conn.commit()
 
+    def update_plan_version(
+        self, plan_id: str, version: int, plan_hash: str, state: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE revocation_plans SET version = ?, plan_hash = ?, state = ? WHERE plan_id = ?",
+                (version, plan_hash, state, plan_id),
+            )
+            conn.commit()
+
+    def set_item_review(
+        self, item_id: str, *, approved: bool, action: str, state: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE revocation_plan_items SET approved = ?, proposed_action = ?, state = ? "
+                "WHERE item_id = ?",
+                (1 if approved else 0, action, state, item_id),
+            )
+            conn.commit()
+
+    def add_plan_item_review(
+        self,
+        *,
+        plan_id: str,
+        item_id: str,
+        plan_version: int,
+        decision: str,
+        reviewer: str,
+        note: str | None,
+    ) -> str:
+        review_id = new_id("irev")
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO plan_item_reviews
+                   (review_id, plan_id, item_id, plan_version, decision, reviewer, note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (review_id, plan_id, item_id, plan_version, decision, reviewer, note, now_iso()),
+            )
+            conn.commit()
+        return review_id
+
+    def plan_item_reviews(self, plan_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM plan_item_reviews WHERE plan_id = ? ORDER BY created_at",
+                (plan_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def set_item_state(self, item_id: str, state: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -688,7 +738,7 @@ class Repository:
         anchors: Sequence[str],
         tokens: Sequence[str],
         related_record_ids: Sequence[str],
-        related_fingerprints: Sequence[str],
+        related_fingerprints: Sequence[Any],
         scope: dict[str, Any],
         policy: dict[str, Any],
         status: str = "pending",

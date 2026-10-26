@@ -133,6 +133,8 @@ def _load_keyring(default_key: str) -> tuple[dict[int, str], int, str | None]:
             version = int(version_text)
         except (TypeError, ValueError):
             return {}, current_version, "REDACTO_HMAC_KEYS versions must be integers."
+        if version < 1:
+            return {}, current_version, "REDACTO_HMAC_KEYS versions must be >= 1."
         if not isinstance(key, str) or not key:
             return {}, current_version, "REDACTO_HMAC_KEYS values must be non-empty strings."
         keys[version] = key

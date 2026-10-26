@@ -723,6 +723,7 @@ class Engine:
 
         model_meta = self._assess_candidates(
             target_id=target_id,
+            target_kind=target_kind,
             candidates=candidates,
             scanned=scanned,
             candidate_edges=candidate_edges,
@@ -795,6 +796,7 @@ class Engine:
         self,
         *,
         target_id: str,
+        target_kind: str,
         candidates: dict[str, dict[str, Any]],
         scanned: dict[str, Record],
         candidate_edges: dict[str, dict[str, Any]],
@@ -810,12 +812,18 @@ class Engine:
             "unassessed": 0,
             "errors": {},
         }
-        if not enabled or not provider_configured:
-            meta["detail"] = (
-                "Model assessment disabled; deterministic discovery only."
-                if not provider_configured
-                else "Model assessment skipped by request."
-            )
+        if not enabled or not provider_configured or target_kind == "secret":
+            if target_kind == "secret":
+                meta["detail"] = (
+                    "Model assessment skipped for secret targets so credential-like "
+                    "content is never sent to a provider."
+                )
+            else:
+                meta["detail"] = (
+                    "Model assessment disabled; deterministic discovery only."
+                    if not provider_configured
+                    else "Model assessment skipped by request."
+                )
             meta["unassessed"] = sum(
                 1
                 for c in candidates.values()
@@ -1185,11 +1193,20 @@ class Engine:
         items = self.repo.plan_items(plan_id)
         removed = [i for i in items if i["state"] in {"done", "already_absent"}]
         related_ids = [i["record_id"] for i in removed if i["record_id"] != request["target_id"]]
-        related_fingerprints: list[str] = []
+        related_fingerprints: list[dict[str, Any]] = []
         for record_id in related_ids:
             record = self.repo.get_record(record_id)
             if record and record.get("fingerprint"):
-                related_fingerprints.append(record["fingerprint"])
+                related_fingerprints.append(
+                    {
+                        "version": (
+                            record.get("fingerprint_key_version")
+                            or request.get("target_key_version")
+                            or 1
+                        ),
+                        "fingerprint": record["fingerprint"],
+                    }
+                )
 
         tombstone_id = self.repo.add_tombstone(
             request_id=request_id,
@@ -1230,13 +1247,21 @@ class Engine:
         """Audit the versioned key ring and whether a version can be retired."""
         active = self.repo.list_tombstones(statuses=("active",))
         by_version: dict[int, int] = {}
+        required_versions: set[int] = set()
         for tombstone in active:
             version = int(tombstone.get("key_version") or 1)
             by_version[version] = by_version.get(version, 0) + 1
+            required_versions.add(version)
+            for entry in tombstone.get("related_fingerprints", []):
+                if isinstance(entry, dict) and entry.get("version"):
+                    required_versions.add(int(entry["version"]))
         configured = sorted(self.settings.hmac_keys)
-        missing = sorted(version for version in by_version if version not in self.settings.hmac_keys)
+        missing = sorted(version for version in required_versions if version not in self.settings.hmac_keys)
+        # Never suggest retiring the current key or one still referenced by a tombstone.
         unused_configured = [
-            version for version in configured if by_version.get(version, 0) == 0
+            version
+            for version in configured
+            if version != self.settings.hmac_key_version and version not in required_versions
         ]
         current_missing = self.settings.hmac_key_version not in self.settings.hmac_keys
 
@@ -1246,6 +1271,7 @@ class Engine:
             "configured_versions": configured,
             "active_tombstones": len(active),
             "tombstones_by_key_version": by_version,
+            "in_use_key_versions": sorted(required_versions),
             "missing_key_versions": missing,
             "protection_degraded": bool(
                 self.settings.keyring_error or missing or current_missing
@@ -1277,13 +1303,19 @@ class Engine:
                     "That key version is not configured.",
                     {"version": retire_version, "configured": configured},
                 )
-            if by_version.get(retire_version, 0) > 0:
+            if retire_version == self.settings.hmac_key_version:
+                raise RedactoError(
+                    "current_version_in_use",
+                    "The current key version cannot be retired; rotate first.",
+                    {"version": retire_version},
+                )
+            if retire_version in required_versions:
                 raise RedactoError(
                     "version_still_in_use",
                     "Active tombstones still reference this key version; keep the key.",
                     {
                         "version": retire_version,
-                        "active_tombstones": by_version[retire_version],
+                        "active_tombstones": by_version.get(retire_version, 0),
                     },
                 )
             report["retirement"] = {
@@ -1668,16 +1700,179 @@ class Engine:
 
     # --------------------------------------------------------------- approve
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
+        plan = self.repo.get_plan(plan_id)
+        recovery = bool(plan and plan["state"] == "EXECUTING")
         try:
             issued = authorization.issue_approval(
                 self.repo, plan_id=plan_id, approval_ref=approval_ref, ttl_seconds=ttl_seconds
             )
         except ValueError as exc:
             raise RedactoError(str(exc), f"Approval could not be issued: {exc}") from exc
-        return {"ok": True, **issued}
+        result = {"ok": True, **issued, "recovery": recovery}
+        if recovery:
+            result["note"] = (
+                "Recovery approval for an EXECUTING plan. Completed actions are skipped by "
+                "idempotency; remaining actions run under the new token."
+            )
+        return result
+
+    def review_plan_item(
+        self,
+        *,
+        plan_id: str,
+        item_id: str,
+        decision: str,
+        reviewer: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Approve or reject one review-required plan item (application action).
+
+        Approving rewrites the item to a concrete adapter action and bumps the plan
+        version, so the changed plan needs a fresh approval token. Rejecting leaves
+        the item unapproved. Both decisions are audited.
+        """
+        if decision not in {"approved", "rejected"}:
+            raise RedactoError("invalid_decision", "decision must be 'approved' or 'rejected'.")
+        reviewer = (reviewer or "").strip()
+        if not reviewer:
+            raise RedactoError("invalid_reviewer", "A reviewer identity is required.")
+        if note is not None and len(note) > 500:
+            raise RedactoError("note_too_long", "Review note must be 500 characters or fewer.")
+
+        plan = self.repo.get_plan(plan_id)
+        if plan is None:
+            raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
+        if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED"}:
+            raise RedactoError(
+                "plan_not_reviewable",
+                "This plan can no longer accept item reviews.",
+                {"plan_id": plan_id, "state": plan["state"]},
+            )
+        item = self.repo.get_plan_item(item_id)
+        if item is None or item["plan_id"] != plan_id:
+            raise RedactoError("unknown_plan_item", "No such item on this plan.", {"item_id": item_id})
+        if item["proposed_action"] != classify.REVIEW_REQUIRED:
+            raise RedactoError(
+                "item_not_reviewable",
+                "Only REVIEW_REQUIRED items can be reviewed.",
+                {"item_id": item_id, "proposed_action": item["proposed_action"]},
+            )
+
+        record = self.repo.get_record(item["record_id"]) or {}
+        if decision == "approved":
+            action = classify.override_action(
+                record_type=record.get("record_type", "unknown"),
+                capabilities=record.get("capabilities", {}),
+            )
+            if action is None:
+                raise RedactoError(
+                    "no_safe_action",
+                    "This adapter cannot perform an approved action for the item.",
+                    {"item_id": item_id, "record_id": item["record_id"]},
+                )
+            self.repo.set_item_review(
+                item_id, approved=True, action=action, state="review_approved"
+            )
+        else:
+            self.repo.set_item_review(
+                item_id,
+                approved=False,
+                action=classify.REVIEW_REQUIRED,
+                state="review_rejected",
+            )
+
+        request = self.repo.get_request(plan["request_id"])
+        assert request is not None
+        items = self.repo.plan_items(plan_id)
+        version = int(plan["version"]) + 1
+        plan_hash = compute_plan_hash(
+            target_id=request["target_id"],
+            mode=request["mode"],
+            scope=plan["scope"],
+            policy=request["policy"],
+            version=version,
+            items=items,
+        )
+        self.repo.update_plan_version(plan_id, version, plan_hash, "READY_FOR_APPROVAL")
+        self.repo.set_request_state(plan["request_id"], "READY_FOR_APPROVAL")
+        review_id = self.repo.add_plan_item_review(
+            plan_id=plan_id,
+            item_id=item_id,
+            plan_version=version,
+            decision=decision,
+            reviewer=reviewer,
+            note=note,
+        )
+        return {
+            "ok": True,
+            "plan_id": plan_id,
+            "plan_version": version,
+            "plan_hash": plan_hash,
+            "state": "READY_FOR_APPROVAL",
+            "item_id": item_id,
+            "decision": decision,
+            "review_id": review_id,
+            "approval_required": True,
+            "message": (
+                "Plan changed; issue a new approval token for this version before applying."
+            ),
+        }
+
+    def cancel_plan(self, *, plan_id: str, reason: str = "") -> dict[str, Any]:
+        plan = self.repo.get_plan(plan_id)
+        if plan is None:
+            raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
+        if plan["state"] == "CANCELLED":
+            return {"ok": True, "plan_id": plan_id, "state": "CANCELLED", "already_cancelled": True}
+        if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED"}:
+            raise RedactoError(
+                "plan_not_cancellable",
+                "Only a plan that has not started executing can be cancelled.",
+                {"plan_id": plan_id, "state": plan["state"]},
+            )
+        self.repo.set_plan_state(plan_id, "CANCELLED")
+        self.repo.set_request_state(plan["request_id"], "CANCELLED")
+        return {
+            "ok": True,
+            "plan_id": plan_id,
+            "request_id": plan["request_id"],
+            "state": "CANCELLED",
+            "reason": reason,
+        }
 
     # ----------------------------------------------------------------- apply
     def apply(
+        self,
+        *,
+        plan_id: str,
+        plan_version: int,
+        approval_ref: str,
+        confirmation_token: str,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """Apply an approved plan, marking an unexpected abort as FAILED."""
+        try:
+            return self._apply(
+                plan_id=plan_id,
+                plan_version=plan_version,
+                approval_ref=approval_ref,
+                confirmation_token=confirmation_token,
+                dry_run=dry_run,
+            )
+        except RedactoError:
+            raise
+        except Exception as exc:
+            plan = self.repo.get_plan(plan_id)
+            if plan is not None and plan["state"] == "EXECUTING":
+                self.repo.set_plan_state(plan_id, "FAILED")
+                self.repo.set_request_state(plan["request_id"], "FAILED")
+            raise RedactoError(
+                "apply_failed",
+                "Apply aborted unexpectedly; the plan is marked FAILED.",
+                {"type": type(exc).__name__},
+            ) from exc
+
+    def _apply(
         self,
         *,
         plan_id: str,
@@ -1947,7 +2142,21 @@ class Engine:
             final_state = plan["state"]
             message = "Dry run only: no destructive operation was performed."
         else:
-            final_state = "PARTIAL" if counts["failed"] else "VERIFYING"
+            actionable = [
+                i
+                for i in items
+                if i["approved"] and i["proposed_action"] in classify.ACTIONABLE
+            ]
+            if (
+                counts["failed"]
+                and counts["failed"] >= len(actionable)
+                and counts["succeeded"] + counts["already_absent"] == 0
+            ):
+                final_state = "FAILED"
+            elif counts["failed"]:
+                final_state = "PARTIAL"
+            else:
+                final_state = "VERIFYING"
             self.repo.set_plan_state(plan_id, final_state, applied_at=now_iso())
             self.repo.set_request_state(plan["request_id"], final_state)
             message = "Apply completed; run redacto_verify for an honest, scoped result."
@@ -2021,7 +2230,8 @@ class Engine:
         target_key_version = (
             request.get("target_key_version")
             or (target_record or {}).get("fingerprint_key_version")
-            or self.settings.hmac_key_version
+            # Legacy material predates versioning and was produced with version 1.
+            or 1
         )
         verify_key = self.settings.key_for_version(target_key_version)
         if target_fingerprint and verify_key is None:

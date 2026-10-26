@@ -90,7 +90,8 @@ def test_missing_old_key_fails_closed_for_all_ingestion(tmp_path):
     report = engine_v2.keyring_report()
     assert report["protection_degraded"] is True
     assert report["missing_key_versions"] == [1]
-    assert report["retirable_versions"] == [2]
+    assert report["retirable_versions"] == []
+    assert 2 not in report["retirable_versions"]
 
     status = engine_v2.status(transport="test")
     assert status["revocation"]["protection_degraded"] is True
@@ -124,19 +125,30 @@ def test_invalid_keyring_fails_closed(tmp_path):
 
 def test_retirement_refuses_while_version_is_in_use(tmp_path):
     engine, _ = _revoked(tmp_path)
-    report = engine.keyring_report()
+    rotated = _rotate(engine.settings, {1: OLD_KEY, 2: NEW_KEY}, 2)
+    report = Engine(rotated).keyring_report()
     assert report["retirable_versions"] == []
     with pytest.raises(RedactoError) as excinfo:
-        engine.keyring_report(retire_version=1)
+        Engine(rotated).keyring_report(retire_version=1)
     assert excinfo.value.code == "version_still_in_use"
 
 
-def test_unused_version_is_reported_retirable(tmp_path):
+def test_unused_non_current_version_is_reported_retirable(tmp_path):
     settings = seeded_settings(tmp_path)
-    engine = Engine(settings)  # nothing revoked yet
-    report = engine.keyring_report(retire_version=1)
+    rotated = _rotate(settings, {1: OLD_KEY, 2: NEW_KEY}, 2)
+    report = Engine(rotated).keyring_report(retire_version=1)
     assert report["retirable_versions"] == [1]
     assert report["retirement"]["safe"] is True
+
+
+def test_current_key_version_cannot_be_retired(tmp_path):
+    settings = seeded_settings(tmp_path)
+    engine = Engine(settings)
+    report = engine.keyring_report()
+    assert 1 not in report["retirable_versions"]
+    with pytest.raises(RedactoError) as excinfo:
+        engine.keyring_report(retire_version=1)
+    assert excinfo.value.code == "current_version_in_use"
 
 
 def test_verification_uses_the_target_key_version_after_rotation(tmp_path):
@@ -156,3 +168,115 @@ def test_verification_degrades_honestly_when_target_key_is_missing(tmp_path):
     assert verified["status"] == "PARTIAL"
     assert "vector_fixture" not in verified["unreachable_stores"]
     assert any("HMAC key version" in limitation for limitation in verified["limitations"])
+
+
+def test_related_fingerprints_are_versioned_across_rotation(tmp_path):
+    from redacto.discovery.normalization import fingerprint
+    from redacto.fixtures import GENERATED_SUMMARY
+
+    settings = seeded_settings(tmp_path)
+    engine = Engine(settings)
+    derivative_fp_v1 = fingerprint(GENERATED_SUMMARY, OLD_KEY)
+    tombstone_id = engine.repo.add_tombstone(
+        request_id="req-versioned",
+        target_id=SOURCE_ID,
+        target_kind="source",
+        label_redacted="acquisition-plan.md",
+        fingerprint_value=fingerprint("target", OLD_KEY),
+        shingles=[],
+        anchors=[],
+        tokens=[],
+        related_record_ids=[],
+        related_fingerprints=[{"version": 1, "fingerprint": derivative_fp_v1}],
+        scope={"stores": ["filesystem"]},
+        policy={},
+        status="pending",
+        key_version=2,
+    )
+    engine.repo.set_tombstone_status(tombstone_id, "active")
+
+    rotated = _rotate(settings, {1: OLD_KEY, 2: NEW_KEY}, 2)
+    guard = Engine(rotated).guard()
+    decision = guard.evaluate(record_id="fs:renamed-summary.md", content=GENERATED_SUMMARY)
+    assert decision.decision == "blocked"
+    assert decision.reason_code == "exact_derivative_fingerprint"
+
+
+def test_missing_related_key_version_fails_closed(tmp_path):
+    from redacto.discovery.normalization import fingerprint
+    from redacto.fixtures import GENERATED_SUMMARY
+
+    settings = seeded_settings(tmp_path)
+    engine = Engine(settings)
+    tombstone_id = engine.repo.add_tombstone(
+        request_id="req-missing-related",
+        target_id=SOURCE_ID,
+        target_kind="source",
+        label_redacted="x",
+        fingerprint_value=fingerprint("target", OLD_KEY),
+        shingles=[],
+        anchors=[],
+        tokens=[],
+        related_record_ids=[],
+        related_fingerprints=[{"version": 9, "fingerprint": "deadbeef"}],
+        scope={},
+        policy={},
+        status="pending",
+        key_version=2,
+    )
+    engine.repo.set_tombstone_status(tombstone_id, "active")
+    rotated = _rotate(settings, {2: NEW_KEY}, 2)
+    engine_v2 = Engine(rotated)
+    guard = engine_v2.guard()
+    assert guard.protection_degraded is True
+    assert 9 in guard.missing_versions
+    decision = guard.evaluate(record_id="fs:x.md", content=GENERATED_SUMMARY)
+    assert decision.reason_code == "key_unavailable_fail_closed"
+
+    report = engine_v2.keyring_report()
+    assert report["missing_key_versions"] == [9]
+    assert report["protection_degraded"] is True
+    status = engine_v2.status(transport="test")
+    assert status["revocation"]["missing_key_versions"] == [9]
+    assert status["revocation"]["protection_degraded"] is True
+
+
+def test_invalid_key_versions_are_rejected(tmp_path, monkeypatch):
+    from redacto.config import load_settings
+
+    monkeypatch.setenv("REDACTO_HMAC_KEYS", '{"-1": "bad", "1": "ok"}')
+    monkeypatch.setenv("REDACTO_HMAC_KEY_VERSION", "1")
+    settings = load_settings()
+    assert settings.keyring_error is not None
+    assert ">= 1" in settings.keyring_error
+
+
+def test_related_version_is_in_use_for_retirement(tmp_path):
+    from redacto.discovery.normalization import fingerprint
+
+    settings = seeded_settings(tmp_path)
+    engine = Engine(settings)
+    tombstone_id = engine.repo.add_tombstone(
+        request_id="req-related-in-use",
+        target_id=SOURCE_ID,
+        target_kind="source",
+        label_redacted="x",
+        fingerprint_value=fingerprint("target", OLD_KEY),
+        shingles=[],
+        anchors=[],
+        tokens=[],
+        related_record_ids=[],
+        related_fingerprints=[{"version": 1, "fingerprint": "deadbeef"}],
+        scope={},
+        policy={},
+        status="pending",
+        key_version=2,
+    )
+    engine.repo.set_tombstone_status(tombstone_id, "active")
+    rotated = _rotate(settings, {1: OLD_KEY, 2: NEW_KEY}, 2)
+    engine_v2 = Engine(rotated)
+    report = engine_v2.keyring_report()
+    assert report["in_use_key_versions"] == [1, 2]
+    with pytest.raises(RedactoError) as excinfo:
+        engine_v2.keyring_report(retire_version=1)
+    assert excinfo.value.code == "version_still_in_use"

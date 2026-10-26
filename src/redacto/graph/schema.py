@@ -91,6 +91,17 @@ CREATE TABLE IF NOT EXISTS revocation_plan_items (
     FOREIGN KEY (plan_id) REFERENCES revocation_plans(plan_id)
 );
 
+CREATE TABLE IF NOT EXISTS plan_item_reviews (
+    review_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    plan_version INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS approvals (
     approval_id TEXT PRIMARY KEY,
     plan_id TEXT NOT NULL,
@@ -138,6 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_lineage_source ON lineage_edges(source_id, status
 CREATE INDEX IF NOT EXISTS idx_candidate_source ON candidate_edges(source_id, status);
 CREATE INDEX IF NOT EXISTS idx_items_plan ON revocation_plan_items(plan_id);
 CREATE INDEX IF NOT EXISTS idx_actions_request ON actions(request_id);
+CREATE INDEX IF NOT EXISTS idx_item_reviews_plan ON plan_item_reviews(plan_id);
 CREATE INDEX IF NOT EXISTS idx_verify_request ON verification_runs(request_id);
 
 -- Revocation tombstones retain only keyed fingerprints and derived match anchors,

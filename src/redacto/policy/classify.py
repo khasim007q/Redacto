@@ -32,6 +32,10 @@ UNREACHABLE = "UNREACHABLE"
 
 ACTIONABLE = {DELETE_RECORD, REDACT_SPAN, INVALIDATE_INDEX, INVALIDATE_CACHE, REGENERATE}
 
+# Below this share of the record, a substring match is held for review. Above it,
+# the record is mostly the target value and the normal delete path still applies.
+PARTIAL_DELETE_MIN_RATIO = 0.5
+
 _QUOTES = re.compile(r"[\"'`]")
 
 
@@ -66,7 +70,11 @@ def propose_action(
 
     # A substring match inside a larger, useful record is not a safe automatic
     # delete: hold it for review so the reviewer sees the collateral damage.
-    if partial_match and evidence_class == DIRECT_MATCH:
+    if (
+        partial_match
+        and evidence_class == DIRECT_MATCH
+        and content_overlap < PARTIAL_DELETE_MIN_RATIO
+    ):
         return REVIEW_REQUIRED, False, "high"
 
     risk = "low" if evidence_class == DIRECT_MATCH else "medium"
@@ -79,6 +87,21 @@ def propose_action(
     if capabilities.get("redact"):
         return REDACT_SPAN, True, risk
     return REVIEW_REQUIRED, False, "high"
+
+
+def override_action(
+    *, record_type: str, capabilities: dict[str, bool]
+) -> str | None:
+    """Action for a reviewer-approved review item, or None if unsupported."""
+    if record_type == "index_entry" and capabilities.get("invalidate"):
+        return INVALIDATE_INDEX
+    if record_type == "cache_entry" and capabilities.get("invalidate"):
+        return INVALIDATE_CACHE
+    if capabilities.get("delete"):
+        return DELETE_RECORD
+    if capabilities.get("redact"):
+        return REDACT_SPAN
+    return None
 
 
 def collateral_risk(action: str, base_risk: str, content_overlap: float) -> str:

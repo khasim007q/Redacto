@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
         "active_tombstones": 0,
         "quarantine_pending": 0,
         "tombstones_by_key_version": {},
+        "in_use_key_versions": [],
         "missing_key_versions": [],
         "protection_degraded": bool(settings.keyring_error),
         "keyring_error": settings.keyring_error,
@@ -68,12 +70,23 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
                 "GROUP BY key_version"
             ).fetchall()
         }
+        required_versions: set[int] = set(by_version)
+        for row in conn.execute(
+            "SELECT related_fingerprints_json FROM tombstones WHERE status = 'active'"
+        ).fetchall():
+            try:
+                entries = json.loads(row[0] or "[]")
+            except json.JSONDecodeError:
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("version"):
+                    required_versions.add(int(entry["version"]))
     except sqlite3.Error:
         return base
     finally:
         conn.close()
 
-    missing = sorted(v for v in by_version if v not in settings.hmac_keys)
+    missing = sorted(v for v in required_versions if v not in settings.hmac_keys)
     current_missing = settings.hmac_key_version not in settings.hmac_keys
     base.update(
         {
@@ -81,6 +94,7 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
             "active_tombstones": active,
             "quarantine_pending": pending,
             "tombstones_by_key_version": by_version,
+            "in_use_key_versions": sorted(required_versions),
             "missing_key_versions": missing,
             "protection_degraded": bool(
                 settings.keyring_error or missing or current_missing

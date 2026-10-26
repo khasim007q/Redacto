@@ -1,15 +1,22 @@
 {
   "mcpServers": {
     "redacto": {
-      "command": "python",
-      "args": ["-m", "redacto.mcp.stdio_server"],
-      "cwd": ".",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "python",
+        "-m",
+        "redacto.mcp.stdio_server"
+      ],
       "env": {
-        "REDACTO_WORKSPACE_ROOT": "fixtures/workspace",
-        "REDACTO_DB_PATH": "var/redacto.sqlite3",
-        "REDACTO_SQLITE_PATH": "fixtures/workspace/agent_memory.sqlite3",
-        "REDACTO_JSONL_PATH": "fixtures/workspace/agent_events.jsonl",
-        "REDACTO_VECTOR_PATH": "fixtures/workspace/vector_chunks.json"
+        "REDACTO_WORKSPACE_ROOT": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace",
+        "REDACTO_DB_PATH": "${CLAUDE_PLUGIN_DATA}/redacto.sqlite3",
+        "REDACTO_SQLITE_PATH": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace/agent_memory.sqlite3",
+        "REDACTO_JSONL_PATH": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace/agent_events.jsonl",
+        "REDACTO_VECTOR_PATH": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace/vector_chunks.json",
+        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv"
       }
     }
   }

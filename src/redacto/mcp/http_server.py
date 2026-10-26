@@ -25,7 +25,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         header = request.headers.get("authorization", "")
         scheme, _, presented = header.partition(" ")
-        if scheme.lower() != "bearer" or not hmac.compare_digest(presented, self._token):
+        # compare_digest rejects non-ASCII str; encode explicitly so a malformed
+        # header is a 401, not a 500.
+        presented_bytes = presented.encode("utf-8", "surrogateescape")
+        token_bytes = self._token.encode("utf-8")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(presented_bytes, token_bytes):
             return JSONResponse(
                 {"error": "unauthorized", "detail": "A valid bearer token is required."},
                 status_code=401,

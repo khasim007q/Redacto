@@ -27,6 +27,7 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _TOKEN = re.compile(r"\b(?:sk|pk|api|token|key)[-_][A-Za-z0-9_-]{6,}\b", re.IGNORECASE)
 _NUMBER = re.compile(r"\b\d[\d,.]*\b")
 _URL = re.compile(r"https?://\S+")
+_LONG_VALUE = re.compile(r"\b[A-Za-z0-9_\-]{16,}\b")
 
 
 class CandidateAssessment(BaseModel):
@@ -67,6 +68,7 @@ def minimize_snippet(text: str, *, limit: int = MAX_SNIPPET_CHARS) -> str:
     scrubbed = _EMAIL.sub("[EMAIL]", text)
     scrubbed = _TOKEN.sub("[TOKEN]", scrubbed)
     scrubbed = _URL.sub("[URL]", scrubbed)
+    scrubbed = _LONG_VALUE.sub("[VALUE]", scrubbed)
     scrubbed = _NUMBER.sub("[NUMBER]", scrubbed)
     scrubbed = re.sub(r"\s+", " ", scrubbed).strip()
     return scrubbed[:limit]
@@ -147,13 +149,19 @@ class OpenAICompatibleAssessor:
             )
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or len(content) > 1_000_000:
+                raise ValueError("invalid or oversized model response")
             parsed = json.loads(content)
         except (httpx.TimeoutException, TimeoutError):
             outcome.provider_error = "timeout"
             outcome.errors = {c.candidate_id: "unassessed_timeout" for c in batch}
             return outcome
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             outcome.provider_error = f"provider_error:{type(exc).__name__}"
+            outcome.errors = {c.candidate_id: "unassessed_provider_error" for c in batch}
+            return outcome
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            outcome.provider_error = f"unexpected_provider_error:{type(exc).__name__}"
             outcome.errors = {c.candidate_id: "unassessed_provider_error" for c in batch}
             return outcome
 
@@ -188,5 +196,7 @@ def build_assessor(
     timeout: float = 10.0,
 ) -> RelationshipAssessor:
     if provider in {"openai_compatible", "openai-compatible", "ollama"} and base_url and model:
+        if not base_url.lower().startswith(("http://", "https://")):
+            return NullAssessor()
         return OpenAICompatibleAssessor(base_url=base_url, model=model, timeout=timeout)
     return NullAssessor()

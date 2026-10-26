@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **131 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **150 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -115,10 +115,12 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
 ## 8. Modes and execution
 
 - **8.1 Source revocation: Compliant.**
-- **8.2 Fact/secret revocation: Partial.** A fact/secret found as a substring of a
-  larger record is now held for review with `risk: high` and a blast-radius note; a
-  whole-copy match follows the normal approval path. No precise `REDACT_SPAN` support
-  yet, so the reviewer still chooses whole-record deletion or rejection.
+- **8.2 Fact/secret revocation: Partial.** A fact/secret substring covering less than
+  half of a record is held for review with `risk: high`; at or above half the normal
+  delete path applies, so a leaked key that dominates its record is removable. A
+  reviewer can approve or reject a review item through `review-item`. No precise
+  `REDACT_SPAN` support yet, so the reviewer still chooses whole-record deletion or
+  rejection.
 - **8.3 Action types: Partial.** All action names exist. A partial substring match is
   mapped to `REVIEW_REQUIRED`, not an automatic delete. `DELETE_RECORD`,
   `INVALIDATE_INDEX`, `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE` and
@@ -127,8 +129,9 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
 - **8.4 State machine: Partial.** `READY_FOR_APPROVAL → APPROVED → EXECUTING →
   VERIFYING → {VERIFIED_WITHIN_SCOPE, PARTIAL, NEEDS_REVIEW}` is implemented and
   `EXECUTING` is set before the first mutation (`test_apply_enters_executing_before_any_mutation`).
-  There is no editable `DRAFT` stage; `CANCELLED` and `FAILED` are defined as
-  terminal states but no user action currently enters them.
+  `CANCELLED` is entered by `redacto cancel` before execution, `FAILED` when every
+  approved action fails, and an `EXECUTING` plan can be re-approved after a crash.
+  There is no editable `DRAFT` stage.
 - **8.5 Verification: Compliant.** Only configured reachable stores; per-store method
   and limitations; `not_verifiable` when the target key version is unavailable.
 
@@ -218,7 +221,8 @@ All bullets are covered; see `tests/test_graph.py`, `test_discovery.py`,
 `test_policy.py`, `test_execution.py`, `test_verification.py`, `test_security.py`,
 `test_tombstones.py`, `test_quarantine.py`, `test_key_rotation.py`,
 `test_embeddings.py`, `test_evaluation.py`, `test_jsonl.py`,
-`test_hardening_collateral.py`, `test_mcp_tools.py`, `test_transport.py`.
+`test_hardening_collateral.py`, `test_recovery_and_review.py`, `test_packaging.py`,
+`test_mcp_tools.py`, `test_transport.py`.
 
 ### 15.3 Demo acceptance targets
 
@@ -311,10 +315,26 @@ Fixed after the readiness review:
 - partial substring matches held for review;
 - buried verbatim passages classified as suspected derivatives.
 
+## Second review follow-up
+
+Fixed after the readiness/collateral review:
+
+- crashed `EXECUTING` plan recovery through re-approval;
+- `review-item` approval/rejection with plan-version bump and audit;
+- partial secret matches above 50% coverage auto-delete; below 50% are reviewable;
+- non-ASCII bearer headers return 401 instead of 500;
+- separator-insensitive secret matching (spaced secrets);
+- current key version cannot be retired; related fingerprints are versioned;
+- `CANCELLED` and `FAILED` plan states;
+- assessor catches unexpected errors, rejects non-HTTP URLs, and never receives the
+  secret target;
+- Claude Code plugin layout (`.claude-plugin/plugin.json` + `.mcp.json` with
+  `${CLAUDE_PLUGIN_ROOT}` and `uv`), explicitly not validated against Alan.
+
 ## Remaining deviations worth fixing next
 
 1. Add a per-adapter `find_exact` method if strict interface parity is required.
-2. Implement editable `DRAFT` plans and explicit `CANCELLED`/`FAILED` transitions.
+2. Implement editable `DRAFT` plans (CANCELLED/FAILED transitions are implemented).
 3. Implement safe `REDACT_SPAN` editing, regeneration and an undo/trash window.
 4. Add a graph visualization that styles confirmed vs candidate edges.
 5. Register the Alan connector (user action) and publish the docs/demo publicly.

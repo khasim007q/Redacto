@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from helpers import seeded_settings
@@ -48,3 +50,32 @@ def test_http_requests_require_a_valid_bearer_token(tmp_path, monkeypatch):
     assert anonymous.status_code == 401
     assert wrong_token.status_code == 401
     assert authorized.status_code != 401
+
+
+def test_non_ascii_bearer_is_rejected_not_a_500():
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    from redacto.mcp.http_server import BearerAuthMiddleware
+
+    async def app(scope, receive, send):  # pragma: no cover - not called on 401
+        raise AssertionError("middleware should reject before calling the app")
+
+    async def call_next(request):
+        return JSONResponse({"ok": True})
+
+    middleware = BearerAuthMiddleware(app=app, token="unit-test-token")
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [(b"authorization", "Bearer caf?".encode("utf-8"))],
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+    response = asyncio.run(middleware.dispatch(Request(scope), call_next))
+    assert response.status_code == 401

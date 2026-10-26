@@ -32,7 +32,9 @@ def issue_approval(
     plan = repo.get_plan(plan_id)
     if plan is None:
         raise ValueError("plan_not_found")
-    if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED"}:
+    # EXECUTING is recoverable: a crashed apply may be re-approved with a new
+    # single-use token. Per-action idempotency prevents duplicate work.
+    if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED", "EXECUTING"}:
         raise ValueError("plan_not_approvable")
     ref = approval_ref.strip()
     if not (MIN_APPROVAL_REF_LEN <= len(ref) <= MAX_APPROVAL_REF_LEN):
