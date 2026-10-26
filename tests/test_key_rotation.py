@@ -304,3 +304,18 @@ def test_non_canonical_key_versions_are_rejected(monkeypatch):
     settings = load_settings()
     assert settings.keyring_error is not None
     assert "canonical" in settings.keyring_error
+
+
+def test_broken_keyring_scan_names_the_keyring_not_the_store(tmp_path):
+    settings = seeded_settings(tmp_path)
+    broken = _rotate(settings, {1: OLD_KEY}, 2)  # current v2 missing
+    engine = Engine(broken)
+    with pytest.raises(RedactoError) as excinfo:
+        engine.scan(target_id=SOURCE_ID)
+    assert excinfo.value.code == "current_key_unavailable"
+    assert excinfo.value.code != "target_unreachable"
+
+    invalid = replace(settings, keyring_error="REDACTO_HMAC_KEYS is invalid")
+    with pytest.raises(RedactoError) as excinfo:
+        Engine(invalid).plan(target_id=SOURCE_ID)
+    assert excinfo.value.code == "keyring_invalid"

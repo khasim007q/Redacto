@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS revocation_plans (
     approved_at TEXT,
     approved_by TEXT,
     applied_at TEXT,
+    execution_token TEXT,
     FOREIGN KEY (request_id) REFERENCES revocation_requests(request_id)
 );
 
@@ -88,6 +89,8 @@ CREATE TABLE IF NOT EXISTS revocation_plan_items (
     risk TEXT NOT NULL,
     approved INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'planned',
+    expected_fingerprint TEXT,
+    fingerprint_key_version INTEGER,
     FOREIGN KEY (plan_id) REFERENCES revocation_plans(plan_id)
 );
 

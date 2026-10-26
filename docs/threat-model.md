@@ -70,6 +70,9 @@ destructive or leaking component**.
 | T41 | A broken key ring crashes status | Adapter construction catches keyring errors; status reports `protection_degraded` and the MCP status tool returns structured data | `test_status_survives_a_broken_key_ring`, `test_broken_keyring_status_does_not_crash` |
 | T42 | Non-canonical key versions collide | Key versions must be canonical integers; leading zeros/signs and duplicate versions are rejected | `test_non_canonical_key_versions_are_rejected` |
 | T43 | A raising custom assessor breaks a scan | Assessor construction and invocation are both guarded; failures become `unassessed` | `test_engine_guards_a_raising_custom_assessor` |
+| T44 | A file rewritten after planning is deleted during apply | Plan items store a content fingerprint; apply re-reads and refuses with `content_changed` | `test_changed_content_is_not_deleted_on_apply` |
+| T45 | Two recovery tokens both report the same work | Apply takes an exclusive DB lease; the loser gets `apply_in_progress` | `test_plan_execution_lease_is_exclusive`, `test_concurrent_recovery_tokens_cannot_both_report_the_work` |
+| T46 | A hard-killed apply leaves a lease behind | Recovery approval clears the stale lease; completed actions remain idempotent | `test_recovery_approval_clears_a_stale_execution_lease` |
 
 ## Residual risks (accepted, disclosed)
 

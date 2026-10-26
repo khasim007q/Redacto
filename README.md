@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 156 automated tests pass (`pytest`).
+- 161 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -255,9 +255,14 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Approval consumption is atomic: one token cannot authorize two concurrent applies.
 - A crashed or failed apply is recoverable: re-approving an `EXECUTING`/`FAILED` plan
   issues a new token; completed actions are skipped and failed actions are retried.
-  A cancelled plan cannot be applied.
+  A cancelled plan cannot be applied. Apply holds an exclusive lease so concurrent
+  recovery tokens cannot both report the same work.
 - Plan item reviews are audited; approving one bumps the plan version and invalidates
   the old token.
+- Apply takes an exclusive execution lease, so two recovery tokens used at once cannot
+  both report the same work. A hard-killed lease is cleared by a recovery approval.
+- Each plan item stores its plan-time content fingerprint. Apply re-reads the record and
+  refuses to delete if the content changed (`content_changed`) or cannot be verified.
 - JSONL event identity is stable even without `event_id` (keyed line hash), and
   malformed lines are matched by that identity rather than a shifted line number.
 - Record-cap truncation is reported in scan coverage and verification; absence is not
@@ -282,7 +287,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-156 passed in 45.98s
+161 passed in 67.27s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,

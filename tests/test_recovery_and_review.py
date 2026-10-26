@@ -316,3 +316,81 @@ def test_recorded_failed_actions_are_retried_after_failed_plan(engine, monkeypat
     assert (
         resumed["counts"]["succeeded"] + resumed["counts"]["already_absent"] == 7
     )
+
+
+def test_changed_content_is_not_deleted_on_apply(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    target = engine.settings.workspace_root / "acquisition-plan.md"
+    target.write_text("unrelated replacement content", encoding="utf-8")
+    applied = approve_and_apply(engine, plan)
+    result = next(r for r in applied["results"] if r.get("record_id") == "fs:acquisition-plan.md")
+    assert result["result"] == "failed"
+    assert result["error_code"] == "content_changed"
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "unrelated replacement content"
+    assert applied["plan_state"] in {"PARTIAL", "FAILED"}
+
+
+def test_plan_execution_lease_is_exclusive(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    first = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert first
+    assert engine.repo.claim_plan_execution(plan["plan_id"]) is None
+    engine.repo.release_plan_execution(plan["plan_id"], first)
+    second = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert second
+
+
+def test_recovery_approval_clears_a_stale_execution_lease(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    token = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert token
+    engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
+    recovery = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
+    assert recovery["recovery"] is True
+    assert engine.repo.get_plan(plan["plan_id"])["execution_token"] is None
+    applied = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="recovery",
+        confirmation_token=recovery["confirmation_token"],
+    )
+    assert applied["counts"]["succeeded"] == 7
+
+
+def test_concurrent_recovery_tokens_cannot_both_report_the_work(engine, monkeypatch):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from redacto.adapters.filesystem import FilesystemAdapter
+
+    original = FilesystemAdapter.delete_record
+
+    def slow(self, locator):
+        time.sleep(0.15)
+        return original(self, locator)
+
+    monkeypatch.setattr(FilesystemAdapter, "delete_record", slow)
+    plan = engine.plan(target_id=SOURCE_ID)
+    first = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="first-token")
+    second = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="second-token")
+
+    def run(approval):
+        try:
+            return engine.apply(
+                plan_id=plan["plan_id"],
+                plan_version=plan["plan_version"],
+                approval_ref=approval["approval_ref"],
+                confirmation_token=approval["confirmation_token"],
+            )
+        except RedactoError as exc:
+            return {"ok": False, "error": exc.code}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(run, [first, second]))
+    successes = [r for r in results if r.get("ok") and r.get("counts", {}).get("succeeded") == 7]
+    assert len(successes) <= 1
+    assert any(
+        r.get("ok") is False and r.get("error") == "apply_in_progress" or r.get("already_completed")
+        for r in results
+    )

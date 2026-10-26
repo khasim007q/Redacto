@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **156 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **161 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -330,6 +330,17 @@ Fixed after the readiness/collateral review:
   secret target;
 - Claude Code plugin layout (`.claude-plugin/plugin.json` + `.mcp.json` with
   `${CLAUDE_PLUGIN_ROOT}` and `uv`), explicitly not validated against Alan.
+
+## Third review follow-up
+
+Fixed after the MVP-readiness review:
+
+- plan items store a plan-time content fingerprint; apply refuses to delete changed or
+  unverifiable content (`content_changed` / `content_unverifiable`);
+- apply takes an exclusive DB execution lease, so concurrent recovery tokens cannot
+  both report the same work; recovery approval clears a stale hard-kill lease;
+- a broken key ring now raises `current_key_unavailable`/`keyring_invalid` from scan
+  instead of `target_unreachable`.
 
 ## Remaining deviations worth fixing next
 

@@ -182,4 +182,6 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "match_kind": item.get("match_kind"),
         "partial_match": item.get("partial_match", False),
         "collateral_note": item.get("collateral_note", ""),
+        "expected_fingerprint": item.get("expected_fingerprint"),
+        "fingerprint_key_version": item.get("fingerprint_key_version"),
     }

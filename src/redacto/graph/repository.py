@@ -95,6 +95,18 @@ class Repository:
             if column not in quarantine_columns:
                 conn.execute(f"ALTER TABLE quarantine ADD COLUMN {column} {ddl}")
 
+        item_columns = {row[1] for row in conn.execute("PRAGMA table_info(revocation_plan_items)")}
+        for column, ddl in {
+            "expected_fingerprint": "TEXT",
+            "fingerprint_key_version": "INTEGER",
+        }.items():
+            if column not in item_columns:
+                conn.execute(f"ALTER TABLE revocation_plan_items ADD COLUMN {column} {ddl}")
+
+        plan_columns = {row[1] for row in conn.execute("PRAGMA table_info(revocation_plans)")}
+        if "execution_token" not in plan_columns:
+            conn.execute("ALTER TABLE revocation_plans ADD COLUMN execution_token TEXT")
+
         record_columns = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
         if "fingerprint_key_version" not in record_columns:
             conn.execute("ALTER TABLE records ADD COLUMN fingerprint_key_version INTEGER")
@@ -391,8 +403,9 @@ class Repository:
                 conn.execute(
                     """INSERT INTO revocation_plan_items
                        (item_id, plan_id, request_id, record_id, evidence_class, proposed_action,
-                        reason_redacted, risk, approved, state)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned')""",
+                        reason_redacted, risk, approved, state, expected_fingerprint,
+                        fingerprint_key_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
                     (
                         item["item_id"],
                         plan_id,
@@ -403,6 +416,8 @@ class Repository:
                         item["reason_redacted"],
                         item["risk"],
                         1 if item["approved"] else 0,
+                        item.get("expected_fingerprint"),
+                        item.get("fingerprint_key_version"),
                     ),
                 )
             conn.commit()
@@ -449,6 +464,35 @@ class Repository:
         if parsed:
             parsed["approved"] = bool(parsed["approved"])
         return parsed
+
+    def claim_plan_execution(self, plan_id: str) -> str | None:
+        """Atomically take the apply lease for a plan."""
+        token = new_id("exec")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE revocation_plans SET execution_token = ? "
+                "WHERE plan_id = ? AND execution_token IS NULL",
+                (token, plan_id),
+            )
+            conn.commit()
+            return token if cursor.rowcount == 1 else None
+
+    def release_plan_execution(self, plan_id: str, token: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE revocation_plans SET execution_token = NULL "
+                "WHERE plan_id = ? AND execution_token = ?",
+                (plan_id, token),
+            )
+            conn.commit()
+
+    def clear_plan_execution(self, plan_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE revocation_plans SET execution_token = NULL WHERE plan_id = ?",
+                (plan_id,),
+            )
+            conn.commit()
 
     def set_plan_state(
         self,

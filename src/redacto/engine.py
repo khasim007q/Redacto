@@ -303,6 +303,8 @@ class Engine:
         matched_bytes: int = 0,
         match_kind: str | None = None,
         partial_match: bool = False,
+        expected_fingerprint: str | None = None,
+        fingerprint_key_version: int | None = None,
     ) -> dict[str, Any]:
         action, approved, risk = classify.propose_action(
             record_type=record_type,
@@ -342,6 +344,8 @@ class Engine:
                 if size_bytes
                 else ""
             ),
+            "expected_fingerprint": expected_fingerprint,
+            "fingerprint_key_version": fingerprint_key_version,
         }
 
     # ------------------------------------------------------------------ scan
@@ -362,6 +366,8 @@ class Engine:
             raise RedactoError("invalid_depth", "depth must be between 1 and 5")
         record = self._require_record(target_id)
         scope_stores = self._scope_stores(stores)
+        # Fail with the key-ring reason before any adapter reports target_unreachable.
+        guard = self.guard()
         target_content = self._target_content(record, target_kind, target_text)
         embedder = self.embedder()
         target_embedding = (
@@ -377,7 +383,6 @@ class Engine:
         )
 
         slots = self.adapters()
-        guard = self.guard()
         guard_findings: list[dict[str, Any]] = []
         guarded_ids: set[str] = set()
         scanned: dict[str, Record] = {}
@@ -490,6 +495,10 @@ class Engine:
                 "content_overlap": ratio,
                 "size_bytes": size,
                 "matched_bytes": int(ratio * size),
+                "expected_fingerprint": fingerprint(
+                    scanned_record.content, self.settings.current_hmac_key
+                ),
+                "fingerprint_key_version": self.settings.hmac_key_version,
             }
             match = matcher.match(scanned_record)
             if match is not None:
@@ -516,6 +525,8 @@ class Engine:
                     matched_bytes=matched,
                     match_kind=match.kind,
                     partial_match=match.is_partial,
+                    expected_fingerprint=common["expected_fingerprint"],
+                    fingerprint_key_version=common["fingerprint_key_version"],
                 )
                 continue
             if record_id in descendant_by_id:
@@ -544,6 +555,8 @@ class Engine:
                     size_bytes=size,
                     matched_bytes=int(ratio * size),
                     match_kind="lineage",
+                    expected_fingerprint=common["expected_fingerprint"],
+                    fingerprint_key_version=common["fingerprint_key_version"],
                 )
                 continue
 
@@ -1724,6 +1737,9 @@ class Engine:
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
         recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED"})
+        if recovery:
+            # A hard-killed apply leaves its lease behind; recovery explicitly clears it.
+            self.repo.clear_plan_execution(plan_id)
         try:
             issued = authorization.issue_approval(
                 self.repo, plan_id=plan_id, approval_ref=approval_ref, ttl_seconds=ttl_seconds
@@ -1873,6 +1889,21 @@ class Engine:
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         """Apply an approved plan, marking an unexpected abort as FAILED."""
+        simulate = self.settings.dry_run if dry_run is None else dry_run
+        plan = self.repo.get_plan(plan_id)
+        execution_token: str | None = None
+        if (
+            not simulate
+            and plan is not None
+            and plan["state"] in {"APPROVED", "EXECUTING", "FAILED"}
+        ):
+            execution_token = self.repo.claim_plan_execution(plan_id)
+            if execution_token is None:
+                raise RedactoError(
+                    "apply_in_progress",
+                    "Another apply is executing this plan.",
+                    {"plan_id": plan_id},
+                )
         try:
             return self._apply(
                 plan_id=plan_id,
@@ -1884,15 +1915,18 @@ class Engine:
         except RedactoError:
             raise
         except Exception as exc:
-            plan = self.repo.get_plan(plan_id)
-            if plan is not None and plan["state"] == "EXECUTING":
+            current = self.repo.get_plan(plan_id)
+            if current is not None and current["state"] == "EXECUTING":
                 self.repo.set_plan_state(plan_id, "FAILED")
-                self.repo.set_request_state(plan["request_id"], "FAILED")
+                self.repo.set_request_state(current["request_id"], "FAILED")
             raise RedactoError(
                 "apply_failed",
                 "Apply aborted unexpectedly; the plan is marked FAILED.",
                 {"type": type(exc).__name__},
             ) from exc
+        finally:
+            if execution_token is not None:
+                self.repo.release_plan_execution(plan_id, execution_token)
 
     def _apply(
         self,
@@ -2097,6 +2131,75 @@ class Engine:
                 counts["failed"] += 1
                 results.append(
                     {"item_id": item["item_id"], "result": "failed", "error_code": "adapter_unavailable"}
+                )
+                continue
+
+            # TOCTOU guard: only mutate content that still matches the plan-time
+            # fingerprint. Recovery approvals can stretch the plan's age indefinitely.
+            expected_fingerprint = item.get("expected_fingerprint")
+            expected_key = self.settings.key_for_version(
+                item.get("fingerprint_key_version")
+            )
+            content_error: str | None = None
+            if not expected_fingerprint or expected_key is None:
+                content_error = "content_unverifiable"
+            else:
+                try:
+                    current = slot.adapter.read_record(record["locator"])
+                except AdapterError as exc:
+                    if exc.code == "not_found":
+                        self.repo.record_action(
+                            request_id=plan["request_id"],
+                            item_id=item["item_id"],
+                            adapter_id=record["store_id"],
+                            operation=action,
+                            result="already_absent",
+                            error_code=None,
+                            started_at=started,
+                            finished_at=now_iso(),
+                            idempotency_key=idempotency_key,
+                        )
+                        self.repo.set_item_state(item["item_id"], "already_absent")
+                        self.repo.mark_record_deleted(item["record_id"])
+                        counts["already_absent"] += 1
+                        results.append(
+                            {
+                                "item_id": item["item_id"],
+                                "record_id": item["record_id"],
+                                "result": "already_absent",
+                                "operation": action,
+                            }
+                        )
+                        continue
+                    content_error = exc.code
+                else:
+                    if fingerprint(current.content, expected_key) != expected_fingerprint:
+                        content_error = "content_changed"
+
+            if content_error is not None:
+                self.repo.record_action(
+                    request_id=plan["request_id"],
+                    item_id=item["item_id"],
+                    adapter_id=record["store_id"],
+                    operation=action,
+                    result="failed",
+                    error_code=content_error,
+                    started_at=started,
+                    finished_at=now_iso(),
+                    idempotency_key=idempotency_key,
+                )
+                self.repo.set_item_state(
+                    item["item_id"],
+                    "content_changed" if content_error == "content_changed" else "failed",
+                )
+                counts["failed"] += 1
+                results.append(
+                    {
+                        "item_id": item["item_id"],
+                        "record_id": item["record_id"],
+                        "result": "failed",
+                        "error_code": content_error,
+                    }
                 )
                 continue
 

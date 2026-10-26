@@ -213,7 +213,11 @@ sequenceDiagram
 - **Crash/failure recovery**: an `EXECUTING` or `FAILED` plan can be re-approved with a
   new token; completed actions are skipped and failed action rows are cleared for a safe
   retry. A plan can be `CANCELLED` before execution, and a cancelled plan cannot be
-  applied.
+  applied. An exclusive execution lease prevents two concurrent applies from both
+  reporting the same work; recovery approval clears a stale lease.
+- **TOCTOU guard**: each plan item stores the record's keyed content fingerprint at plan
+  time. Apply re-reads the record and refuses to mutate if the content changed or the
+  expected key version is unavailable.
 - **Item review**: `review-item` rewrites a `REVIEW_REQUIRED` item to a concrete adapter
   action and bumps the plan version, so the changed plan needs a fresh token. Rejections
   are recorded without admitting the item.

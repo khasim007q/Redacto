@@ -40,6 +40,8 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
                 "reason_redacted": candidate["reason_redacted"],
                 "risk": risk,
                 "approved": approved,
+                "expected_fingerprint": candidate.get("expected_fingerprint"),
+                "fingerprint_key_version": candidate.get("fingerprint_key_version"),
                 "depth": candidate.get("depth"),
                 "unreachable": bool(candidate.get("unreachable")),
                 "size_bytes": int(candidate.get("size_bytes", 0)),
@@ -75,6 +77,8 @@ def compute_plan_hash(
                 "evidence_class": item["evidence_class"],
                 "proposed_action": item["proposed_action"],
                 "approved": bool(item["approved"]),
+                "expected_fingerprint": item.get("expected_fingerprint"),
+                "fingerprint_key_version": item.get("fingerprint_key_version"),
             }
             for item in sorted(items, key=lambda i: i["item_id"])
         ],
