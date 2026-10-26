@@ -37,6 +37,14 @@
     "replayed_jsonl_event": "blocked:exact_fingerprint or revoked_record_id",
     "rebuilt_vector_chunk": "blocked:exact_derivative_fingerprint or partial_copy",
     "paraphrased_memory": "quarantined:anchor_overlap",
-    "unrelated_note": "allowed"
+    "unrelated_note": "allowed",
+    "no_anchor_paraphrase": "quarantined:embedding_similarity"
+  },
+  "embedding_calibration": {
+    "threshold": 0.3,
+    "false_positives": 0,
+    "missed_paraphrases": 0,
+    "negatives_max_score": 0.17,
+    "positives_min_score": 0.31
   }
 }

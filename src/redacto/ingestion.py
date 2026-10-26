@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
+from redacto.discovery.embeddings import EmbeddingProvider, cosine
 from redacto.discovery.normalization import fingerprint, normalize_loose
 
 SHINGLE_SIZE = 5
@@ -151,9 +152,20 @@ class TombstoneMaterial:
     shingles: tuple[str, ...]
     anchors: tuple[str, ...]
     tokens: tuple[str, ...]
+    embedding: tuple[float, ...] = ()
+    embedding_model: str = ""
 
     @classmethod
-    def build(cls, content: str, key: str) -> "TombstoneMaterial":
+    def build(
+        cls, content: str, key: str, embedder: EmbeddingProvider | None = None
+    ) -> "TombstoneMaterial":
+        embedding: tuple[float, ...] = ()
+        model = ""
+        if embedder is not None and getattr(embedder, "model_id", "none") != "none":
+            values = embedder.embed(content)
+            if values:
+                embedding = tuple(values)
+                model = embedder.model_id
         return cls(
             fingerprint=_hmac(content, key),
             shingles=tuple(_hmac(item, key) for item in shingles(content)),
@@ -161,6 +173,8 @@ class TombstoneMaterial:
                 f"{weight}:{_hmac(value, key)}" for value, weight in anchor_items(content)
             ),
             tokens=tuple(_hmac(item, key) for item in tokens(content)),
+            embedding=embedding,
+            embedding_model=model,
         )
 
 
@@ -185,6 +199,7 @@ class GuardDecision:
     target_id: str | None = None
     target_kind: str | None = None
     label_redacted: str | None = None
+    degraded: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -203,6 +218,7 @@ class GuardDecision:
             "target_id": self.target_id,
             "target_kind": self.target_kind,
             "label_redacted": self.label_redacted,
+            "degraded": self.degraded,
         }
 
 
@@ -211,38 +227,98 @@ def _allowed() -> GuardDecision:
 
 
 class TombstoneGuard:
-    """Evaluate records against active tombstones before admission."""
+    """Evaluate records against active tombstones before admission.
 
-    def __init__(self, tombstones: Iterable[dict[str, Any]], key: str):
+    Tombstones are grouped by the key version that produced their material. During
+    rotation every active version must remain in the key ring. If any active
+    tombstone references a missing key, the guard fails closed: ingestion is blocked
+    rather than silently claiming protection it cannot provide.
+    """
+
+    def __init__(
+        self,
+        tombstones: Iterable[dict[str, Any]],
+        keyring: Mapping[int, str],
+        current_version: int,
+        embedder: EmbeddingProvider | None = None,
+        embedding_threshold: float = 0.30,
+    ):
         self._tombstones = [t for t in tombstones if t.get("status") == "active"]
-        self._key = key
+        self._keyring = {int(version): key for version, key in keyring.items()}
+        self._current = int(current_version)
+        self._embedder = embedder
+        self._embedding_threshold = embedding_threshold
+        self._missing_versions = sorted(
+            {
+                int(tombstone.get("key_version") or 1)
+                for tombstone in self._tombstones
+                if int(tombstone.get("key_version") or 1) not in self._keyring
+            }
+        )
 
     @classmethod
-    def from_repo(cls, repo, key: str) -> "TombstoneGuard":
-        return cls(repo.list_tombstones(statuses=("active",)), key)
+    def from_repo(
+        cls,
+        repo,
+        *,
+        keyring: Mapping[int, str],
+        current_version: int,
+        embedder: EmbeddingProvider | None = None,
+        embedding_threshold: float = 0.30,
+    ) -> "TombstoneGuard":
+        return cls(
+            repo.list_tombstones(statuses=("active",)),
+            keyring,
+            current_version,
+            embedder=embedder,
+            embedding_threshold=embedding_threshold,
+        )
 
     @property
     def active_count(self) -> int:
         return len(self._tombstones)
 
+    @property
+    def protection_degraded(self) -> bool:
+        return bool(self._missing_versions)
+
+    @property
+    def missing_versions(self) -> list[int]:
+        return list(self._missing_versions)
+
     def evaluate(self, *, record_id: str, content: str) -> GuardDecision:
         if not self._tombstones:
             return _allowed()
+        if self._missing_versions:
+            return GuardDecision(
+                decision=BLOCKED,
+                reason_code="key_unavailable_fail_closed",
+                match_score=1.0,
+                degraded=True,
+            )
 
-        record_fingerprint = _hmac(content, self._key)
-        record_shingles = {_hmac(item, self._key) for item in shingles(content)}
-        record_anchors = {_hmac(item, self._key) for item in anchors(content)}
-        record_tokens = {_hmac(item, self._key) for item in tokens(content)}
+        versions = {
+            int(tombstone.get("key_version") or 1) for tombstone in self._tombstones
+        }
+        materials: dict[int, tuple[str, set[str], set[str], set[str]]] = {}
+        for version in versions:
+            key = self._keyring[version]
+            materials[version] = (
+                _hmac(content, key),
+                {_hmac(item, key) for item in shingles(content)},
+                {_hmac(item, key) for item in anchors(content)},
+                {_hmac(item, key) for item in tokens(content)},
+            )
+
+        record_embedding: list[float] = []
+        if self._embedder is not None and any(t.get("embedding") for t in self._tombstones):
+            record_embedding = self._embedder.embed(content)
 
         best = _allowed()
         for tombstone in self._tombstones:
+            version = int(tombstone.get("key_version") or 1)
             decision = self._evaluate_one(
-                tombstone,
-                record_id=record_id,
-                record_fingerprint=record_fingerprint,
-                record_shingles=record_shingles,
-                record_anchors=record_anchors,
-                record_tokens=record_tokens,
+                tombstone, record_id, *materials[version], record_embedding=record_embedding
             )
             if _SEVERITY[decision.decision] > _SEVERITY[best.decision] or (
                 decision.decision == best.decision and decision.match_score > best.match_score
@@ -259,12 +335,12 @@ class TombstoneGuard:
     def _evaluate_one(
         self,
         tombstone: dict[str, Any],
-        *,
         record_id: str,
         record_fingerprint: str,
         record_shingles: set[str],
         record_anchors: set[str],
         record_tokens: set[str],
+        record_embedding: list[float] | None = None,
     ) -> GuardDecision:
         base = {
             "tombstone_id": tombstone["tombstone_id"],
@@ -272,7 +348,6 @@ class TombstoneGuard:
             "target_kind": tombstone["target_kind"],
             "label_redacted": tombstone["label_redacted"],
         }
-
         # 1. The revoked record reappearing under its original identity.
         if record_id == tombstone["target_id"]:
             return GuardDecision(BLOCKED, "same_target", 1.0, **base)
@@ -291,8 +366,6 @@ class TombstoneGuard:
             containment = len(record_shingles & tombstone_shingles) / len(record_shingles)
             if containment >= PARTIAL_COPY_BLOCK_RATIO:
                 return GuardDecision(BLOCKED, "partial_copy", containment, **base)
-        else:
-            containment = 0.0
 
         # 4. Fact/secret targets: all distinctive tokens present.
         if tombstone["target_kind"] in {"fact", "secret"}:
@@ -316,6 +389,14 @@ class TombstoneGuard:
             similarity = len(record_shingles & tombstone_shingles) / len(record_shingles)
             if similarity >= SIMILAR_CONTENT_REVIEW_RATIO:
                 return GuardDecision(QUARANTINED, "similar_content", similarity, **base)
+
+        # 7. Embedding similarity: a risk signal, never proof. It can only
+        #    quarantine; exact copies and shared content are handled above.
+        tombstone_embedding = tombstone.get("embedding") or []
+        if record_embedding and tombstone_embedding:
+            similarity = cosine(record_embedding, tombstone_embedding)
+            if similarity >= self._embedding_threshold:
+                return GuardDecision(QUARANTINED, "embedding_similarity", similarity, **base)
 
         return _allowed()
 

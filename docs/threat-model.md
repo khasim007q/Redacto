@@ -46,6 +46,10 @@ destructive or leaking component**.
 | T17 | Re-ingestion recreates a revoked trace (restored file, replayed log, rebuilt index) | The guard runs before store writes and graph admission; exact/near copies are blocked | `test_restoring_the_original_file_is_blocked`, `test_renamed_exact_copy_is_blocked_by_fingerprint`, `test_replaying_an_old_jsonl_event_is_blocked`, `test_rebuilt_vector_chunk_is_blocked`, `test_ingest_refuses_to_write_a_blocked_record_to_a_store` |
 | T18 | An uncertain match is silently dropped, losing useful data | Uncertain matches are quarantined with a locator and reason, never deleted; review is explicit | `test_paraphrased_memory_is_quarantined_not_dropped`, `test_quarantine_can_be_reviewed`, `test_unrelated_records_are_still_allowed` |
 | T19 | A stale or foreign tombstone blocks legitimate data | Tombstones only activate after a real applied revocation; HMAC binding means a different key cannot match; false positives are quarantined, not deleted | `test_no_tombstone_before_apply`, `test_guard_uses_hmac_so_another_key_cannot_match` |
+| T20 | Approving a quarantined record bypasses a revocation | Approval re-reads the record, rechecks every active tombstone and the safety mode, and refuses hard blocks; rejection admits nothing; both are audited | `test_approval_rechecks_tombstones_added_after_quarantine`, `test_approved_record_cannot_bypass_a_later_revocation`, `test_rejection_preserves_decision_without_admitting` |
+| T21 | Key rotation silently disables tombstone matching | Tombstones carry a key version; old versions stay in the ring; missing versions fail closed and are reported degraded; retirement refuses while in use | `test_old_tombstone_still_enforced_during_rotation`, `test_missing_old_key_fails_closed_for_all_ingestion`, `test_retirement_refuses_while_version_is_in_use` |
+| T22 | An embedding score is treated as proof of lineage or used to delete | Embeddings can only generate review candidates and quarantine; they never block, never approve, never create confirmed edges; thresholds are calibrated and FP/FN measured | `test_embedding_similarity_alone_never_blocks`, `test_embedding_candidate_is_not_confirmed_lineage`, `test_calibration_measures_false_positives_and_misses` |
+| T23 | A quarantine approval outlives the policy it was granted under | The recheck snapshot, reviewer, note and safety mode are persisted with the decision; strict mode refuses uncertainty overrides | `test_strict_mode_refuses_uncertain_override`, `test_approval_admits_through_audited_path` |
 
 ## Residual risks (accepted, disclosed)
 
@@ -54,13 +58,19 @@ destructive or leaking component**.
 - **Paraphrase detection is incomplete.** Verification matches planned record IDs and
   the keyed whole-target fingerprint; a reworded remnant in an unlinked store may
   survive and is not detectable by this method.
-- **Re-ingestion is mitigated, not eliminated.** Exact and near copies are blocked and
-  anchor-bearing paraphrases are quarantined, but a paraphrase with no shared
-  distinctive anchors can still pass. Embedding-based detection is the next step.
-- **Tombstone material is key-bound.** Changing `REDACTO_HMAC_KEY` invalidates existing
-  tombstone matching until material is re-derived; key rotation is a manual procedure.
-- **Quarantine is a queue, not a workflow.** Approving a quarantine entry records the
-  decision but does not admit the record to the graph.
+- **Re-ingestion is mitigated, not eliminated.** Exact and near copies are blocked;
+  anchor-bearing paraphrases and embedding-similar paraphrases are quarantined. A
+  paraphrase below the calibrated embedding threshold can still pass, and the local
+  embedding is lexical-semantic rather than a production neural model.
+- **Thresholds are synthetic.** Embedding false-positive/missed-paraphrase counts come
+  from a small hand-labelled fixture. Production deployment requires recalibration on
+  real labelled examples.
+- **Key rotation requires retaining old keys.** Tombstones are not re-derived; a
+  missing version fails closed rather than degrading silently. Tombstone retention and
+  expiry are not implemented yet.
+- **Quarantine approval is a human override of uncertainty.** It cannot override a hard
+  tombstone block, but it can admit a record later judged risky if no current tombstone
+  covers it; the reviewer, note and recheck snapshot are the accountability record.
 - **Keyed fingerprints are only as strong as `REDACTO_HMAC_KEY`.** The fixture default
   is not a secret; production use requires a real key and rotation story.
 - **Model assessment quality is not benchmarked** in this MVP; the deterministic path

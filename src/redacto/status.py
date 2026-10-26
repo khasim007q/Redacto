@@ -36,24 +36,58 @@ def _model_status(settings: Settings) -> dict[str, object]:
     }
 
 
-def _revocation_counts(db_path: Path) -> dict[str, object]:
-    """Read-only counts; never creates or mutates the graph database."""
+def _revocation_status(settings: Settings) -> dict[str, object]:
+    """Read-only tombstone/keyring health; never creates or mutates the database."""
+    base: dict[str, object] = {
+        "available": False,
+        "active_tombstones": 0,
+        "quarantine_pending": 0,
+        "tombstones_by_key_version": {},
+        "missing_key_versions": [],
+        "protection_degraded": bool(settings.keyring_error),
+        "keyring_error": settings.keyring_error,
+        "configured_key_versions": sorted(settings.hmac_keys),
+        "current_key_version": settings.hmac_key_version,
+    }
+    db_path = settings.db_path
     if not db_path.is_file():
-        return {"available": False, "active_tombstones": 0, "quarantine_pending": 0}
+        return base
     try:
         conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=2)
     except sqlite3.Error:
-        return {"available": False, "active_tombstones": 0, "quarantine_pending": 0}
+        return base
     try:
         active = conn.execute("SELECT COUNT(*) FROM tombstones WHERE status = 'active'").fetchone()[0]
         pending = conn.execute(
             "SELECT COUNT(*) FROM quarantine WHERE status = 'pending_review'"
         ).fetchone()[0]
-        return {"available": True, "active_tombstones": active, "quarantine_pending": pending}
+        by_version = {
+            int(row[0]): int(row[1])
+            for row in conn.execute(
+                "SELECT key_version, COUNT(*) FROM tombstones WHERE status = 'active' "
+                "GROUP BY key_version"
+            ).fetchall()
+        }
     except sqlite3.Error:
-        return {"available": False, "active_tombstones": 0, "quarantine_pending": 0}
+        return base
     finally:
         conn.close()
+
+    missing = sorted(v for v in by_version if v not in settings.hmac_keys)
+    current_missing = settings.hmac_key_version not in settings.hmac_keys
+    base.update(
+        {
+            "available": True,
+            "active_tombstones": active,
+            "quarantine_pending": pending,
+            "tombstones_by_key_version": by_version,
+            "missing_key_versions": missing,
+            "protection_degraded": bool(
+                settings.keyring_error or missing or current_missing
+            ),
+        }
+    )
+    return base
 
 
 def collect_status(settings: Settings, *, transport: str) -> dict[str, object]:
@@ -96,11 +130,17 @@ def collect_status(settings: Settings, *, transport: str) -> dict[str, object]:
         "reachable_adapter_count": len(reachable),
         "unreachable_adapters": unreachable,
         "model_assessment": _model_status(settings),
+        "embeddings": {
+            "provider": settings.embedding_provider,
+            "candidate_threshold": settings.embedding_candidate_threshold,
+            "quarantine_threshold": settings.embedding_quarantine_threshold,
+            "role": "candidate generation and risk scoring only; never proof of lineage",
+        },
         "storage": {
             "graph_db": str(settings.db_path),
             "graph_db_parent_ready": not pending_db,
         },
-        "revocation": _revocation_counts(settings.db_path),
+        "revocation": _revocation_status(settings),
         "limitations": [
             "Verification covers configured, reachable stores only.",
             "A successful adapter response is not proof that copies, backups or provider logs are gone.",

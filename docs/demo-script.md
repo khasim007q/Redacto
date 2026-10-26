@@ -50,8 +50,21 @@ Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
 ```
 
 `ingest` reports `restored.md` as `blocked` (`exact_fingerprint`): the copy never
-enters the provenance graph. A paraphrase is reported as `quarantined`
-(`anchor_overlap`) and appears in the quarantine queue instead of being deleted.
+enters the provenance graph. A no-anchor paraphrase is reported as `quarantined`
+(`embedding_similarity`) and appears in the quarantine queue instead of being
+deleted. If the paraphrase shares distinctive anchors, the reason is
+`anchor_overlap` instead; both are quarantine, never deletion.
+
+Resolve a quarantine entry (application action, not an agent tool):
+
+```powershell
+.venv\Scripts\python.exe -m redacto resolve-quarantine --id <QUARANTINE_ID> \
+  --decision approved --reviewer "reviewer-id" --note "why this is safe"
+```
+
+Approval rechecks active tombstones and policy, records the decision, and only then
+admits the record to the graph. `--decision rejected` records the decision without
+admitting anything.
 
 ## Storyboard with timings
 
@@ -87,6 +100,18 @@ Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
 
 Point at the `blocked` decision and explain that the file on disk was not deleted by
 the guard: blocking admission is not the same as a new destructive action.
+
+## Optional: key rotation and embedding calibration (20 seconds)
+
+```powershell
+.venv\Scripts\python.exe -m redacto keyring
+.venv\Scripts\python.exe -m redacto calibrate-embeddings --thresholds 0.25,0.3,0.6
+```
+
+Say: "Rotation is versioned. Old tombstone keys stay in the ring, and if one is
+missing ingestion fails closed instead of pretending protection still works.
+Embedding thresholds are measured: at 0.30 the synthetic set has zero false
+positives and zero missed paraphrases."
 
 ## What to point at when someone asks "did it really work?"
 

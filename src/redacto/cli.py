@@ -133,6 +133,37 @@ def cmd_quarantine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_calibrate_embeddings(args: argparse.Namespace) -> int:
+    from redacto.discovery.embeddings import default_calibration
+
+    thresholds = (
+        [float(value) for value in args.thresholds.split(",")]
+        if args.thresholds
+        else [0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+    )
+    reports = {
+        f"{threshold:.2f}": default_calibration(threshold).as_dict()
+        for threshold in thresholds
+    }
+    summary = {
+        threshold: {
+            "false_positives": report["false_positives"],
+            "false_negatives": report["false_negatives"],
+            "true_positives": report["true_positives"],
+            "true_negatives": report["true_negatives"],
+        }
+        for threshold, report in reports.items()
+    }
+    _print({"ok": True, "thresholds": summary, "detail": reports})
+    return 0
+
+
+def cmd_keyring(args: argparse.Namespace) -> int:
+    engine = _engine()
+    _print(engine.keyring_report(retire_version=args.retire))
+    return 0
+
+
 def cmd_ingest(args: argparse.Namespace) -> int:
     engine = _engine()
     _print(engine.reingest_stores(stores=_stores(args.stores)))
@@ -141,7 +172,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 def cmd_resolve_quarantine(args: argparse.Namespace) -> int:
     engine = _engine()
-    _print(engine.resolve_quarantine(quarantine_id=args.id, decision=args.decision))
+    _print(
+        engine.resolve_quarantine(
+            quarantine_id=args.id,
+            decision=args.decision,
+            reviewer=args.reviewer,
+            note=args.note,
+        )
+    )
     return 0
 
 
@@ -227,7 +265,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
             "INSERT OR REPLACE INTO memories (id, content, created_at, sensitivity) VALUES (?, ?, ?, ?)",
             (
                 "mem-reintroduced-paraphrase",
-                "Kestrel deal was about $42 million, I believe.",
+                "A private firm is buying the sensor maker for about 42 million in cash.",
                 "2026-10-26T12:00:00+00:00",
                 "confidential",
             ),
@@ -241,6 +279,9 @@ def cmd_demo(args: argparse.Namespace) -> int:
             f"{finding['reason_code']} (score {finding['match_score']})"
         )
     print("    Restored exact copies are blocked; paraphrases are quarantined for review, not deleted.")
+    print("    Demo subset: 2 scenarios (1 blocked, 1 quarantined).")
+    print("    Full test matrix: 9 scenarios - 6 blocked, 2 quarantined, 1 allowed")
+    print("    (tests/test_tombstones.py + tests/test_embeddings.py).")
     print("    Learn more: README.md and docs/demo-script.md")
     return 0
 
@@ -319,6 +360,16 @@ def build_parser() -> argparse.ArgumentParser:
     quarantine.add_argument("--statuses", default="pending_review")
     quarantine.set_defaults(func=cmd_quarantine)
 
+    calibrate = sub.add_parser(
+        "calibrate-embeddings", help="measure embedding false positives and missed paraphrases"
+    )
+    calibrate.add_argument("--thresholds", help="comma-separated cosine thresholds")
+    calibrate.set_defaults(func=cmd_calibrate_embeddings)
+
+    keyring = sub.add_parser("keyring", help="audit HMAC key versions and rotation safety")
+    keyring.add_argument("--retire", type=int)
+    keyring.set_defaults(func=cmd_keyring)
+
     ingest = sub.add_parser("ingest", help="re-run the ingestion guard over configured stores")
     ingest.add_argument("--stores")
     ingest.set_defaults(func=cmd_ingest)
@@ -326,6 +377,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolve = sub.add_parser("resolve-quarantine", help="mark a quarantine entry reviewed")
     resolve.add_argument("--id", required=True)
     resolve.add_argument("--decision", required=True, choices=["approved", "rejected"])
+    resolve.add_argument("--reviewer", default="local-operator")
+    resolve.add_argument("--note")
     resolve.set_defaults(func=cmd_resolve_quarantine)
 
     demo = sub.add_parser("demo", help="run the 90-120 second end-to-end storyboard")

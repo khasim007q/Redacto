@@ -34,10 +34,10 @@ def build_adapters(settings: Settings) -> dict[str, AdapterSlot]:
         except AdapterError as exc:
             slots[adapter_id] = AdapterSlot(adapter_id, None, str(exc))
 
-    _add("filesystem", lambda: FilesystemAdapter(settings.workspace_root, settings.hmac_key))
-    _add("sqlite_memory", lambda: SqliteMemoryAdapter(settings.sqlite_store_path, settings.hmac_key))
-    _add("jsonl_logs", lambda: JsonlLogAdapter(settings.jsonl_log_path, settings.hmac_key))
-    _add("vector_fixture", lambda: VectorFixtureAdapter(settings.vector_fixture_path, settings.hmac_key))
+    _add("filesystem", lambda: FilesystemAdapter(settings.workspace_root, settings.current_hmac_key))
+    _add("sqlite_memory", lambda: SqliteMemoryAdapter(settings.sqlite_store_path, settings.current_hmac_key))
+    _add("jsonl_logs", lambda: JsonlLogAdapter(settings.jsonl_log_path, settings.current_hmac_key))
+    _add("vector_fixture", lambda: VectorFixtureAdapter(settings.vector_fixture_path, settings.current_hmac_key))
     return slots
 
 

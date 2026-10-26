@@ -19,3 +19,12 @@ class RedactoError(Exception):
                 "details": self.details,
             },
         }
+
+
+class HmacKeyError(RuntimeError):
+    """Raised when the configured key ring cannot evaluate or create material."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message

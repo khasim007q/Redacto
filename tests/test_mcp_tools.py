@@ -58,7 +58,8 @@ def _env_for(settings) -> dict:
         "REDACTO_SQLITE_PATH": str(settings.sqlite_store_path),
         "REDACTO_JSONL_PATH": str(settings.jsonl_log_path),
         "REDACTO_VECTOR_PATH": str(settings.vector_fixture_path),
-        "REDACTO_HMAC_KEY": settings.hmac_key,
+        "REDACTO_HMAC_KEY": settings.current_hmac_key,
+        "REDACTO_HMAC_KEY_VERSION": str(settings.hmac_key_version),
         "REDACTO_DRY_RUN": "false",
     }
 

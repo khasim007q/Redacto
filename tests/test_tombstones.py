@@ -380,6 +380,6 @@ def test_guard_uses_hmac_so_another_key_cannot_match(tmp_path):
     tombstone = engine.repo.list_tombstones()[0]
     from redacto.ingestion import TombstoneGuard
 
-    other_key = TombstoneGuard([tombstone], "a-different-key")
+    other_key = TombstoneGuard([tombstone], {1: "a-different-key"}, 1)
     decision = other_key.evaluate(record_id="fs:copy.md", content=ACQUISITION_PLAN)
     assert decision.decision == "allowed"

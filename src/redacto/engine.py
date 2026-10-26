@@ -11,6 +11,7 @@ from typing import Any, Sequence
 from redacto.adapters.base import AdapterError, Record
 from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
+from redacto.discovery.embeddings import build_embedder, cosine
 from redacto.discovery.exact import ExactMatcher, shares_entity
 from redacto.discovery.normalization import fingerprint
 from redacto.discovery.relationship_assessor import (
@@ -19,7 +20,7 @@ from redacto.discovery.relationship_assessor import (
     build_assessor,
     minimize_snippet,
 )
-from redacto.errors import RedactoError
+from redacto.errors import HmacKeyError, RedactoError
 from redacto.graph.repository import RECEIPT_VERSION, Repository, new_id, now_iso
 from redacto.graph.traversal import traverse
 from redacto.ingestion import (
@@ -175,16 +176,34 @@ class Engine:
             record_type=record.record_type,
             store_id=record.store_id,
             locator=record.locator,
-            fingerprint=fingerprint(record.content, self.settings.hmac_key),
+            fingerprint=fingerprint(record.content, self.settings.current_hmac_key),
+            fingerprint_key_version=self.settings.hmac_key_version,
             created_at=record.metadata.get("created_at") or None,
             sensitivity=sensitivity or ["unknown"],
             capabilities=capabilities,
             status="active",
         )
 
+    def embedder(self):
+        return build_embedder(self.settings.embedding_provider)
+
     def guard(self) -> TombstoneGuard:
-        """Active tombstones, rebuilt from stored keyed material only."""
-        return TombstoneGuard.from_repo(self.repo, self.settings.hmac_key)
+        """Active tombstones, rebuilt from stored keyed material only.
+
+        Fails closed when the current key version is missing or the key ring is
+        invalid: no ingestion should proceed while protection cannot be evaluated.
+        """
+        try:
+            self.settings.current_hmac_key
+        except HmacKeyError as exc:
+            raise RedactoError(exc.code, exc.message, {"keyring_error": exc.message}) from exc
+        return TombstoneGuard.from_repo(
+            self.repo,
+            keyring=self.settings.hmac_keys,
+            current_version=self.settings.hmac_key_version,
+            embedder=self.embedder(),
+            embedding_threshold=self.settings.embedding_quarantine_threshold,
+        )
 
     def _record_guard_decision(
         self, decision, record: Record, *, present_in_store: bool
@@ -276,6 +295,10 @@ class Engine:
         record = self._require_record(target_id)
         scope_stores = self._scope_stores(stores)
         target_content = self._target_content(record, target_kind, target_text)
+        embedder = self.embedder()
+        target_embedding = (
+            embedder.embed(target_content) if embedder.model_id != "none" else []
+        )
 
         traversal = traverse(self.repo, target_id, max_depth=depth)
         matcher = ExactMatcher(
@@ -329,11 +352,20 @@ class Engine:
             )
             caps = self._record_capabilities(store, slot)
             for scanned_record in records:
-                # Tombstone guard runs before anything enters the provenance graph.
-                decision = guard.evaluate(
-                    record_id=scanned_record.record_id, content=scanned_record.content
+                # The guard protects the admission boundary. Records already active in
+                # the graph (for example a record admitted after review) stay visible so
+                # a later revocation can target them. Restored or never-admitted records
+                # are still guarded, including a restored revocation target.
+                existing = self.repo.get_record(scanned_record.record_id)
+                already_active = existing is not None and existing["status"] == "active"
+                decision = (
+                    None
+                    if already_active
+                    else guard.evaluate(
+                        record_id=scanned_record.record_id, content=scanned_record.content
+                    )
                 )
-                if decision.decision != ALLOWED:
+                if decision is not None and decision.decision != ALLOWED:
                     self._record_guard_decision(decision, scanned_record, present_in_store=True)
                     guard_findings.append(
                         self._guard_finding(decision, scanned_record, present_in_store=True)
@@ -355,6 +387,7 @@ class Engine:
         candidate_edges = {edge["target_id"]: edge for edge in traversal.candidates}
         candidates: dict[str, dict[str, Any]] = {}
         unrelated_preserved = 0
+        embedding_candidates = 0
 
         for record_id, scanned_record in scanned.items():
             if record_id in guarded_ids:
@@ -453,6 +486,42 @@ class Engine:
                 }
                 continue
 
+            if target_embedding:
+                similarity = cosine(target_embedding, embedder.embed(scanned_record.content))
+                if similarity >= self.settings.embedding_candidate_threshold:
+                    evidence = (
+                        f"Embedding similarity {similarity:.2f}; candidate only, not lineage."
+                    )
+                    candidates[record_id] = self._candidate(
+                        record_id=record_id,
+                        store_id=scanned_record.store_id,
+                        record_type=scanned_record.record_type,
+                        capabilities=capabilities,
+                        evidence_class=classify.SUSPECTED_DERIVATIVE,
+                        reason_redacted=classify.explain(
+                            evidence_class=classify.SUSPECTED_DERIVATIVE,
+                            record_type=scanned_record.record_type,
+                            action=classify.REVIEW_REQUIRED,
+                            candidate_evidence=evidence,
+                        ),
+                        relation="possible_derivative",
+                    )
+                    embedding_candidates += 1
+                    if record_id not in candidate_edges:
+                        self.repo.add_candidate_edge(
+                            source_id=target_id,
+                            target_id=record_id,
+                            relation_guess="possible_derivative",
+                            evidence_summary_redacted=evidence,
+                            model_id=embedder.model_id,
+                            confidence=similarity,
+                        )
+                        candidate_edges[record_id] = {
+                            "target_id": record_id,
+                            "relation_guess": "possible_derivative",
+                        }
+                    continue
+
             unrelated_preserved += 1
 
         for node in traversal.descendants if not fact_mode else []:
@@ -537,6 +606,13 @@ class Engine:
             "coverage": coverage,
             "unreachable_stores": [entry["store_id"] for entry in unreachable],
             "model": model_meta,
+            "embeddings": {
+                "provider": embedder.model_id,
+                "candidate_threshold": self.settings.embedding_candidate_threshold,
+                "quarantine_threshold": self.settings.embedding_quarantine_threshold,
+                "candidates_generated": embedding_candidates,
+                "note": "Embedding similarity generates review candidates only; it never proves lineage.",
+            },
             "guard": {
                 "active_tombstones": guard.active_count,
                 "counts": summarize_guard_findings(guard_findings),
@@ -727,7 +803,10 @@ class Engine:
         # Capture tombstone material now: after apply the target content may be gone.
         target_record = self._require_record(target_id)
         target_content = self._target_content(target_record, target_kind, target_text)
-        material = TombstoneMaterial.build(target_content, self.settings.hmac_key)
+        embedder = self.embedder()
+        material = TombstoneMaterial.build(
+            target_content, self.settings.current_hmac_key, embedder
+        )
         if target_kind == "source":
             label_redacted = (
                 target_record["locator"].get("path")
@@ -749,6 +828,9 @@ class Engine:
             target_anchors=material.anchors,
             target_tokens=material.tokens,
             target_label_redacted=label_redacted,
+            target_key_version=self.settings.hmac_key_version,
+            target_embedding=material.embedding,
+            target_embedding_model=material.embedding_model or None,
         )
         version = self.repo.next_plan_version(request_id)
         plan_hash = compute_plan_hash(
@@ -813,6 +895,8 @@ class Engine:
             "scope": tombstone["scope"],
             "policy": tombstone["policy"],
             "status": tombstone["status"],
+            "key_version": tombstone.get("key_version", 1),
+            "embedding_model": tombstone.get("embedding_model"),
             "created_at": tombstone["created_at"],
             "activated_at": tombstone["activated_at"],
             "related_record_ids": tombstone["related_record_ids"],
@@ -851,6 +935,9 @@ class Engine:
             scope=request["scope"],
             policy=request["policy"],
             status="pending",
+            key_version=request.get("target_key_version") or self.settings.hmac_key_version,
+            embedding=request.get("target_embedding", []),
+            embedding_model=request.get("target_embedding_model"),
         )
         self.repo.set_tombstone_status(tombstone_id, "active")
         return self.repo.get_tombstone(tombstone_id)
@@ -868,6 +955,73 @@ class Engine:
                 "and status only. No revoked content is stored."
             ),
         }
+
+    def keyring_report(self, *, retire_version: int | None = None) -> dict[str, Any]:
+        """Audit the versioned key ring and whether a version can be retired."""
+        active = self.repo.list_tombstones(statuses=("active",))
+        by_version: dict[int, int] = {}
+        for tombstone in active:
+            version = int(tombstone.get("key_version") or 1)
+            by_version[version] = by_version.get(version, 0) + 1
+        configured = sorted(self.settings.hmac_keys)
+        missing = sorted(version for version in by_version if version not in self.settings.hmac_keys)
+        unused_configured = [
+            version for version in configured if by_version.get(version, 0) == 0
+        ]
+        current_missing = self.settings.hmac_key_version not in self.settings.hmac_keys
+
+        report: dict[str, Any] = {
+            "ok": True,
+            "current_key_version": self.settings.hmac_key_version,
+            "configured_versions": configured,
+            "active_tombstones": len(active),
+            "tombstones_by_key_version": by_version,
+            "missing_key_versions": missing,
+            "protection_degraded": bool(
+                self.settings.keyring_error or missing or current_missing
+            ),
+            "keyring_error": self.settings.keyring_error,
+            "retirable_versions": unused_configured,
+            "rotation_steps": [
+                "Add the new key as a new version in REDACTO_HMAC_KEYS; keep the old key.",
+                "Raise REDACTO_HMAC_KEY_VERSION to the new version and restart.",
+                "Run `redacto keyring` and confirm missing_key_versions is empty.",
+                "Keep old keys until no active tombstone references them.",
+                "Remove a key only when its version appears in retirable_versions.",
+            ],
+        }
+        if current_missing:
+            report["warning"] = (
+                "The current key version is missing: ingestion and new revocations will be "
+                "refused until it is restored."
+            )
+        if missing:
+            report["warning"] = (
+                "Active tombstones reference missing key versions: ingestion fails closed "
+                "until those keys are restored."
+            )
+        if retire_version is not None:
+            if retire_version not in self.settings.hmac_keys:
+                raise RedactoError(
+                    "unknown_key_version",
+                    "That key version is not configured.",
+                    {"version": retire_version, "configured": configured},
+                )
+            if by_version.get(retire_version, 0) > 0:
+                raise RedactoError(
+                    "version_still_in_use",
+                    "Active tombstones still reference this key version; keep the key.",
+                    {
+                        "version": retire_version,
+                        "active_tombstones": by_version[retire_version],
+                    },
+                )
+            report["retirement"] = {
+                "version": retire_version,
+                "safe": True,
+                "action": "Remove this version from REDACTO_HMAC_KEYS and restart.",
+            }
+        return report
 
     # --------------------------------------------------------------- ingestion
     def ingest(
@@ -1005,11 +1159,228 @@ class Engine:
             "note": "Quarantine entries hold a locator and redacted match reason, never record content.",
         }
 
-    def resolve_quarantine(self, *, quarantine_id: str, decision: str) -> dict[str, Any]:
+    def resolve_quarantine(
+        self,
+        *,
+        quarantine_id: str,
+        decision: str,
+        reviewer: str = "local-operator",
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a quarantine entry through an explicit, auditable path.
+
+        Approving re-reads the stored record, rechecks every active tombstone and the
+        current safety mode, then admits it to the provenance graph. Rejecting records
+        the decision without admitting anything. Neither path deletes stored content.
+        """
         if decision not in {"approved", "rejected"}:
             raise RedactoError("invalid_decision", "decision must be 'approved' or 'rejected'.")
-        self.repo.set_quarantine_status(quarantine_id, decision)
-        return {"ok": True, "quarantine_id": quarantine_id, "status": decision}
+        reviewer = (reviewer or "").strip()
+        if not reviewer:
+            raise RedactoError("invalid_reviewer", "A reviewer identity is required for the audit record.")
+        if note is not None and len(note) > 500:
+            raise RedactoError("note_too_long", "Review note must be 500 characters or fewer.")
+
+        entry = self.repo.get_quarantine(quarantine_id)
+        if entry is None:
+            raise RedactoError(
+                "unknown_quarantine", "No such quarantine entry.", {"quarantine_id": quarantine_id}
+            )
+        if entry["status"] != "pending_review":
+            raise RedactoError(
+                "quarantine_already_resolved",
+                "This quarantine entry already has a recorded decision.",
+                {"quarantine_id": quarantine_id, "status": entry["status"]},
+            )
+
+        guard = self.guard()
+        policy_snapshot = {
+            "safety_mode": self.settings.safety_mode,
+            "active_tombstones": guard.active_count,
+            "reviewer": reviewer,
+            "note": note or "",
+        }
+        slots = self.adapters()
+        slot = slots.get(entry["store_id"]) if entry["store_id"] else None
+        present = slot is not None and slot.adapter is not None
+
+        if decision == "rejected":
+            record = {
+                **policy_snapshot,
+                "outcome": "rejected",
+                "reason": "human_review_rejected",
+                "admitted": False,
+            }
+            event_id = self.repo.record_ingestion_event(
+                tombstone_id=entry["tombstone_id"],
+                store_id=entry["store_id"],
+                record_id=entry["record_id"],
+                locator=entry["locator"],
+                decision="rejected",
+                reason_code="quarantine_rejected",
+                match_score=entry["match_score"],
+                present_in_store=present,
+            )
+            self.repo.set_quarantine_status(
+                quarantine_id,
+                "rejected",
+                reviewed_by=reviewer,
+                note=note,
+                recheck=record,
+            )
+            return {
+                "ok": True,
+                "quarantine_id": quarantine_id,
+                "status": "rejected",
+                "admitted": False,
+                "audit_event_id": event_id,
+                "decision_record": record,
+            }
+
+        if not present:
+            record = {
+                **policy_snapshot,
+                "outcome": "resubmit_required",
+                "reason": "source_store_unreachable_or_content_not_retained",
+                "admitted": False,
+            }
+            event_id = self.repo.record_ingestion_event(
+                tombstone_id=entry["tombstone_id"],
+                store_id=entry["store_id"],
+                record_id=entry["record_id"],
+                locator=entry["locator"],
+                decision="resubmit_required",
+                reason_code="quarantine_source_unavailable",
+                match_score=entry["match_score"],
+                present_in_store=False,
+            )
+            self.repo.set_quarantine_status(
+                quarantine_id,
+                "pending_review",
+                reviewed_by=reviewer,
+                note=note,
+                recheck=record,
+            )
+            return {
+                "ok": True,
+                "quarantine_id": quarantine_id,
+                "status": "pending_review",
+                "admitted": False,
+                "audit_event_id": event_id,
+                "decision_record": record,
+                "message": "Content is not retained in quarantine; resubmit the record to review it.",
+            }
+
+        try:
+            record = slot.adapter.read_record(entry["locator"])  # type: ignore[union-attr]
+        except AdapterError as exc:
+            outcome = {
+                **policy_snapshot,
+                "outcome": "resubmit_required",
+                "reason": f"source_record_unreadable:{exc.code}",
+                "admitted": False,
+            }
+            event_id = self.repo.record_ingestion_event(
+                tombstone_id=entry["tombstone_id"],
+                store_id=entry["store_id"],
+                record_id=entry["record_id"],
+                locator=entry["locator"],
+                decision="resubmit_required",
+                reason_code="quarantine_source_unavailable",
+                match_score=entry["match_score"],
+                present_in_store=False,
+            )
+            self.repo.set_quarantine_status(
+                quarantine_id, "pending_review", reviewed_by=reviewer, note=note, recheck=outcome
+            )
+            return {
+                "ok": True,
+                "quarantine_id": quarantine_id,
+                "status": "pending_review",
+                "admitted": False,
+                "audit_event_id": event_id,
+                "decision_record": outcome,
+            }
+
+        # Recheck the guard at resolution time, not at quarantine time.
+        # A human approval may override uncertainty, never a hard tombstone block.
+        recheck = guard.evaluate(record_id=record.record_id, content=record.content)
+        override_allowed = self.settings.safety_mode != "strict"
+        refused = recheck.decision == BLOCKED or (
+            recheck.decision == QUARANTINED and not override_allowed
+        )
+        decision_record = {
+            **policy_snapshot,
+            "outcome": recheck.decision,
+            "guard": recheck.as_dict(),
+            "review_override_allowed": override_allowed,
+            "admitted": not refused,
+        }
+        if refused:
+            event_id = self.repo.record_ingestion_event(
+                tombstone_id=recheck.tombstone_id or entry["tombstone_id"],
+                store_id=record.store_id,
+                record_id=record.record_id,
+                locator=record.locator,
+                decision=recheck.decision,
+                reason_code=f"quarantine_recheck:{recheck.reason_code}",
+                match_score=recheck.match_score,
+                present_in_store=True,
+            )
+            self.repo.set_quarantine_status(
+                quarantine_id,
+                "blocked_on_recheck",
+                reviewed_by=reviewer,
+                note=note,
+                recheck=decision_record,
+            )
+            return {
+                "ok": True,
+                "quarantine_id": quarantine_id,
+                "status": "blocked_on_recheck",
+                "admitted": False,
+                "audit_event_id": event_id,
+                "decision_record": decision_record,
+                "message": (
+                    "Approval refused: an active tombstone still blocks this record, or "
+                    "the current safety mode does not allow an uncertainty override. "
+                    "It was not admitted."
+                ),
+            }
+
+        if recheck.decision == QUARANTINED:
+            decision_record["outcome"] = "quarantined_overridden"
+            decision_record["override_reason"] = "human_review_approved"
+        capabilities = self._record_capabilities(entry["store_id"], slot)
+        self._upsert_scanned(record, capabilities)
+        event_id = self.repo.record_ingestion_event(
+            tombstone_id=None,
+            store_id=record.store_id,
+            record_id=record.record_id,
+            locator=record.locator,
+            decision="admitted",
+            reason_code="quarantine_approved",
+            match_score=entry["match_score"],
+            present_in_store=True,
+        )
+        self.repo.set_quarantine_status(
+            quarantine_id,
+            "approved",
+            reviewed_by=reviewer,
+            note=note,
+            admission_event_id=event_id,
+            recheck=decision_record,
+            admitted_at=now_iso(),
+        )
+        return {
+            "ok": True,
+            "quarantine_id": quarantine_id,
+            "status": "approved",
+            "admitted": True,
+            "record_id": record.record_id,
+            "audit_event_id": event_id,
+            "decision_record": decision_record,
+        }
 
     # --------------------------------------------------------------- approve
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
@@ -1349,6 +1720,18 @@ class Engine:
         }
         target_record = self.repo.get_record(request["target_id"])
         target_fingerprint = target_record["fingerprint"] if target_record else None
+        target_key_version = (
+            request.get("target_key_version")
+            or (target_record or {}).get("fingerprint_key_version")
+            or self.settings.hmac_key_version
+        )
+        verify_key = self.settings.key_for_version(target_key_version)
+        if target_fingerprint and verify_key is None:
+            # Cannot evaluate residuals honestly without the key that produced them.
+            target_fingerprint = None
+            key_unavailable = True
+        else:
+            key_unavailable = False
 
         slots = self.adapters()
         store_results: list[dict[str, Any]] = []
@@ -1402,16 +1785,23 @@ class Engine:
             for record in records:
                 if record.record_id in planned_removals:
                     residuals.append(record.record_id)
-                elif target_fingerprint and fingerprint(
-                    record.content, self.settings.hmac_key
+                elif target_fingerprint and verify_key and fingerprint(
+                    record.content, verify_key
                 ) == target_fingerprint:
                     residuals.append(record.record_id)
             residual_total += len(residuals)
             outcome = "verified" if not residuals else "residual"
+            if key_unavailable:
+                outcome = "not_verifiable"
             limitations = [
                 "Rescan checks planned record IDs and exact/normalized copies of the target content.",
                 "Paraphrased remnants cannot be proven absent by this method.",
             ]
+            if key_unavailable:
+                limitations.append(
+                    "The HMAC key version that produced this target fingerprint is unavailable; "
+                    "content fingerprints were not verified."
+                )
             self.repo.add_verification(
                 request_id=request_id,
                 adapter_id=store,
@@ -1460,6 +1850,11 @@ class Engine:
             limitations.append("Unreachable stores, not verified: " + ", ".join(unreachable_stores))
         if not_verifiable:
             limitations.append("Stores that could not be verified: " + ", ".join(not_verifiable))
+        if key_unavailable:
+            limitations.append(
+                f"The HMAC key version {target_key_version} that produced the target "
+                "fingerprint is unavailable; exact-copy residuals were not verified."
+            )
 
         # Activate the tombstone only after a real apply. Source revocation needs the
         # target itself gone; fact/secret revocation guards the value even if it was

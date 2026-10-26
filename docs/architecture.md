@@ -63,6 +63,7 @@ flowchart LR
 | `policy/plan.py` | Plan items, version-bound plan hash, estimated impact. |
 | `policy/authorization.py` | Application-issued confirmation tokens (hash stored, short TTL, single use). |
 | `ingestion.py` | Tombstone material, guard evaluation, and the allowed/quarantined/blocked decision. |
+| `discovery/embeddings.py` | Local deterministic embedding provider, cosine scoring, and labelled calibration. |
 | `engine.py` | scan / trace / plan / apply / verify orchestration and all scope checks. |
 | `receipts.py` | Receipt rendering to JSON and Markdown. |
 | `mcp/server.py` | Tool registration plus the error guard that never leaks stack traces. |
@@ -132,6 +133,8 @@ erDiagram
         text related_fingerprints_json
         text scope_json
         text status
+        int key_version
+        text embedding_json
     }
     ingestion_events {
         text event_id PK
@@ -213,8 +216,9 @@ sequenceDiagram
 A verified revocation writes one tombstone per request. It stores the target's keyed
 HMAC fingerprint, keyed hashes of normalized 5-word shingles, weighted anchor hashes
 (proper nouns weight 1, numeric amounts weight 2), token hashes for fact/secret
-targets, the removed records' fingerprints, scope, policy and status. The revoked
-content is not stored and cannot be recovered from the tombstone.
+targets, the removed records' fingerprints, a derived embedding vector, the key
+version that produced the material, scope, policy and status. The revoked content is
+not stored and cannot be recovered from the tombstone.
 
 ```mermaid
 flowchart TD
@@ -227,6 +231,7 @@ flowchart TD
     M -- "all fact tokens present" --> B4["BLOCK: fact_containment"]
     M -- "weighted anchors >= 3" --> Q["QUARANTINE: anchor_overlap"]
     M -- "shingle overlap >= 0.2" --> Q2["QUARANTINE: similar_content"]
+    M -- "embedding cosine >= 0.30" --> Q3["QUARANTINE: embedding_similarity"]
     M -- "no evidence" --> A
     B --> L["ingestion_events + no admission"]
     B2 --> L
@@ -241,9 +246,57 @@ review pointer and also not admitted. Neither is deleted automatically: a record
 already exists in a store stays there and is reported, preserving the approval
 boundary.
 
+Embedding similarity is a **risk signal only**: it can quarantine, never block and
+never confirm lineage. Thresholds are calibrated on a labelled synthetic set (see
+`redacto calibrate-embeddings`); the local provider is a deterministic lexical-semantic
+embedding, not a neural model.
+
 The same guard runs inside `redacto_scan`, so restoring a revoked file cannot
-re-admit it to the provenance graph. `redacto ingest` re-runs the guard over the
+re-admit it to the provenance graph. Records already active in the graph are exempt
+from the admission guard so a later revocation can still target them, while restored
+or never-admitted records are guarded. `redacto ingest` re-runs the guard over the
 configured stores and reports `allowed`, `blocked` and `quarantined` counts.
+
+## Quarantine resolution
+
+Quarantine is a review queue. Resolution is an application action, not an MCP tool.
+
+```mermaid
+sequenceDiagram
+    participant R as Reviewer (application)
+    participant E as Engine
+    participant S as Store adapter
+    participant G as Tombstone guard
+    participant DB as Graph DB
+    R->>E: resolve_quarantine(id, approved, reviewer, note)
+    E->>DB: load pending quarantine entry
+    E->>S: read the record by stored locator
+    alt record no longer readable
+        E-->>R: resubmit_required (stays pending)
+    else
+        E->>G: recheck active tombstones + safety mode
+        alt hard block, or strict mode + uncertain
+            E->>DB: status blocked_on_recheck + recheck snapshot
+            E-->>R: admitted=false, audit event
+        else allowed or uncertainty overridden
+            E->>DB: admit record (status active)
+            E->>DB: ingestion event admitted + decision record
+            E-->>R: admitted=true, audit event id
+        end
+    end
+```
+
+Rejection records the decision, reviewer, note and recheck snapshot without admitting
+the record. Neither path deletes content. An approval can override **uncertainty**;
+it can never override a hard tombstone block, which is what stops a previously
+reviewed record from being used to bypass a later revocation.
+
+## Key rotation
+
+Tombstones carry a `key_version`. The guard evaluates each tombstone with that
+version's key from `REDACTO_HMAC_KEYS`. Missing versions fail closed for ingestion;
+missing current versions refuse new work; verification reports `not_verifiable` when
+the target's key version is gone. Full procedure: [key-rotation.md](key-rotation.md).
 
 ## Transport
 

@@ -233,7 +233,8 @@ def _write_workspace(root: Path) -> None:
     db_path = root / "agent_memory.sqlite3"
     if db_path.exists():
         db_path.unlink()
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute(
             """CREATE TABLE memories (
                    id TEXT PRIMARY KEY,
@@ -259,6 +260,8 @@ def _write_workspace(root: Path) -> None:
             CACHE_ROWS,
         )
         conn.commit()
+    finally:
+        conn.close()
 
     (root / "agent_events.jsonl").write_text(
         "\n".join(json.dumps(event, ensure_ascii=False) for event in EVENTS) + "\n",
@@ -300,7 +303,8 @@ def seed_workspace(settings: Settings) -> dict[str, object]:
                 record_type=record.record_type,
                 store_id=record.store_id,
                 locator=record.locator,
-                fingerprint=fingerprint(record.content, settings.hmac_key),
+                fingerprint=fingerprint(record.content, settings.current_hmac_key),
+                fingerprint_key_version=settings.hmac_key_version,
                 created_at=record.metadata.get("created_at") or None,
                 sensitivity=CONFIDENTIAL_IDS.get(record.record_id, record.sensitivity or ["unknown"]),
                 capabilities=capabilities,
@@ -365,6 +369,14 @@ def seed_workspace(settings: Settings) -> dict[str, object]:
             "rebuilt_vector_chunk": "blocked:exact_derivative_fingerprint or partial_copy",
             "paraphrased_memory": "quarantined:anchor_overlap",
             "unrelated_note": "allowed",
+            "no_anchor_paraphrase": "quarantined:embedding_similarity",
+        },
+        "embedding_calibration": {
+            "threshold": 0.30,
+            "false_positives": 0,
+            "missed_paraphrases": 0,
+            "negatives_max_score": 0.17,
+            "positives_min_score": 0.31,
         },
     }
     (settings.workspace_root.parent / "expected_results.json").write_text(

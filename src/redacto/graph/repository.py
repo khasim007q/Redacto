@@ -70,6 +70,9 @@ class Repository:
         """Add later columns to pre-existing databases without losing data."""
         existing = {row[1] for row in conn.execute("PRAGMA table_info(revocation_requests)")}
         additions = {
+            "target_key_version": "INTEGER",
+            "target_embedding_json": "TEXT NOT NULL DEFAULT '[]'",
+            "target_embedding_model": "TEXT",
             "target_fingerprint": "TEXT",
             "target_shingles_json": "TEXT NOT NULL DEFAULT '[]'",
             "target_anchors_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -80,6 +83,30 @@ class Repository:
             if column not in existing:
                 conn.execute(f"ALTER TABLE revocation_requests ADD COLUMN {column} {ddl}")
 
+        quarantine_columns = {row[1] for row in conn.execute("PRAGMA table_info(quarantine)")}
+        quarantine_additions = {
+            "reviewed_by": "TEXT",
+            "review_note": "TEXT",
+            "admission_event_id": "TEXT",
+            "admitted_at": "TEXT",
+            "recheck_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, ddl in quarantine_additions.items():
+            if column not in quarantine_columns:
+                conn.execute(f"ALTER TABLE quarantine ADD COLUMN {column} {ddl}")
+
+        record_columns = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+        if "fingerprint_key_version" not in record_columns:
+            conn.execute("ALTER TABLE records ADD COLUMN fingerprint_key_version INTEGER")
+
+        tombstone_columns = {row[1] for row in conn.execute("PRAGMA table_info(tombstones)")}
+        if "key_version" not in tombstone_columns:
+            conn.execute("ALTER TABLE tombstones ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1")
+        if "embedding_json" not in tombstone_columns:
+            conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_json TEXT NOT NULL DEFAULT '[]'")
+        if "embedding_model" not in tombstone_columns:
+            conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_model TEXT")
+
     # ---------------------------------------------------------------- records
     def upsert_record(
         self,
@@ -89,6 +116,7 @@ class Repository:
         store_id: str,
         locator: dict[str, str],
         fingerprint: str | None = None,
+        fingerprint_key_version: int | None = None,
         created_at: str | None = None,
         sensitivity: Sequence[str] = (),
         capabilities: dict[str, bool] | None = None,
@@ -98,13 +126,15 @@ class Repository:
             conn.execute(
                 """
                 INSERT INTO records (record_id, record_type, store_id, locator_json, fingerprint,
-                                     created_at, observed_at, sensitivity_json, capabilities_json, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                     fingerprint_key_version, created_at, observed_at,
+                                     sensitivity_json, capabilities_json, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(record_id) DO UPDATE SET
                     record_type=excluded.record_type,
                     store_id=excluded.store_id,
                     locator_json=excluded.locator_json,
                     fingerprint=excluded.fingerprint,
+                    fingerprint_key_version=excluded.fingerprint_key_version,
                     observed_at=excluded.observed_at,
                     sensitivity_json=excluded.sensitivity_json,
                     capabilities_json=excluded.capabilities_json,
@@ -116,6 +146,7 @@ class Repository:
                     store_id,
                     _json(locator),
                     fingerprint,
+                    fingerprint_key_version,
                     created_at,
                     now_iso(),
                     _json(list(sensitivity)),
@@ -138,8 +169,8 @@ class Repository:
     def list_records(self, limit: int = 1000) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT record_id, record_type, store_id, locator_json, sensitivity_json "
-                "FROM records ORDER BY record_id LIMIT ?",
+                "SELECT record_id, record_type, store_id, locator_json, sensitivity_json, "
+                "fingerprint_key_version FROM records ORDER BY record_id LIMIT ?",
                 (limit,),
             ).fetchall()
         results = []
@@ -272,6 +303,9 @@ class Repository:
         target_anchors: Sequence[str] = (),
         target_tokens: Sequence[str] = (),
         target_label_redacted: str | None = None,
+        target_key_version: int | None = None,
+        target_embedding: Sequence[float] = (),
+        target_embedding_model: str | None = None,
     ) -> str:
         request_id = new_id("req")
         with self._connect() as conn:
@@ -279,8 +313,9 @@ class Repository:
                 """INSERT INTO revocation_requests
                    (request_id, target_id, target_kind, mode, scope_json, policy_json, state,
                     created_at, target_fingerprint, target_shingles_json, target_anchors_json,
-                    target_tokens_json, target_label_redacted)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    target_tokens_json, target_label_redacted, target_key_version,
+                    target_embedding_json, target_embedding_model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request_id,
                     target_id,
@@ -295,6 +330,9 @@ class Repository:
                     _json(list(target_anchors)),
                     _json(list(target_tokens)),
                     target_label_redacted,
+                    target_key_version,
+                    _json(list(target_embedding)),
+                    target_embedding_model,
                 ),
             )
             conn.commit()
@@ -312,6 +350,7 @@ class Repository:
             parsed["target_shingles"] = _loads(parsed.pop("target_shingles_json", None), [])
             parsed["target_anchors"] = _loads(parsed.pop("target_anchors_json", None), [])
             parsed["target_tokens"] = _loads(parsed.pop("target_tokens_json", None), [])
+            parsed["target_embedding"] = _loads(parsed.pop("target_embedding_json", None), [])
         return parsed
 
     def set_request_state(self, request_id: str, state: str) -> None:
@@ -639,6 +678,9 @@ class Repository:
         scope: dict[str, Any],
         policy: dict[str, Any],
         status: str = "pending",
+        key_version: int = 1,
+        embedding: Sequence[float] = (),
+        embedding_model: str | None = None,
     ) -> str:
         tombstone_id = new_id("tomb")
         with self._connect() as conn:
@@ -646,8 +688,9 @@ class Repository:
                 """INSERT INTO tombstones
                    (tombstone_id, request_id, target_id, target_kind, label_redacted, fingerprint,
                     shingles_json, anchors_json, tokens_json, related_record_ids_json,
-                    related_fingerprints_json, scope_json, policy_json, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    related_fingerprints_json, embedding_json, embedding_model,
+                    scope_json, policy_json, status, key_version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     tombstone_id,
                     request_id,
@@ -660,9 +703,12 @@ class Repository:
                     _json(list(tokens)),
                     _json(list(related_record_ids)),
                     _json(list(related_fingerprints)),
+                    _json(list(embedding)),
+                    embedding_model,
                     _json(scope),
                     _json(policy),
                     status,
+                    key_version,
                     now_iso(),
                 ),
             )
@@ -677,6 +723,7 @@ class Repository:
         item["tokens"] = _loads(item.pop("tokens_json"), [])
         item["related_record_ids"] = _loads(item.pop("related_record_ids_json"), [])
         item["related_fingerprints"] = _loads(item.pop("related_fingerprints_json"), [])
+        item["embedding"] = _loads(item.pop("embedding_json", None), [])
         item["scope"] = _loads(item.pop("scope_json"), {})
         item["policy"] = _loads(item.pop("policy_json"), {})
         return item
@@ -729,7 +776,8 @@ class Repository:
         reason_code: str,
         match_score: float,
         present_in_store: bool,
-    ) -> None:
+    ) -> str:
+        new_event_id = new_id("evt")
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO ingestion_events
@@ -743,7 +791,7 @@ class Repository:
                        present_in_store = excluded.present_in_store,
                        created_at = excluded.created_at""",
                 (
-                    new_id("evt"),
+                    new_event_id,
                     tombstone_id,
                     store_id,
                     record_id,
@@ -756,6 +804,12 @@ class Repository:
                 ),
             )
             conn.commit()
+            row = conn.execute(
+                "SELECT event_id FROM ingestion_events WHERE tombstone_id IS ? "
+                "AND record_id = ? AND decision = ?",
+                (tombstone_id, record_id, decision),
+            ).fetchone()
+        return row["event_id"] if row else new_event_id
 
     def ingestion_events(self, *, limit: int = 200) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -817,13 +871,53 @@ class Repository:
         for row in rows:
             item = dict(row)
             item["locator"] = _loads(item.pop("locator_json"), {})
+            item["recheck"] = _loads(item.pop("recheck_json", None), {})
             results.append(item)
         return results
 
-    def set_quarantine_status(self, quarantine_id: str, status: str) -> None:
+    def get_quarantine(self, quarantine_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM quarantine WHERE quarantine_id = ?", (quarantine_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["locator"] = _loads(item.pop("locator_json"), {})
+        item["recheck"] = _loads(item.pop("recheck_json", None), {})
+        return item
+
+    def set_quarantine_status(
+        self,
+        quarantine_id: str,
+        status: str,
+        *,
+        reviewed_by: str | None = None,
+        note: str | None = None,
+        admission_event_id: str | None = None,
+        recheck: dict[str, Any] | None = None,
+        admitted_at: str | None = None,
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE quarantine SET status = ?, reviewed_at = ? WHERE quarantine_id = ?",
-                (status, now_iso(), quarantine_id),
+                """UPDATE quarantine
+                   SET status = ?,
+                       reviewed_at = ?,
+                       reviewed_by = COALESCE(?, reviewed_by),
+                       review_note = COALESCE(?, review_note),
+                       admission_event_id = COALESCE(?, admission_event_id),
+                       admitted_at = COALESCE(?, admitted_at),
+                       recheck_json = COALESCE(?, recheck_json)
+                   WHERE quarantine_id = ?""",
+                (
+                    status,
+                    now_iso(),
+                    reviewed_by,
+                    note,
+                    admission_event_id,
+                    admitted_at,
+                    _json(recheck) if recheck is not None else None,
+                    quarantine_id,
+                ),
             )
             conn.commit()

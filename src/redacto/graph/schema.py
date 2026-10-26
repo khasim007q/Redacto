@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS records (
     store_id TEXT NOT NULL,
     locator_json TEXT NOT NULL,
     fingerprint TEXT,
+    fingerprint_key_version INTEGER,
     created_at TEXT,
     observed_at TEXT NOT NULL,
     sensitivity_json TEXT NOT NULL DEFAULT '[]',
@@ -56,7 +57,10 @@ CREATE TABLE IF NOT EXISTS revocation_requests (
     target_shingles_json TEXT NOT NULL DEFAULT '[]',
     target_anchors_json TEXT NOT NULL DEFAULT '[]',
     target_tokens_json TEXT NOT NULL DEFAULT '[]',
-    target_label_redacted TEXT
+    target_label_redacted TEXT,
+    target_key_version INTEGER,
+    target_embedding_json TEXT NOT NULL DEFAULT '[]',
+    target_embedding_model TEXT
 );
 
 CREATE TABLE IF NOT EXISTS revocation_plans (
@@ -150,9 +154,12 @@ CREATE TABLE IF NOT EXISTS tombstones (
     tokens_json TEXT NOT NULL DEFAULT '[]',
     related_record_ids_json TEXT NOT NULL DEFAULT '[]',
     related_fingerprints_json TEXT NOT NULL DEFAULT '[]',
+    embedding_json TEXT NOT NULL DEFAULT '[]',
+    embedding_model TEXT,
     scope_json TEXT NOT NULL,
     policy_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
+    key_version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     activated_at TEXT
 );
@@ -183,6 +190,11 @@ CREATE TABLE IF NOT EXISTS quarantine (
     status TEXT NOT NULL DEFAULT 'pending_review',
     created_at TEXT NOT NULL,
     reviewed_at TEXT,
+    reviewed_by TEXT,
+    review_note TEXT,
+    admission_event_id TEXT,
+    admitted_at TEXT,
+    recheck_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE (tombstone_id, record_id)
 );
 
