@@ -38,7 +38,8 @@ from redacto.status import collect_status
 TARGET_KINDS = {"source", "fact", "secret"}
 MODES = {"source_revocation", "fact_revocation"}
 TERMINAL_PLAN_STATES = {
-    "EXECUTING",
+    # EXECUTING is deliberately not terminal: a crashed apply can be retried, and
+    # per-action idempotency keys make the retry safe.
     "VERIFYING",
     "VERIFIED_WITHIN_SCOPE",
     "PARTIAL",
@@ -228,6 +229,28 @@ class Engine:
                 match_score=decision.match_score,
             )
 
+    def _record_is_oversized(self, record: Record) -> bool:
+        return len(record.content.encode("utf-8")) > self.settings.max_record_bytes
+
+    def _skip_finding(self, record: Record, *, present_in_store: bool) -> dict[str, Any]:
+        return {
+            "record_id": record.record_id,
+            "store_id": record.store_id,
+            "record_type": record.record_type,
+            "decision": "skipped",
+            "reason_code": "oversized_record",
+            "match_score": 0.0,
+            "tombstone_id": None,
+            "target_id": None,
+            "target_kind": None,
+            "label_redacted": None,
+            "degraded": False,
+            "present_in_store": present_in_store,
+            "admitted": False,
+            "size_bytes": len(record.content.encode("utf-8")),
+            "limit_bytes": self.settings.max_record_bytes,
+        }
+
     @staticmethod
     def _guard_finding(decision, record: Record, *, present_in_store: bool) -> dict[str, Any]:
         return {
@@ -238,6 +261,20 @@ class Engine:
             "present_in_store": present_in_store,
             "admitted": False,
         }
+
+    NODE_TYPES = {
+        "doc": "ARTIFACT",
+        "memory": "MEMORY",
+        "log": "LOG_RECORD",
+        "index_entry": "INDEX_ENTRY",
+        "cache_entry": "CACHE_ENTRY",
+        "store": "STORE",
+        "agent_run": "AGENT_RUN",
+    }
+
+    @classmethod
+    def _node_type(cls, record_type: str) -> str:
+        return cls.NODE_TYPES.get(record_type, "ARTIFACT")
 
     def _candidate(
         self,
@@ -252,16 +289,19 @@ class Engine:
         relation: str | None = None,
         evidence_type: str | None = None,
         confirmed: bool = False,
+        unreachable: bool = False,
     ) -> dict[str, Any]:
         action, approved, risk = classify.propose_action(
             record_type=record_type,
             capabilities=capabilities,
             evidence_class=evidence_class,
+            unreachable=unreachable,
         )
         return {
             "record_id": record_id,
             "store_id": store_id,
             "record_type": record_type,
+            "node_type": self._node_type(record_type),
             "capabilities": capabilities,
             "evidence_class": evidence_class,
             "proposed_action": action,
@@ -274,6 +314,7 @@ class Engine:
             "confirmed": confirmed or evidence_class in {classify.DIRECT_MATCH, classify.CONFIRMED_DESCENDANT},
             "candidate_only": evidence_class
             in {classify.SUSPECTED_DERIVATIVE, classify.RELATED_NONDISCLOSING, classify.UNKNOWN},
+            "unreachable": unreachable,
         }
 
     # ------------------------------------------------------------------ scan
@@ -352,6 +393,12 @@ class Engine:
             )
             caps = self._record_capabilities(store, slot)
             for scanned_record in records:
+                if self._record_is_oversized(scanned_record):
+                    guard_findings.append(
+                        self._skip_finding(scanned_record, present_in_store=True)
+                    )
+                    guarded_ids.add(scanned_record.record_id)
+                    continue
                 # The guard protects the admission boundary. Records already active in
                 # the graph (for example a record admitted after review) stay visible so
                 # a later revocation can target them. Restored or never-admitted records
@@ -541,6 +588,7 @@ class Engine:
                     unknown_reason="confirmed descendant was not reachable during scan",
                 ),
                 depth=node.depth,
+                unreachable=True,
             )
 
         for edge in traversal.candidates:
@@ -561,6 +609,7 @@ class Engine:
                     unknown_reason="candidate record was not reachable during scan",
                 ),
                 relation=edge["relation_guess"],
+                unreachable=True,
             )
 
         model_meta = self._assess_candidates(
@@ -596,13 +645,18 @@ class Engine:
             "target": {
                 "record_id": record["record_id"],
                 "record_type": record["record_type"],
+                "node_type": "SOURCE" if target_kind == "source" else "FACT",
                 "store_id": record["store_id"],
                 "kind": target_kind,
                 "label": record["locator"].get("path") or record["locator"].get("id") or record["record_id"],
             },
             "scope": {"stores": scope_stores, "max_depth": depth},
             "candidates": [classify.summarize_candidate(c) | {"confirmed": c["confirmed"], "candidate_only": c["candidate_only"], "relation": c.get("relation")} for c in ordered],
-            "counts": counts,
+            "counts": counts | {
+                "unreachable": sum(
+                    1 for c in ordered if c["proposed_action"] == classify.UNREACHABLE
+                )
+            },
             "coverage": coverage,
             "unreachable_stores": [entry["store_id"] for entry in unreachable],
             "model": model_meta,
@@ -622,6 +676,7 @@ class Engine:
                 "Scan is read-only with respect to record content; only minimized graph metadata is written.",
                 "Semantic candidates stay advisory; unassessed candidates are never destructive.",
                 "Records matching an active tombstone are blocked or quarantined and never re-admitted to the graph.",
+                "Records larger than REDACTO_MAX_RECORD_BYTES are skipped before matching and reported.",
             ],
         }
 
@@ -724,6 +779,108 @@ class Engine:
                 )
         return meta
 
+    # ------------------------------------------------- internal lineage hook
+    LINEAGE_RELATIONS = {
+        "READ_FROM",
+        "DERIVED_FROM",
+        "EXTRACTED_FROM",
+        "SUMMARIZED_FROM",
+        "INDEXED_AS",
+        "CACHED_AS",
+        "STORED_IN",
+        "REGENERATED_FROM",
+    }
+    EVIDENCE_TYPES = {
+        "instrumented",
+        "imported_metadata",
+        "human_verified",
+        "model_inferred",
+        "heuristic_match",
+    }
+    CONFIRMABLE_EVIDENCE = {"instrumented", "imported_metadata", "human_verified"}
+
+    def record_lineage(
+        self,
+        *,
+        source_ids: Sequence[str],
+        output_id: str,
+        relation: str,
+        evidence_type: str,
+        evidence_ref: str | None = None,
+        verified_by: str | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Internal-only hook for trusted ingestion/transformation code.
+
+        This is deliberately not an MCP tool. Instrumented/imported/human-verified
+        evidence is required before an edge can be confirmed; model or heuristic
+        evidence only creates candidate edges. Arbitrary agent claims cannot be
+        promoted to confirmed lineage through this method.
+        """
+        if relation not in self.LINEAGE_RELATIONS:
+            raise RedactoError(
+                "invalid_relation",
+                "Relationship is not part of the provenance vocabulary.",
+                {"relation": relation},
+            )
+        if evidence_type not in self.EVIDENCE_TYPES:
+            raise RedactoError(
+                "invalid_evidence_type",
+                "Evidence type is not part of the provenance vocabulary.",
+                {"evidence_type": evidence_type},
+            )
+        if not source_ids:
+            raise RedactoError("invalid_sources", "At least one source_id is required.")
+        self._require_record(output_id)
+        for source_id in source_ids:
+            self._require_record(source_id)
+        if evidence_type in {"instrumented", "imported_metadata"} and not evidence_ref:
+            raise RedactoError(
+                "missing_evidence_ref",
+                "Instrumented/imported lineage requires an opaque evidence reference.",
+            )
+        if evidence_type == "human_verified" and not verified_by:
+            raise RedactoError(
+                "missing_verifier",
+                "Human-verified lineage requires a verifier identity.",
+            )
+
+        confirmed = evidence_type in self.CONFIRMABLE_EVIDENCE
+        edges: list[dict[str, Any]] = []
+        for source_id in source_ids:
+            if confirmed:
+                edge_id = self.repo.add_lineage_edge(
+                    source_id=source_id,
+                    target_id=output_id,
+                    relation=relation,
+                    evidence_type=evidence_type,
+                    evidence_ref=evidence_ref,
+                    status="confirmed",
+                    verified_by=verified_by,
+                )
+            else:
+                edge_id = self.repo.add_candidate_edge(
+                    source_id=source_id,
+                    target_id=output_id,
+                    relation_guess=relation,
+                    evidence_summary_redacted=(
+                        f"{evidence_type} relationship claim; advisory until reviewed."
+                    ),
+                    model_id=evidence_type,
+                    confidence=confidence,
+                    status="candidate",
+                )
+            edges.append({"edge_id": edge_id, "source_id": source_id, "status": "confirmed" if confirmed else "candidate"})
+
+        return {
+            "ok": True,
+            "output_id": output_id,
+            "relation": relation,
+            "evidence_type": evidence_type,
+            "status": "confirmed" if confirmed else "candidate",
+            "edges": edges,
+        }
+
     # ----------------------------------------------------------------- trace
     def trace(self, *, source_id: str, depth: int = 3) -> dict[str, Any]:
         if not 1 <= depth <= 5:
@@ -736,6 +893,7 @@ class Engine:
             return {
                 "record_id": node.record_id,
                 "record_type": graph_record.get("record_type", "unknown"),
+                "node_type": self._node_type(graph_record.get("record_type", "unknown")),
                 "store_id": graph_record.get("store_id"),
                 "depth": node.depth,
                 "via": node.via,
@@ -745,6 +903,7 @@ class Engine:
             "source": {
                 "record_id": record["record_id"],
                 "record_type": record["record_type"],
+                "node_type": "SOURCE",
                 "store_id": record["store_id"],
                 "label": record["locator"].get("path") or record["locator"].get("id"),
             },
@@ -1055,11 +1214,15 @@ class Engine:
                     {"store_id": store_id, "reason": slots[store_id].unavailable_reason},
                 )
 
-        counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0}
+        counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0, "skipped": 0}
         results: list[dict[str, Any]] = []
         for record in records:
             if store_id is not None and record.store_id != store_id:
                 record = record.model_copy(update={"store_id": store_id})
+            if self._record_is_oversized(record):
+                counts["skipped"] += 1
+                results.append(self._skip_finding(record, present_in_store=False))
+                continue
             decision = guard.evaluate(record_id=record.record_id, content=record.content)
             if decision.decision != ALLOWED:
                 self._record_guard_decision(decision, record, present_in_store=False)
@@ -1112,7 +1275,7 @@ class Engine:
         guard = self.guard()
         scope_stores = self._scope_stores(stores)
         slots = self.adapters()
-        counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0}
+        counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0, "skipped": 0}
         findings: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
 
@@ -1128,6 +1291,10 @@ class Engine:
                 continue
             capabilities = self._record_capabilities(store, slot)
             for record in records:
+                if self._record_is_oversized(record):
+                    counts["skipped"] += 1
+                    findings.append(self._skip_finding(record, present_in_store=True))
+                    continue
                 decision = guard.evaluate(record_id=record.record_id, content=record.content)
                 if decision.decision != ALLOWED:
                     self._record_guard_decision(decision, record, present_in_store=True)
@@ -1452,6 +1619,10 @@ class Engine:
             raise RedactoError("unauthorized_apply", f"Apply rejected: {reason}.", {"reason": reason})
 
         simulate = self.settings.dry_run if dry_run is None else dry_run
+        if not simulate:
+            # Enter EXECUTING before any mutation; verify finalises the state.
+            self.repo.set_plan_state(plan_id, "EXECUTING")
+            self.repo.set_request_state(plan["request_id"], "EXECUTING")
         slots = self.adapters()
         scope_stores = set(plan["scope"].get("stores", []))
         results: list[dict[str, Any]] = []
@@ -1461,7 +1632,12 @@ class Engine:
         for item in items:
             action = item["proposed_action"]
             if not item["approved"] or action not in classify.ACTIONABLE:
-                state = "preserved" if action == classify.SKIP_PRESERVE else "review_required"
+                if action == classify.SKIP_PRESERVE:
+                    state = "preserved"
+                elif action == classify.UNREACHABLE:
+                    state = "unreachable"
+                else:
+                    state = "review_required"
                 self.repo.set_item_state(item["item_id"], state)
                 if state == "review_required":
                     review_required.append(

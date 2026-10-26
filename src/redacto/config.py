@@ -42,6 +42,7 @@ class Settings:
     safety_mode: str
     dry_run: bool
     max_scan_records: int
+    max_record_bytes: int
     model_provider: str
     model_base_url: str | None
     model_name: str | None
@@ -94,6 +95,7 @@ class Settings:
             "safety_mode": self.safety_mode,
             "dry_run_default": self.dry_run,
             "max_scan_records": self.max_scan_records,
+            "max_record_bytes": self.max_record_bytes,
             "model_provider": self.model_provider,
             "model_configured": bool(self.model_base_url and self.model_name),
             "http_bind": f"{self.http_host}:{self.http_port}",
@@ -171,6 +173,7 @@ def load_settings() -> Settings:
         safety_mode=os.environ.get("REDACTO_SAFETY_MODE", "review"),
         dry_run=_env_bool("REDACTO_DRY_RUN", True),
         max_scan_records=int(os.environ.get("REDACTO_MAX_SCAN_RECORDS", "500")),
+        max_record_bytes=int(os.environ.get("REDACTO_MAX_RECORD_BYTES", "1000000")),
         model_provider=model_provider,
         model_base_url=os.environ.get("REDACTO_MODEL_BASE_URL") or None,
         model_name=os.environ.get("REDACTO_MODEL_NAME") or None,

@@ -197,3 +197,56 @@ def test_seed_reseeds_cleanly(tmp_path):
     assert (settings.workspace_root / "acquisition-plan.md").exists()
     assert Engine(settings).trace(source_id=SOURCE_ID)["confirmed_descendants"]
     assert Path(settings.db_path).exists()
+
+
+def test_apply_enters_executing_before_any_mutation(engine, monkeypatch):
+    plan = engine.plan(target_id=SOURCE_ID)
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="operator-approval")
+    observed: list[str] = []
+
+    from redacto.adapters.filesystem import FilesystemAdapter
+
+    original_delete = FilesystemAdapter.delete_record
+
+    def wrapped(self, locator):
+        observed.append(engine.repo.get_plan(plan["plan_id"])["state"])
+        return original_delete(self, locator)
+
+    monkeypatch.setattr(FilesystemAdapter, "delete_record", wrapped)
+    engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="operator-approval",
+        confirmation_token=approval["confirmation_token"],
+    )
+    assert observed
+    assert all(state == "EXECUTING" for state in observed)
+
+
+def test_unreachable_store_yields_unreachable_actions(tmp_path):
+    settings = seeded_settings(tmp_path, jsonl_log_path=tmp_path / "missing.jsonl")
+    engine = Engine(settings)
+    plan = engine.plan(target_id=SOURCE_ID)
+    unreachable_items = [
+        item for item in plan["items"] if item["proposed_action"] == "UNREACHABLE"
+    ]
+    assert unreachable_items
+    assert all(item["approved"] is False for item in unreachable_items)
+    assert any(item["record_id"] == "log:evt-summary-gen" for item in unreachable_items)
+    assert plan["estimated_impact"]["unreachable"] >= 1
+
+
+def test_executing_plan_can_be_retried_without_duplicate_work(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="operator-approval")
+    # Simulate a crash after the plan entered EXECUTING but before completion.
+    engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
+    result = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="operator-approval",
+        confirmation_token=approval["confirmation_token"],
+    )
+    assert result.get("already_completed") is not True
+    assert result["counts"]["succeeded"] == 7
+    assert result["plan_state"] == "VERIFYING"

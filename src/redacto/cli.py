@@ -133,6 +133,13 @@ def cmd_quarantine(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    from redacto.evaluation import evaluate_fixture
+
+    _print(evaluate_fixture(_engine()))
+    return 0
+
+
 def cmd_calibrate_embeddings(args: argparse.Namespace) -> int:
     from redacto.discovery.embeddings import default_calibration
 
@@ -359,6 +366,11 @@ def build_parser() -> argparse.ArgumentParser:
     quarantine = sub.add_parser("quarantine", help="list guard-quarantined records")
     quarantine.add_argument("--statuses", default="pending_review")
     quarantine.set_defaults(func=cmd_quarantine)
+
+    evaluate = sub.add_parser(
+        "evaluate", help="report fixture-level precision, recall and policy counts"
+    )
+    evaluate.set_defaults(func=cmd_evaluate)
 
     calibrate = sub.add_parser(
         "calibrate-embeddings", help="measure embedding false positives and missed paraphrases"

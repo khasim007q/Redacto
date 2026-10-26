@@ -32,6 +32,7 @@ def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
         "safety_mode": "review",
         "dry_run": False,
         "max_scan_records": 500,
+        "max_record_bytes": 1_000_000,
         "model_provider": "none",
         "model_base_url": None,
         "model_name": None,

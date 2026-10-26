@@ -106,12 +106,14 @@ the guard: blocking admission is not the same as a new destructive action.
 ```powershell
 .venv\Scripts\python.exe -m redacto keyring
 .venv\Scripts\python.exe -m redacto calibrate-embeddings --thresholds 0.25,0.3,0.6
+.venv\Scripts\python.exe -m redacto evaluate
 ```
 
 Say: "Rotation is versioned. Old tombstone keys stay in the ring, and if one is
 missing ingestion fails closed instead of pretending protection still works.
 Embedding thresholds are measured: at 0.30 the synthetic set has zero false
-positives and zero missed paraphrases."
+positives and zero missed paraphrases. `evaluate` reports direct precision/recall,
+lineage coverage and unrelated records touched."
 
 ## What to point at when someone asks "did it really work?"
 

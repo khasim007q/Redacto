@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 103 automated tests pass (`pytest`).
+- 114 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -70,6 +70,7 @@ python -m redacto resolve-quarantine --id <ID> --decision approved|rejected \
   --reviewer "reviewer-id" --note "why"
 python -m redacto keyring                          # key versions + rotation safety
 python -m redacto calibrate-embeddings             # FP / missed-paraphrase metrics
+python -m redacto evaluate                         # metrics; run after `seed` on a pristine fixture
 python -m redacto serve  --transport stdio   # or: --transport http
 ```
 
@@ -170,6 +171,17 @@ Full diagrams (component flow, ER model, revocation sequence) are in
   `SUSPECTED_DERIVATIVE`, `RELATED_NONDISCLOSING`, `UNKNOWN`.
 - **Plan lifecycle**: `READY_FOR_APPROVAL → APPROVED → EXECUTING → VERIFYING →
   VERIFIED_WITHIN_SCOPE`, with `PARTIAL`, `NEEDS_REVIEW`, `FAILED` used honestly.
+- **Lineage hook**: `Engine.record_lineage` is internal-only. Instrumented, imported
+  or human-verified evidence can confirm an edge; model/heuristic claims become
+  candidates. It is not exposed as an MCP tool.
+- **Plan states**: `READY_FOR_APPROVAL ? APPROVED ? EXECUTING ? VERIFYING` then
+  `VERIFIED_WITHIN_SCOPE`, `PARTIAL` or `NEEDS_REVIEW`. `EXECUTING` is set before the
+  first mutation. There is no editable `DRAFT` stage in the MVP.
+- **Action vocabulary**: `DELETE_RECORD`, `INVALIDATE_INDEX`, `INVALIDATE_CACHE`,
+  `REVIEW_REQUIRED`, `SKIP_PRESERVE`, `UNREACHABLE` are exercised. `REDACT_SPAN` and
+  `REGENERATE_FROM_ALLOWED_SOURCES` are defined but unsupported by current adapters.
+- **Node types**: stored records map to `MEMORY`, `LOG_RECORD`, `INDEX_ENTRY`,
+  `CACHE_ENTRY` and `ARTIFACT`; scan/trace targets are labelled `SOURCE` or `FACT`.
 - **Persistence**: records, lineage edges, candidate edges, requests, plans, items,
   approvals, actions, verification runs, receipts. No table stores content,
   matched passages or secrets — only opaque locators, keyed HMAC fingerprints,
@@ -215,6 +227,8 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
   Rejection preserves the decision without admitting anything.
 - Embeddings are a risk signal, never proof. They can only quarantine; a high score
   never authorizes deletion or confirms lineage.
+- Records larger than `REDACTO_MAX_RECORD_BYTES` (default 1 MB) are skipped before
+  matching and reported, so oversized input cannot enter the graph or model path.
 - HTTP mode requires a bearer token and refuses to start without one.
 
 ## Measured results
@@ -222,7 +236,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-103 passed in 33.80s
+114 passed in 42.65s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -235,6 +249,22 @@ instruction containment, secret non-persistence, HTTP auth, and re-ingestion
 protection, store-write blocking, quarantine approval/rejection and rechecks,
 key-ring rotation and fail-closed behaviour, and embedding calibration with
 measured false positives and missed paraphrases.
+
+### Fixture evaluation (`redacto evaluate`)
+
+The spec asks for counts rather than one accuracy score:
+
+| Metric | Result |
+|---|---|
+| Direct-match precision / recall | 1.0 / 1.0 (2 TP, 0 FP, 0 FN) |
+| Confirmed-descendant coverage | 5 / 5 (1.0) |
+| Semantic candidate precision / recall | 1.0 / 1.0 (2 TP, 0 FP, 0 FN) |
+| Preserved-related recall | 4 / 4 (1.0) |
+| Unrelated records touched | 0 |
+| Destructive actions blocked by policy | 2 |
+| Model JSON-schema validity | not measured while the model provider is disabled |
+
+These are fixture-level engineering targets, not production accuracy claims.
 
 ### Embedding calibration (synthetic labelled set)
 
@@ -308,6 +338,10 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 - Quarantine approval is a human/application action; approving an uncertain record
   overrides uncertainty, but can never override a hard tombstone block.
 - Model assessment is unbenchmarked in this MVP and advisory only.
+- No editable `DRAFT` plan stage and no user-facing `CANCELLED`/`FAILED` transition;
+  exceptional outcomes are expressed through `PARTIAL`/`NEEDS_REVIEW`.
+- `find_exact` is implemented centrally in discovery rather than per adapter, and
+  `REDACT_SPAN`/regeneration have no supported adapter yet.
 - Two revocation modes exist in code; **source revocation** is the tested path.
   Fact/secret revocation is functional but narrower (bounded substring matching).
 - Receipt integrity is evidence metadata, not proof of physical overwrite.
@@ -320,6 +354,7 @@ src/redacto/
   graph/       schema.py repository.py traversal.py
   discovery/   normalization.py exact.py relationship_assessor.py embeddings.py
   ingestion.py  (tombstone guard, quarantine decisions, fail-closed keys)
+  evaluation.py (fixture precision/recall and policy counts)
   policy/      classify.py plan.py authorization.py
   adapters/    base.py registry.py filesystem.py sqlite_store.py jsonl_logs.py vector_fixture.py
   mcp/         server.py stdio_server.py http_server.py
@@ -329,8 +364,18 @@ fixtures/      workspace/ expected_results.json
 tests/         test_graph.py test_discovery.py test_policy.py test_execution.py
                test_verification.py test_security.py test_mcp_tools.py test_transport.py
                test_tombstones.py test_quarantine.py test_key_rotation.py test_embeddings.py
+               test_evaluation.py
 docs/          architecture.md threat-model.md demo-script.md key-rotation.md
+               spec-compliance.md
 ```
+
+## Spec compliance
+
+A section-by-section audit against `REDACTO_SPEC.md`, including deviations and
+evidence, is in [docs/spec-compliance.md](docs/spec-compliance.md). The headline:
+all P0 requirements are implemented; the remaining deviations are an editable draft
+plan stage, per-adapter `find_exact`, span redaction/regeneration, a graph
+visualization, and Alan connector registration.
 
 ## Next highest-value task
 

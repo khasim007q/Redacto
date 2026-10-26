@@ -46,12 +46,15 @@ def propose_action(
     record_type: str,
     capabilities: dict[str, bool],
     evidence_class: str,
+    unreachable: bool = False,
 ) -> tuple[str, bool, str]:
     """Return (action, approved_for_plan, collateral_risk).
 
     Only deterministic evidence classes become approved plan items. Candidate
     classes stay review/preserve regardless of model confidence.
     """
+    if unreachable:
+        return UNREACHABLE, False, "high"
     if evidence_class == RELATED_NONDISCLOSING:
         return SKIP_PRESERVE, False, "none"
     if evidence_class in {SUSPECTED_DERIVATIVE, UNKNOWN}:
@@ -127,6 +130,7 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "record_id": item["record_id"],
         "store_id": item.get("store_id"),
         "record_type": item.get("record_type"),
+        "node_type": item.get("node_type"),
         "capabilities": item.get("capabilities", {}),
         "evidence_class": item["evidence_class"],
         "proposed_action": item["proposed_action"],
@@ -134,4 +138,5 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "risk": item["risk"],
         "approved": item["approved"],
         "depth": item.get("depth"),
+        "unreachable": item.get("unreachable", False),
     }

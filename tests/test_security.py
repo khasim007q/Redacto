@@ -10,7 +10,7 @@ import pytest
 
 from conftest import approve_and_apply
 from helpers import seeded_settings
-from redacto.adapters.base import AdapterError
+from redacto.adapters.base import AdapterError, Record
 from redacto.adapters.filesystem import FilesystemAdapter
 from redacto.adapters.sqlite_store import SqliteMemoryAdapter
 from redacto.engine import Engine
@@ -100,3 +100,37 @@ def test_unapproved_plan_cannot_be_applied_through_engine_api(engine):
             confirmation_token="guess",
         )
     assert excinfo.value.code == "unauthorized_apply"
+
+
+def test_oversized_ingestion_is_skipped_and_not_written(tmp_path):
+    from helpers import seeded_settings
+
+    settings = seeded_settings(tmp_path, max_record_bytes=100)
+    engine = Engine(settings)
+    record = Record(
+        record_id="fs:oversized.md",
+        record_type="doc",
+        store_id="filesystem",
+        locator={"path": "oversized.md"},
+        content="x" * 5_000,
+        sensitivity=["confidential"],
+    )
+    result = engine.ingest([record], store_id="filesystem", write_to_store=True)
+    assert result["counts"]["skipped"] == 1
+    assert result["results"][0]["reason_code"] == "oversized_record"
+    assert not (settings.workspace_root / "oversized.md").exists()
+    assert engine.repo.get_record("fs:oversized.md") is None
+
+
+def test_oversized_scanned_records_are_reported_not_admitted(tmp_path):
+    from helpers import seeded_settings
+
+    settings = seeded_settings(tmp_path, max_record_bytes=100)
+    engine = Engine(settings)
+    scan = engine.scan(target_id=SOURCE_ID)
+    assert scan["guard"]["counts"]["skipped"] >= 1
+    assert any(
+        finding["reason_code"] == "oversized_record" for finding in scan["guard"]["findings"]
+    )
+    # The oversized target is not classified as a candidate.
+    assert scan["counts"]["direct_match"] == 0

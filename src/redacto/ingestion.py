@@ -405,5 +405,6 @@ def summarize_guard_findings(findings: Sequence[dict[str, Any]]) -> dict[str, in
     return {
         "blocked": sum(1 for item in findings if item["decision"] == BLOCKED),
         "quarantined": sum(1 for item in findings if item["decision"] == QUARANTINED),
+        "skipped": sum(1 for item in findings if item["decision"] == "skipped"),
         "allowed": sum(1 for item in findings if item["decision"] == ALLOWED),
     }

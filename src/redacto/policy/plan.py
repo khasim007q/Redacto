@@ -21,6 +21,7 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
             record_type=candidate.get("record_type", "unknown"),
             capabilities=candidate.get("capabilities", {}),
             evidence_class=candidate["evidence_class"],
+            unreachable=bool(candidate.get("unreachable")),
         )
         items.append(
             {
@@ -28,12 +29,14 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
                 "record_id": candidate["record_id"],
                 "store_id": candidate.get("store_id"),
                 "record_type": candidate.get("record_type", "unknown"),
+                "node_type": candidate.get("node_type", "ARTIFACT"),
                 "evidence_class": candidate["evidence_class"],
                 "proposed_action": action,
                 "reason_redacted": candidate["reason_redacted"],
                 "risk": risk,
                 "approved": approved,
                 "depth": candidate.get("depth"),
+                "unreachable": bool(candidate.get("unreachable")),
             }
         )
     return items
@@ -75,6 +78,7 @@ def estimated_impact(items: Sequence[dict[str, Any]]) -> dict[str, int]:
         "invalidate": 0,
         "review": 0,
         "preserve": 0,
+        "unreachable": 0,
     }
     for item in items:
         action = item["proposed_action"]
@@ -86,4 +90,6 @@ def estimated_impact(items: Sequence[dict[str, Any]]) -> dict[str, int]:
             impact["review"] += 1
         elif action == classify.SKIP_PRESERVE:
             impact["preserve"] += 1
+        elif action == classify.UNREACHABLE:
+            impact["unreachable"] += 1
     return impact

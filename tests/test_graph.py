@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from redacto.errors import RedactoError
 from redacto.fixtures import SOURCE_ID
 
 CONFIRMED = {
@@ -51,3 +54,87 @@ def test_depth_bound_limits_traversal(engine):
     found = {node["record_id"] for node in trace["confirmed_descendants"]}
     assert found == CONFIRMED - {"mem:mem-summary-paraphrase"}
     assert all(node["depth"] == 1 for node in trace["confirmed_descendants"])
+
+
+def test_record_lineage_hook_confirms_instrumented_edges(engine):
+    result = engine.record_lineage(
+        source_ids=[SOURCE_ID],
+        output_id="mem:mem-unrelated-eng",
+        relation="DERIVED_FROM",
+        evidence_type="instrumented",
+        evidence_ref="test-ingestion-hook",
+    )
+    assert result["status"] == "confirmed"
+    trace = engine.trace(source_id=SOURCE_ID)
+    assert "mem:mem-unrelated-eng" in {
+        node["record_id"] for node in trace["confirmed_descendants"]
+    }
+
+
+def test_record_lineage_hook_keeps_model_claims_as_candidates(engine):
+    result = engine.record_lineage(
+        source_ids=[SOURCE_ID],
+        output_id="mem:mem-unrelated-eng",
+        relation="DERIVED_FROM",
+        evidence_type="model_inferred",
+        confidence=0.9,
+    )
+    assert result["status"] == "candidate"
+    trace = engine.trace(source_id=SOURCE_ID)
+    assert "mem:mem-unrelated-eng" not in {
+        node["record_id"] for node in trace["confirmed_descendants"]
+    }
+    assert "mem:mem-unrelated-eng" in {
+        edge["record_id"] for edge in trace["candidate_relationships"]
+    }
+
+
+def test_record_lineage_hook_requires_trustworthy_evidence(engine):
+    with pytest.raises(RedactoError) as excinfo:
+        engine.record_lineage(
+            source_ids=[SOURCE_ID],
+            output_id="mem:mem-unrelated-eng",
+            relation="INVENTED_RELATION",
+            evidence_type="instrumented",
+            evidence_ref="x",
+        )
+    assert excinfo.value.code == "invalid_relation"
+
+    with pytest.raises(RedactoError) as excinfo:
+        engine.record_lineage(
+            source_ids=[SOURCE_ID],
+            output_id="mem:mem-unrelated-eng",
+            relation="DERIVED_FROM",
+            evidence_type="agent_says_so",
+            evidence_ref="x",
+        )
+    assert excinfo.value.code == "invalid_evidence_type"
+
+    with pytest.raises(RedactoError) as excinfo:
+        engine.record_lineage(
+            source_ids=[SOURCE_ID],
+            output_id="mem:mem-unrelated-eng",
+            relation="DERIVED_FROM",
+            evidence_type="instrumented",
+        )
+    assert excinfo.value.code == "missing_evidence_ref"
+
+    with pytest.raises(RedactoError) as excinfo:
+        engine.record_lineage(
+            source_ids=[SOURCE_ID],
+            output_id="mem:mem-unrelated-eng",
+            relation="DERIVED_FROM",
+            evidence_type="human_verified",
+        )
+    assert excinfo.value.code == "missing_verifier"
+
+
+def test_node_types_follow_the_spec_vocabulary(engine):
+    scan = engine.scan(target_id=SOURCE_ID)
+    assert scan["target"]["node_type"] == "SOURCE"
+    memory = next(
+        c for c in scan["candidates"] if c["record_id"] == "mem:mem-candidate-paraphrase"
+    )
+    assert memory["node_type"] == "MEMORY"
+    trace = engine.trace(source_id=SOURCE_ID)
+    assert trace["source"]["node_type"] == "SOURCE"

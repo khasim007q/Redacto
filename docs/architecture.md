@@ -200,7 +200,8 @@ sequenceDiagram
 
 - **Actions**: `DELETE_RECORD`, `INVALIDATE_INDEX`, `INVALIDATE_CACHE`,
   `REDACT_SPAN` (only where an adapter advertises redaction), `REVIEW_REQUIRED`,
-  `SKIP_PRESERVE`, `UNREACHABLE`.
+  `SKIP_PRESERVE`, `UNREACHABLE` (records in stores that could not be scanned).
+  `REGENERATE_FROM_ALLOWED_SOURCES` is defined but no adapter supports it yet.
 - **Plan states**: `READY_FOR_APPROVAL → APPROVED → EXECUTING → VERIFYING →
   VERIFIED_WITHIN_SCOPE`, with `PARTIAL`, `NEEDS_REVIEW`, `FAILED` as honest
   exceptional states.
@@ -210,6 +211,19 @@ sequenceDiagram
 - **Verification**: rescan reachable in-scope stores, check planned record IDs and
   the keyed whole-target fingerprint, and report residuals. Unreachable stores are
   reported as gaps, never as clean.
+
+## Lineage ingestion hook
+
+`Engine.record_lineage` is the internal, non-MCP entry point for trusted ingestion
+and transformation code. It validates the relation and evidence vocabulary:
+
+- `instrumented` and `imported_metadata` require an opaque `evidence_ref`.
+- `human_verified` requires a verifier identity.
+- Those three evidence types may create a confirmed edge.
+- `model_inferred` and `heuristic_match` only create candidate edges.
+
+The method is intentionally absent from the MCP surface, so an agent cannot promote
+its own claim into confirmed lineage.
 
 ## Revocation tombstones and the ingestion guard
 
@@ -250,6 +264,9 @@ Embedding similarity is a **risk signal only**: it can quarantine, never block a
 never confirm lineage. Thresholds are calibrated on a labelled synthetic set (see
 `redacto calibrate-embeddings`); the local provider is a deterministic lexical-semantic
 embedding, not a neural model.
+
+Records larger than `REDACTO_MAX_RECORD_BYTES` are skipped before matching and
+reported as `oversized_record`; they never enter the graph or a model prompt.
 
 The same guard runs inside `redacto_scan`, so restoring a revoked file cannot
 re-admit it to the provenance graph. Records already active in the graph are exempt
@@ -297,6 +314,11 @@ Tombstones carry a `key_version`. The guard evaluates each tombstone with that
 version's key from `REDACTO_HMAC_KEYS`. Missing versions fail closed for ingestion;
 missing current versions refuse new work; verification reports `not_verifiable` when
 the target's key version is gone. Full procedure: [key-rotation.md](key-rotation.md).
+
+## Spec compliance
+
+The section-by-section audit, including deviations, is in
+[spec-compliance.md](spec-compliance.md).
 
 ## Transport
 
