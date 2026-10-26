@@ -41,7 +41,17 @@ application approval, rehearses with a dry run, applies, verifies and writes
 
 # 8. Verify and export the receipt
 .venv\Scripts\python.exe -m redacto verify --request-id <REQUEST_ID> --out var\receipt.json --markdown var\receipt.md
+
+# 9. Show the tombstone, then re-ingest a restored copy
+.venv\Scripts\python.exe -m redacto tombstones
+Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
+.venv\Scripts\python.exe -m redacto ingest --stores filesystem
+.venv\Scripts\python.exe -m redacto quarantine
 ```
+
+`ingest` reports `restored.md` as `blocked` (`exact_fingerprint`): the copy never
+enters the provenance graph. A paraphrase is reported as `quarantined`
+(`anchor_overlap`) and appears in the quarantine queue instead of being deleted.
 
 ## Storyboard with timings
 
@@ -65,6 +75,18 @@ Remove-Item Env:REDACTO_JSONL_PATH
 
 The JSONL store is reported unreachable, its confirmed descendants become
 `UNKNOWN` review items, and verification ends `PARTIAL` instead of claiming success.
+
+## Showing the re-ingestion guard (optional, 20 seconds)
+
+```powershell
+.venv\Scripts\python.exe -m redacto tombstones
+Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
+.venv\Scripts\python.exe -m redacto ingest --stores filesystem
+.venv\Scripts\python.exe -m redacto quarantine
+```
+
+Point at the `blocked` decision and explain that the file on disk was not deleted by
+the guard: blocking admission is not the same as a new destructive action.
 
 ## What to point at when someone asks "did it really work?"
 

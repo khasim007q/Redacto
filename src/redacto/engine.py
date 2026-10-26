@@ -22,6 +22,14 @@ from redacto.discovery.relationship_assessor import (
 from redacto.errors import RedactoError
 from redacto.graph.repository import RECEIPT_VERSION, Repository, new_id, now_iso
 from redacto.graph.traversal import traverse
+from redacto.ingestion import (
+    ALLOWED,
+    BLOCKED,
+    QUARANTINED,
+    TombstoneGuard,
+    TombstoneMaterial,
+    summarize_guard_findings,
+)
 from redacto.policy import authorization, classify
 from redacto.policy.plan import build_plan_items, compute_plan_hash, estimated_impact
 from redacto.status import collect_status
@@ -174,6 +182,44 @@ class Engine:
             status="active",
         )
 
+    def guard(self) -> TombstoneGuard:
+        """Active tombstones, rebuilt from stored keyed material only."""
+        return TombstoneGuard.from_repo(self.repo, self.settings.hmac_key)
+
+    def _record_guard_decision(
+        self, decision, record: Record, *, present_in_store: bool
+    ) -> None:
+        self.repo.record_ingestion_event(
+            tombstone_id=decision.tombstone_id,
+            store_id=record.store_id,
+            record_id=record.record_id,
+            locator=record.locator,
+            decision=decision.decision,
+            reason_code=decision.reason_code,
+            match_score=decision.match_score,
+            present_in_store=present_in_store,
+        )
+        if decision.quarantined:
+            self.repo.add_quarantine(
+                tombstone_id=decision.tombstone_id,
+                store_id=record.store_id,
+                record_id=record.record_id,
+                locator=record.locator,
+                reason_code=decision.reason_code,
+                match_score=decision.match_score,
+            )
+
+    @staticmethod
+    def _guard_finding(decision, record: Record, *, present_in_store: bool) -> dict[str, Any]:
+        return {
+            "record_id": record.record_id,
+            "store_id": record.store_id,
+            "record_type": record.record_type,
+            **decision.as_dict(),
+            "present_in_store": present_in_store,
+            "admitted": False,
+        }
+
     def _candidate(
         self,
         *,
@@ -240,6 +286,9 @@ class Engine:
         )
 
         slots = self.adapters()
+        guard = self.guard()
+        guard_findings: list[dict[str, Any]] = []
+        guarded_ids: set[str] = set()
         scanned: dict[str, Record] = {}
         coverage: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
@@ -280,17 +329,38 @@ class Engine:
             )
             caps = self._record_capabilities(store, slot)
             for scanned_record in records:
+                # Tombstone guard runs before anything enters the provenance graph.
+                decision = guard.evaluate(
+                    record_id=scanned_record.record_id, content=scanned_record.content
+                )
+                if decision.decision != ALLOWED:
+                    self._record_guard_decision(decision, scanned_record, present_in_store=True)
+                    guard_findings.append(
+                        self._guard_finding(decision, scanned_record, present_in_store=True)
+                    )
+                    guarded_ids.add(scanned_record.record_id)
+                    continue
                 self._upsert_scanned(scanned_record, caps)
 
         if _collect_records is not None:
             _collect_records.update(scanned)
 
-        descendant_by_id = {node.record_id: node for node in traversal.descendants}
+        # Fact/secret revocation targets a value, not a document's descendants: the
+        # anchor record is only a lookup handle. Only records containing the value
+        # may be treated as direct matches.
+        fact_mode = target_kind in {"fact", "secret"}
+        descendant_by_id = (
+            {} if fact_mode else {node.record_id: node for node in traversal.descendants}
+        )
         candidate_edges = {edge["target_id"]: edge for edge in traversal.candidates}
         candidates: dict[str, dict[str, Any]] = {}
         unrelated_preserved = 0
 
         for record_id, scanned_record in scanned.items():
+            if record_id in guarded_ids:
+                # A revoked trace reappearing in a store is reported by the guard,
+                # not re-admitted as a fresh candidate.
+                continue
             capabilities = self._record_capabilities(scanned_record.store_id, slots[scanned_record.store_id])
             match = matcher.match(scanned_record)
             if match is not None:
@@ -385,7 +455,7 @@ class Engine:
 
             unrelated_preserved += 1
 
-        for node in traversal.descendants:
+        for node in traversal.descendants if not fact_mode else []:
             if node.record_id in candidates or node.record_id in scanned:
                 continue
             graph_record = self.repo.get_record(node.record_id) or {}
@@ -467,9 +537,15 @@ class Engine:
             "coverage": coverage,
             "unreachable_stores": [entry["store_id"] for entry in unreachable],
             "model": model_meta,
+            "guard": {
+                "active_tombstones": guard.active_count,
+                "counts": summarize_guard_findings(guard_findings),
+                "findings": guard_findings,
+            },
             "limitations": [
                 "Scan is read-only with respect to record content; only minimized graph metadata is written.",
                 "Semantic candidates stay advisory; unassessed candidates are never destructive.",
+                "Records matching an active tombstone are blocked or quarantined and never re-admitted to the graph.",
             ],
         }
 
@@ -648,6 +724,19 @@ class Engine:
             "unreachable_stores": scan_result["unreachable_stores"],
             "model": scan_result["model"],
         }
+        # Capture tombstone material now: after apply the target content may be gone.
+        target_record = self._require_record(target_id)
+        target_content = self._target_content(target_record, target_kind, target_text)
+        material = TombstoneMaterial.build(target_content, self.settings.hmac_key)
+        if target_kind == "source":
+            label_redacted = (
+                target_record["locator"].get("path")
+                or target_record["locator"].get("id")
+                or target_id
+            )
+        else:
+            label_redacted = f"<redacted {target_kind} target>"
+
         request_id = self.repo.create_request(
             target_id=target_id,
             target_kind=target_kind,
@@ -655,6 +744,11 @@ class Engine:
             scope=scope,
             policy=policy,
             state="READY_FOR_APPROVAL",
+            target_fingerprint=material.fingerprint,
+            target_shingles=material.shingles,
+            target_anchors=material.anchors,
+            target_tokens=material.tokens,
+            target_label_redacted=label_redacted,
         )
         version = self.repo.next_plan_version(request_id)
         plan_hash = compute_plan_hash(
@@ -704,6 +798,218 @@ class Engine:
             "warnings": warnings,
             "limitations": scan_result["limitations"],
         }
+
+    # ------------------------------------------------------------- tombstones
+    @staticmethod
+    def _tombstone_public(tombstone: dict[str, Any] | None) -> dict[str, Any] | None:
+        if tombstone is None:
+            return None
+        return {
+            "tombstone_id": tombstone["tombstone_id"],
+            "request_id": tombstone["request_id"],
+            "target_id": tombstone["target_id"],
+            "target_kind": tombstone["target_kind"],
+            "label_redacted": tombstone["label_redacted"],
+            "scope": tombstone["scope"],
+            "policy": tombstone["policy"],
+            "status": tombstone["status"],
+            "created_at": tombstone["created_at"],
+            "activated_at": tombstone["activated_at"],
+            "related_record_ids": tombstone["related_record_ids"],
+            "related_record_count": len(tombstone["related_record_ids"]),
+        }
+
+    def activate_tombstones(self, request_id: str, plan_id: str) -> dict[str, Any] | None:
+        """Create (or return) the active tombstone for a completed revocation."""
+        existing = self.repo.tombstones_for_request(request_id)
+        if existing:
+            return existing[0]
+        request = self.repo.get_request(request_id)
+        if request is None or not request.get("target_fingerprint"):
+            return None
+
+        items = self.repo.plan_items(plan_id)
+        removed = [i for i in items if i["state"] in {"done", "already_absent"}]
+        related_ids = [i["record_id"] for i in removed if i["record_id"] != request["target_id"]]
+        related_fingerprints: list[str] = []
+        for record_id in related_ids:
+            record = self.repo.get_record(record_id)
+            if record and record.get("fingerprint"):
+                related_fingerprints.append(record["fingerprint"])
+
+        tombstone_id = self.repo.add_tombstone(
+            request_id=request_id,
+            target_id=request["target_id"],
+            target_kind=request["target_kind"],
+            label_redacted=request.get("target_label_redacted") or request["target_id"],
+            fingerprint_value=request["target_fingerprint"],
+            shingles=request.get("target_shingles", []),
+            anchors=request.get("target_anchors", []),
+            tokens=request.get("target_tokens", []),
+            related_record_ids=related_ids,
+            related_fingerprints=related_fingerprints,
+            scope=request["scope"],
+            policy=request["policy"],
+            status="pending",
+        )
+        self.repo.set_tombstone_status(tombstone_id, "active")
+        return self.repo.get_tombstone(tombstone_id)
+
+    def tombstones(self, *, statuses: Sequence[str] = ("active",)) -> dict[str, Any]:
+        """List tombstones without fingerprints or any revoked content."""
+        items = self.repo.list_tombstones(statuses=statuses)
+        return {
+            "ok": True,
+            "count": len(items),
+            "statuses": list(statuses),
+            "tombstones": [self._tombstone_public(item) for item in items],
+            "note": (
+                "Tombstones retain keyed fingerprints, derived match anchors, scope, policy "
+                "and status only. No revoked content is stored."
+            ),
+        }
+
+    # --------------------------------------------------------------- ingestion
+    def ingest(
+        self,
+        records: Sequence[Record],
+        *,
+        store_id: str | None = None,
+        write_to_store: bool = False,
+    ) -> dict[str, Any]:
+        """Admit records through the tombstone guard.
+
+        Blocked records never enter the store or the provenance graph. Quarantined
+        records are held for review and also not admitted. Allowed records are
+        written to the store first (when requested) and then added to the graph.
+        """
+        guard = self.guard()
+        slots = self.adapters()
+        if write_to_store:
+            if not store_id:
+                raise RedactoError("invalid_store", "store_id is required when write_to_store is true.")
+            if store_id not in slots:
+                raise RedactoError(
+                    "out_of_scope_store",
+                    "The target store is not configured; ingestion cannot broaden scope.",
+                    {"store_id": store_id},
+                )
+            if slots[store_id].adapter is None:
+                raise RedactoError(
+                    "store_unreachable",
+                    "The target store is not reachable; nothing was written.",
+                    {"store_id": store_id, "reason": slots[store_id].unavailable_reason},
+                )
+
+        counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0}
+        results: list[dict[str, Any]] = []
+        for record in records:
+            if store_id is not None and record.store_id != store_id:
+                record = record.model_copy(update={"store_id": store_id})
+            decision = guard.evaluate(record_id=record.record_id, content=record.content)
+            if decision.decision != ALLOWED:
+                self._record_guard_decision(decision, record, present_in_store=False)
+                counts[decision.decision] += 1
+                results.append(self._guard_finding(decision, record, present_in_store=False))
+                continue
+
+            if write_to_store:
+                try:
+                    slots[store_id].adapter.write_record(record)  # type: ignore[union-attr]
+                except AdapterError as exc:
+                    raise RedactoError(
+                        "ingestion_write_failed",
+                        f"Store rejected the write: {exc}",
+                        {"store_id": store_id, "adapter_code": exc.code},
+                    ) from exc
+            capabilities = (
+                self._record_capabilities(record.store_id, slots[record.store_id])
+                if record.store_id in slots
+                else {}
+            )
+            self._upsert_scanned(record, capabilities)
+            counts[ALLOWED] += 1
+            results.append(
+                {
+                    "record_id": record.record_id,
+                    "store_id": record.store_id,
+                    "record_type": record.record_type,
+                    "decision": ALLOWED,
+                    "reason_code": "no_match",
+                    "match_score": 0.0,
+                    "written_to_store": bool(write_to_store),
+                    "admitted": True,
+                }
+            )
+        return {
+            "ok": True,
+            "counts": counts,
+            "results": results,
+            "guard": {"active_tombstones": guard.active_count},
+            "limitations": [
+                "The guard blocks admission; it does not delete records already present in a store.",
+                "Quarantined records are held for review and are not added to the active graph.",
+                "A quarantined new write is not written to the store; the caller still holds the source record.",
+            ],
+        }
+
+    def reingest_stores(self, stores: Sequence[str] | None = None) -> dict[str, Any]:
+        """Rescan configured stores through the guard without creating candidates."""
+        guard = self.guard()
+        scope_stores = self._scope_stores(stores)
+        slots = self.adapters()
+        counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0}
+        findings: list[dict[str, Any]] = []
+        unreachable: list[dict[str, Any]] = []
+
+        for store in scope_stores:
+            slot = slots[store]
+            if slot.adapter is None:
+                unreachable.append({"store_id": store, "reason": slot.unavailable_reason})
+                continue
+            try:
+                records = list(slot.adapter.list_records(limit=self.settings.max_scan_records))
+            except AdapterError as exc:
+                unreachable.append({"store_id": store, "reason": f"{exc.code}: {exc}"})
+                continue
+            capabilities = self._record_capabilities(store, slot)
+            for record in records:
+                decision = guard.evaluate(record_id=record.record_id, content=record.content)
+                if decision.decision != ALLOWED:
+                    self._record_guard_decision(decision, record, present_in_store=True)
+                    counts[decision.decision] += 1
+                    findings.append(self._guard_finding(decision, record, present_in_store=True))
+                    continue
+                self._upsert_scanned(record, capabilities)
+                counts[ALLOWED] += 1
+
+        return {
+            "ok": True,
+            "counts": counts,
+            "findings": findings,
+            "unreachable_stores": unreachable,
+            "guard": {"active_tombstones": guard.active_count},
+            "note": (
+                "Blocked and quarantined records were not admitted to the graph. "
+                "Records already present in a store are reported, not silently deleted."
+            ),
+        }
+
+    def quarantine(self, *, statuses: Sequence[str] = ("pending_review",)) -> dict[str, Any]:
+        items = self.repo.list_quarantine(statuses=statuses)
+        return {
+            "ok": True,
+            "count": len(items),
+            "statuses": list(statuses),
+            "quarantine": items,
+            "note": "Quarantine entries hold a locator and redacted match reason, never record content.",
+        }
+
+    def resolve_quarantine(self, *, quarantine_id: str, decision: str) -> dict[str, Any]:
+        if decision not in {"approved", "rejected"}:
+            raise RedactoError("invalid_decision", "decision must be 'approved' or 'rejected'.")
+        self.repo.set_quarantine_status(quarantine_id, decision)
+        return {"ok": True, "quarantine_id": quarantine_id, "status": decision}
 
     # --------------------------------------------------------------- approve
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
@@ -1155,6 +1461,27 @@ class Engine:
         if not_verifiable:
             limitations.append("Stores that could not be verified: " + ", ".join(not_verifiable))
 
+        # Activate the tombstone only after a real apply. Source revocation needs the
+        # target itself gone; fact/secret revocation guards the value even if it was
+        # absent from every store at apply time.
+        tombstone = None
+        applied_plan = plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED"}
+        if status != "FAILED" and applied_plan:
+            target_removed = any(
+                item["record_id"] == request["target_id"]
+                and item["state"] in {"done", "already_absent"}
+                for item in items
+            )
+            if request["target_kind"] in {"fact", "secret"} or (
+                target_removed and (succeeded + already_absent) > 0
+            ):
+                tombstone = self.activate_tombstones(request_id, plan["plan_id"])
+        if tombstone is not None:
+            limitations.append(
+                "An active tombstone blocks re-ingestion of exact and near copies; paraphrased "
+                "remnants remain a review risk."
+            )
+
         summary = {
             "receipt_version": RECEIPT_VERSION,
             "request_id": request_id,
@@ -1178,6 +1505,7 @@ class Engine:
             "limitations": limitations,
             "model": request["policy"].get("model", {}),
             "approved_by": "application-issued-approval",
+            "tombstone": self._tombstone_public(tombstone),
             "checked_at": now_iso(),
             "statement": _statement_for(status, review_pending, unreachable_stores, not_verifiable),
         }
@@ -1194,6 +1522,7 @@ class Engine:
             "stores": store_results,
             "unreachable_stores": unreachable_stores,
             "limitations": limitations,
+            "tombstone": self._tombstone_public(tombstone),
             "statement": summary["statement"],
             "receipt": summary,
         }

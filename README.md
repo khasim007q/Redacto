@@ -21,8 +21,10 @@ complete (scan, trace, plan, approval, apply, verify, receipt). Model-assisted
 discovery sits behind a replaceable interface and is **off by default**; with no
 provider configured, semantic candidates are reported as unassessed.
 
-- 55 automated tests pass (`pytest`).
+- 76 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
+- Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
+  quarantined for review, never silently dropped and never auto-deleted.
 - Verification is scoped and enforced by code, not by wording in a prompt.
 
 ## Quick start
@@ -54,6 +56,10 @@ python -m redacto plan   --target-id "fs:acquisition-plan.md"
 python -m redacto approve --plan-id <PLAN_ID> --ref "operator approval"
 python -m redacto apply  --plan-id <PLAN_ID> --version 1 --ref "operator approval" --token <TOKEN> [--dry-run]
 python -m redacto verify --request-id <REQUEST_ID> --out var\receipt.json --markdown var\receipt.md
+python -m redacto tombstones                       # active tombstones, no content
+python -m redacto ingest                           # re-run the guard over configured stores
+python -m redacto quarantine                       # records held for review
+python -m redacto resolve-quarantine --id <ID> --decision approved|rejected
 python -m redacto serve  --transport stdio   # or: --transport http
 ```
 
@@ -67,6 +73,8 @@ python -m redacto serve  --transport stdio   # or: --transport http
 | `redacto_plan` | no | Draft plan with per-record actions, risks, estimated impact |
 | `redacto_apply` | **yes** | Executes an approved plan version; requires an application-issued token |
 | `redacto_verify` | no | Rescans in-scope stores and writes a scoped receipt |
+| `redacto_tombstones` | no | Active tombstones: scope, policy, status (no content, no fingerprints) |
+| `redacto_quarantine` | no | Records held by the ingestion guard for human review |
 
 There is deliberately **no approve tool**. Approval is an application action
 (`redacto approve`), so an agent cannot authorize its own deletion.
@@ -184,6 +192,10 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - No `execute_shell`, no arbitrary SQL, no arbitrary filesystem operations.
 - Failures are never reported as success: adapter errors produce per-record failures
   and a `PARTIAL` result.
+- Tombstones retain keyed HMAC fingerprints and derived anchors only. A different
+  `REDACTO_HMAC_KEY` cannot match them, and the revoked content is unrecoverable.
+- The ingestion guard fails closed: blocked records never reach the store or graph.
+  Quarantined records are held as pointers for review, not copied into Redacto.
 - HTTP mode requires a bearer token and refuses to start without one.
 
 ## Measured results
@@ -191,7 +203,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-55 passed in 12.16s
+76 passed in 30.87s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -200,7 +212,9 @@ short-secret bounds, entity heuristics, model invalid-JSON/timeout →
 version, tampered plan), dry run, per-record outcomes, idempotent re-apply,
 adapter failure and disappearing stores, unreachable-store reporting, receipt
 redaction, scope enforcement, traversal rejection, SQL table rejection, embedded
-instruction containment, secret non-persistence, and HTTP auth.
+instruction containment, secret non-persistence, HTTP auth, and all four
+re-ingestion attacks (restored file, replayed JSONL event, rebuilt vector chunk,
+reintroduced paraphrase) plus store-write blocking and quarantine review.
 
 Demo (`python -m redacto demo`) on the seeded fixture:
 
@@ -223,7 +237,12 @@ Demo (`python -m redacto demo`) on the seeded fixture:
   weights are out of reach; the receipt says so.
 - Verification detects planned record IDs and exact/normalized whole-target copies.
   Paraphrased remnants in unlinked stores may survive undetected.
-- Re-ingestion can recreate a revoked trace; there is no tombstone check yet.
+- Re-ingestion is blocked for exact and near copies, but a paraphrase with no shared
+  distinctive anchors can still enter; the guard only quarantines what it can evidence.
+- Tombstone key rotation is manual: changing `REDACTO_HMAC_KEY` makes existing
+  tombstones unmatchable until re-derived.
+- Quarantine is a review queue, not a workflow engine: approval does not automatically
+  admit the record to the graph.
 - Model assessment is unbenchmarked in this MVP and advisory only.
 - Two revocation modes exist in code; **source revocation** is the tested path.
   Fact/secret revocation is functional but narrower (bounded substring matching).
@@ -249,11 +268,12 @@ docs/          architecture.md threat-model.md demo-script.md
 
 ## Next highest-value task
 
-Add a **revocation tombstone / re-ingestion guard**: persist revoked source
-fingerprints and rejected derivations so a deleted trace cannot be silently
-recreated by a later ingestion run. That is the biggest remaining gap between
-"verified absent now" and "stays absent".
+Strengthen **paraphrase re-ingestion detection** beyond shared anchors: embed the
+tombstone's derived match material and require a calibrated similarity threshold
+before admitting a record, with the same quarantine default. That closes the gap
+between "exact and near copies are blocked" and "a reworded trace cannot slip in".
 
-Then, in order: benchmark the model assessor on a labelled sibling set; a graph
-visualisation that distinguishes confirmed from candidate edges; and real vector
-store / cache adapters behind the same interface.
+Then, in order: an automated tombstone-key rotation story; a quarantine review
+workflow that can admit a reviewed record under an audit entry; a benchmark of the
+model assessor on a labelled sibling set; and real vector store / cache adapters
+behind the same interface.

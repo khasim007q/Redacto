@@ -62,7 +62,23 @@ class Repository:
     def _initialize(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add later columns to pre-existing databases without losing data."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(revocation_requests)")}
+        additions = {
+            "target_fingerprint": "TEXT",
+            "target_shingles_json": "TEXT NOT NULL DEFAULT '[]'",
+            "target_anchors_json": "TEXT NOT NULL DEFAULT '[]'",
+            "target_tokens_json": "TEXT NOT NULL DEFAULT '[]'",
+            "target_label_redacted": "TEXT",
+        }
+        for column, ddl in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE revocation_requests ADD COLUMN {column} {ddl}")
 
     # ---------------------------------------------------------------- records
     def upsert_record(
@@ -251,13 +267,20 @@ class Repository:
         scope: dict[str, Any],
         policy: dict[str, Any],
         state: str = "PLANNED",
+        target_fingerprint: str | None = None,
+        target_shingles: Sequence[str] = (),
+        target_anchors: Sequence[str] = (),
+        target_tokens: Sequence[str] = (),
+        target_label_redacted: str | None = None,
     ) -> str:
         request_id = new_id("req")
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO revocation_requests
-                   (request_id, target_id, target_kind, mode, scope_json, policy_json, state, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (request_id, target_id, target_kind, mode, scope_json, policy_json, state,
+                    created_at, target_fingerprint, target_shingles_json, target_anchors_json,
+                    target_tokens_json, target_label_redacted)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request_id,
                     target_id,
@@ -267,6 +290,11 @@ class Repository:
                     _json(policy),
                     state,
                     now_iso(),
+                    target_fingerprint,
+                    _json(list(target_shingles)),
+                    _json(list(target_anchors)),
+                    _json(list(target_tokens)),
+                    target_label_redacted,
                 ),
             )
             conn.commit()
@@ -281,6 +309,9 @@ class Repository:
         if parsed:
             parsed["scope"] = _loads(parsed.pop("scope_json"), {})
             parsed["policy"] = _loads(parsed.pop("policy_json"), {})
+            parsed["target_shingles"] = _loads(parsed.pop("target_shingles_json", None), [])
+            parsed["target_anchors"] = _loads(parsed.pop("target_anchors_json", None), [])
+            parsed["target_tokens"] = _loads(parsed.pop("target_tokens_json", None), [])
         return parsed
 
     def set_request_state(self, request_id: str, state: str) -> None:
@@ -590,3 +621,209 @@ class Repository:
         if parsed:
             parsed["summary"] = _loads(parsed.pop("summary_json"), {})
         return parsed
+
+    # ------------------------------------------------------------- tombstones
+    def add_tombstone(
+        self,
+        *,
+        request_id: str,
+        target_id: str,
+        target_kind: str,
+        label_redacted: str,
+        fingerprint_value: str,
+        shingles: Sequence[str],
+        anchors: Sequence[str],
+        tokens: Sequence[str],
+        related_record_ids: Sequence[str],
+        related_fingerprints: Sequence[str],
+        scope: dict[str, Any],
+        policy: dict[str, Any],
+        status: str = "pending",
+    ) -> str:
+        tombstone_id = new_id("tomb")
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO tombstones
+                   (tombstone_id, request_id, target_id, target_kind, label_redacted, fingerprint,
+                    shingles_json, anchors_json, tokens_json, related_record_ids_json,
+                    related_fingerprints_json, scope_json, policy_json, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    tombstone_id,
+                    request_id,
+                    target_id,
+                    target_kind,
+                    label_redacted,
+                    fingerprint_value,
+                    _json(list(shingles)),
+                    _json(list(anchors)),
+                    _json(list(tokens)),
+                    _json(list(related_record_ids)),
+                    _json(list(related_fingerprints)),
+                    _json(scope),
+                    _json(policy),
+                    status,
+                    now_iso(),
+                ),
+            )
+            conn.commit()
+        return tombstone_id
+
+    @staticmethod
+    def _tombstone_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["shingles"] = _loads(item.pop("shingles_json"), [])
+        item["anchors"] = _loads(item.pop("anchors_json"), [])
+        item["tokens"] = _loads(item.pop("tokens_json"), [])
+        item["related_record_ids"] = _loads(item.pop("related_record_ids_json"), [])
+        item["related_fingerprints"] = _loads(item.pop("related_fingerprints_json"), [])
+        item["scope"] = _loads(item.pop("scope_json"), {})
+        item["policy"] = _loads(item.pop("policy_json"), {})
+        return item
+
+    def list_tombstones(
+        self, *, statuses: Sequence[str] = ("active",), limit: int = 200
+    ) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tombstones WHERE status IN ({placeholders}) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (*statuses, limit),
+            ).fetchall()
+        return [self._tombstone_row(row) for row in rows]
+
+    def get_tombstone(self, tombstone_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tombstones WHERE tombstone_id = ?", (tombstone_id,)
+            ).fetchone()
+        return self._tombstone_row(row) if row is not None else None
+
+    def tombstones_for_request(self, request_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tombstones WHERE request_id = ? ORDER BY created_at",
+                (request_id,),
+            ).fetchall()
+        return [self._tombstone_row(row) for row in rows]
+
+    def set_tombstone_status(self, tombstone_id: str, status: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tombstones SET status = ?, activated_at = COALESCE(activated_at, ?) "
+                "WHERE tombstone_id = ?",
+                (status, now_iso() if status == "active" else None, tombstone_id),
+            )
+            conn.commit()
+
+    # --------------------------------------------------------- ingestion audit
+    def record_ingestion_event(
+        self,
+        *,
+        tombstone_id: str | None,
+        store_id: str | None,
+        record_id: str,
+        locator: dict[str, Any],
+        decision: str,
+        reason_code: str,
+        match_score: float,
+        present_in_store: bool,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO ingestion_events
+                   (event_id, tombstone_id, store_id, record_id, locator_json, decision,
+                    reason_code, match_score, present_in_store, attempts, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(tombstone_id, record_id, decision) DO UPDATE SET
+                       attempts = ingestion_events.attempts + 1,
+                       reason_code = excluded.reason_code,
+                       match_score = excluded.match_score,
+                       present_in_store = excluded.present_in_store,
+                       created_at = excluded.created_at""",
+                (
+                    new_id("evt"),
+                    tombstone_id,
+                    store_id,
+                    record_id,
+                    _json(locator),
+                    decision,
+                    reason_code,
+                    match_score,
+                    1 if present_in_store else 0,
+                    now_iso(),
+                ),
+            )
+            conn.commit()
+
+    def ingestion_events(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ingestion_events ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["locator"] = _loads(item.pop("locator_json"), {})
+            item["present_in_store"] = bool(item["present_in_store"])
+            results.append(item)
+        return results
+
+    # -------------------------------------------------------------- quarantine
+    def add_quarantine(
+        self,
+        *,
+        tombstone_id: str | None,
+        store_id: str | None,
+        record_id: str,
+        locator: dict[str, Any],
+        reason_code: str,
+        match_score: float,
+    ) -> str:
+        quarantine_id = new_id("quar")
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO quarantine
+                   (quarantine_id, tombstone_id, store_id, record_id, locator_json, reason_code,
+                    match_score, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)
+                   ON CONFLICT(tombstone_id, record_id) DO NOTHING""",
+                (
+                    quarantine_id,
+                    tombstone_id,
+                    store_id,
+                    record_id,
+                    _json(locator),
+                    reason_code,
+                    match_score,
+                    now_iso(),
+                ),
+            )
+            conn.commit()
+        return quarantine_id
+
+    def list_quarantine(
+        self, *, statuses: Sequence[str] = ("pending_review",), limit: int = 200
+    ) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM quarantine WHERE status IN ({placeholders}) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (*statuses, limit),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["locator"] = _loads(item.pop("locator_json"), {})
+            results.append(item)
+        return results
+
+    def set_quarantine_status(self, quarantine_id: str, status: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE quarantine SET status = ?, reviewed_at = ? WHERE quarantine_id = ?",
+                (status, now_iso(), quarantine_id),
+            )
+            conn.commit()

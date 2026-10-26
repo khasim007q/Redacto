@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
 from redacto.config import load_settings
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID, seed_workspace
+from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID, seed_workspace
 from redacto.receipts import to_json, to_markdown
 
 
@@ -118,6 +119,32 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tombstones(args: argparse.Namespace) -> int:
+    engine = _engine()
+    statuses = _stores(args.statuses) or ["active"]
+    _print(engine.tombstones(statuses=statuses))
+    return 0
+
+
+def cmd_quarantine(args: argparse.Namespace) -> int:
+    engine = _engine()
+    statuses = _stores(args.statuses) or ["pending_review"]
+    _print(engine.quarantine(statuses=statuses))
+    return 0
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    engine = _engine()
+    _print(engine.reingest_stores(stores=_stores(args.stores)))
+    return 0
+
+
+def cmd_resolve_quarantine(args: argparse.Namespace) -> int:
+    engine = _engine()
+    _print(engine.resolve_quarantine(quarantine_id=args.id, decision=args.decision))
+    return 0
+
+
 def cmd_demo(args: argparse.Namespace) -> int:
     settings = load_settings()
     var = settings.db_path.parent
@@ -191,6 +218,29 @@ def cmd_demo(args: argparse.Namespace) -> int:
     (var / "demo_receipt.md").write_text(to_markdown(summary), encoding="utf-8")
     print(f"\n[7] Receipt written to {var / 'demo_receipt.json'} and {var / 'demo_receipt.md'}")
     print(f"    {summary['statement']}")
+
+    print("\n[8] Re-ingestion attack")
+    restored = settings.workspace_root / "acquisition-plan.md"
+    restored.write_text(ACQUISITION_PLAN, encoding="utf-8")
+    with sqlite3.connect(settings.sqlite_store_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO memories (id, content, created_at, sensitivity) VALUES (?, ?, ?, ?)",
+            (
+                "mem-reintroduced-paraphrase",
+                "Kestrel deal was about $42 million, I believe.",
+                "2026-10-26T12:00:00+00:00",
+                "confidential",
+            ),
+        )
+        conn.commit()
+    reingest = engine.reingest_stores(stores=["filesystem", "sqlite_memory"])
+    print(f"    guard counts: {reingest['counts']} (active tombstones: {reingest['guard']['active_tombstones']})")
+    for finding in reingest["findings"]:
+        print(
+            f"      {finding['decision']:<12} {finding['record_id']:<34} "
+            f"{finding['reason_code']} (score {finding['match_score']})"
+        )
+    print("    Restored exact copies are blocked; paraphrases are quarantined for review, not deleted.")
     print("    Learn more: README.md and docs/demo-script.md")
     return 0
 
@@ -260,6 +310,23 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--out")
     verify.add_argument("--markdown")
     verify.set_defaults(func=cmd_verify)
+
+    tombstones = sub.add_parser("tombstones", help="list revocation tombstones (no content)")
+    tombstones.add_argument("--statuses", default="active")
+    tombstones.set_defaults(func=cmd_tombstones)
+
+    quarantine = sub.add_parser("quarantine", help="list guard-quarantined records")
+    quarantine.add_argument("--statuses", default="pending_review")
+    quarantine.set_defaults(func=cmd_quarantine)
+
+    ingest = sub.add_parser("ingest", help="re-run the ingestion guard over configured stores")
+    ingest.add_argument("--stores")
+    ingest.set_defaults(func=cmd_ingest)
+
+    resolve = sub.add_parser("resolve-quarantine", help="mark a quarantine entry reviewed")
+    resolve.add_argument("--id", required=True)
+    resolve.add_argument("--decision", required=True, choices=["approved", "rejected"])
+    resolve.set_defaults(func=cmd_resolve_quarantine)
 
     demo = sub.add_parser("demo", help="run the 90-120 second end-to-end storyboard")
     demo.set_defaults(func=cmd_demo)

@@ -76,6 +76,16 @@ class StoreAdapter(ABC):
     def delete_record(self, locator: dict[str, str]) -> None:
         """Delete one in-scope record. Raise AdapterError on any failure."""
 
+    def write_record(self, record: Record) -> None:
+        """Admit a record into this store.
+
+        Ingestion callers must check tombstones before calling this. Adapters that
+        cannot write raise; a rejected write is never silently ignored.
+        """
+        raise AdapterError(
+            f"{self.adapter_id}: writing records is not supported", code="unsupported_operation"
+        )
+
     def redact_record(self, locator: dict[str, str], spans: Sequence[str]) -> None:
         raise AdapterError(
             f"{self.adapter_id}: redaction is not supported", code="unsupported_operation"

@@ -62,6 +62,7 @@ flowchart LR
 | `policy/classify.py` | Evidence classes → proposed action + approved flag + collateral risk. |
 | `policy/plan.py` | Plan items, version-bound plan hash, estimated impact. |
 | `policy/authorization.py` | Application-issued confirmation tokens (hash stored, short TTL, single use). |
+| `ingestion.py` | Tombstone material, guard evaluation, and the allowed/quarantined/blocked decision. |
 | `engine.py` | scan / trace / plan / apply / verify orchestration and all scope checks. |
 | `receipts.py` | Receipt rendering to JSON and Markdown. |
 | `mcp/server.py` | Tool registration plus the error guard that never leaks stack traces. |
@@ -80,6 +81,9 @@ erDiagram
     revocation_requests ||--o{ actions : "request_id"
     revocation_requests ||--o{ verification_runs : "request_id"
     revocation_requests ||--o{ receipts : "request_id"
+    revocation_requests ||--o{ tombstones : "request_id"
+    tombstones ||--o{ ingestion_events : "tombstone_id"
+    tombstones ||--o{ quarantine : "tombstone_id"
 
     records {
         text record_id PK
@@ -117,6 +121,34 @@ erDiagram
         text token_hash
         text expires_at
         text used_at
+    }
+    tombstones {
+        text tombstone_id PK
+        text target_id
+        text target_kind
+        text fingerprint
+        text shingles_json
+        text anchors_json
+        text related_fingerprints_json
+        text scope_json
+        text status
+    }
+    ingestion_events {
+        text event_id PK
+        text tombstone_id
+        text record_id
+        text decision
+        text reason_code
+        real match_score
+        int attempts
+    }
+    quarantine {
+        text quarantine_id PK
+        text tombstone_id
+        text record_id
+        text locator_json
+        text reason_code
+        text status
     }
     actions {
         text action_id PK
@@ -156,8 +188,9 @@ sequenceDiagram
     Ag->>S: redacto_apply(plan_id, version, ref, token)
     S-->>Ag: per-record results (success / already_absent / failed)
     Ag->>S: redacto_verify(request_id)
-    S-->>Ag: scoped receipt + limitations
+    S-->>Ag: scoped receipt + limitations + active tombstone
     Ag->>U: removed / preserved / review / failed / unverified
+    Note over S: Later ingestion is checked against the tombstone:<br/>exact/near copies blocked, uncertain matches quarantined
 ```
 
 ## Execution semantics
@@ -174,6 +207,43 @@ sequenceDiagram
 - **Verification**: rescan reachable in-scope stores, check planned record IDs and
   the keyed whole-target fingerprint, and report residuals. Unreachable stores are
   reported as gaps, never as clean.
+
+## Revocation tombstones and the ingestion guard
+
+A verified revocation writes one tombstone per request. It stores the target's keyed
+HMAC fingerprint, keyed hashes of normalized 5-word shingles, weighted anchor hashes
+(proper nouns weight 1, numeric amounts weight 2), token hashes for fact/secret
+targets, the removed records' fingerprints, scope, policy and status. The revoked
+content is not stored and cannot be recovered from the tombstone.
+
+```mermaid
+flowchart TD
+    R["Candidate record at ingestion"] --> G{"Active tombstones?"}
+    G -- none --> A["ALLOW: admit to store + graph"]
+    G -- match --> M{"Match strength"}
+    M -- "same record id / revoked id" --> B["BLOCK: same_target / revoked_record_id"]
+    M -- "exact fingerprint" --> B2["BLOCK: exact_fingerprint / exact_derivative_fingerprint"]
+    M -- "shingle containment >= 0.5" --> B3["BLOCK: partial_copy"]
+    M -- "all fact tokens present" --> B4["BLOCK: fact_containment"]
+    M -- "weighted anchors >= 3" --> Q["QUARANTINE: anchor_overlap"]
+    M -- "shingle overlap >= 0.2" --> Q2["QUARANTINE: similar_content"]
+    M -- "no evidence" --> A
+    B --> L["ingestion_events + no admission"]
+    B2 --> L
+    B3 --> L
+    B4 --> L
+    Q --> QR["quarantine row (locator + reason) + no admission"]
+    Q2 --> QR
+```
+
+Blocked records never enter the store or the graph. Quarantined records are held as a
+review pointer and also not admitted. Neither is deleted automatically: a record that
+already exists in a store stays there and is reported, preserving the approval
+boundary.
+
+The same guard runs inside `redacto_scan`, so restoring a revoked file cannot
+re-admit it to the provenance graph. `redacto ingest` re-runs the guard over the
+configured stores and reports `allowed`, `blocked` and `quarantined` counts.
 
 ## Transport
 

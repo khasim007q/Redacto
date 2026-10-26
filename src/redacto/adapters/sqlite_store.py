@@ -165,6 +165,28 @@ class SqliteMemoryAdapter(StoreAdapter):
             code="unsupported_operation",
         )
 
+    def write_record(self, record: Record) -> None:
+        table = record.locator.get("table")
+        if table not in self._tables:
+            raise AdapterError("unapproved table", code="out_of_scope")
+        record_id = record.locator.get("id")
+        if not record_id:
+            raise AdapterError("sqlite locator requires 'id'", code="invalid_locator")
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} (id, content, created_at, sensitivity) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        record_id,
+                        record.content,
+                        record.metadata.get("created_at"),
+                        ",".join(record.sensitivity),
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise AdapterError(f"sqlite write failed: {exc}", code="write_failed") from exc
+
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = 0
         for record in self.list_records():

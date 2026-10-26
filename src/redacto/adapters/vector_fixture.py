@@ -103,6 +103,21 @@ class VectorFixtureAdapter(StoreAdapter):
     def invalidate_derived(self, locator: dict[str, str]) -> None:
         self.delete_record(locator)
 
+    def write_record(self, record: Record) -> None:
+        chunk_id = record.locator.get("id")
+        if not chunk_id:
+            raise AdapterError("vector locator requires 'id'", code="invalid_locator")
+        chunks = [c for c in self._load() if str(c.get("id") or c.get("chunk_id")) != chunk_id]
+        chunks.append(
+            {
+                "id": chunk_id,
+                "text": record.content,
+                "metadata": dict(record.metadata),
+                "sensitivity": ",".join(record.sensitivity) if record.sensitivity else "unknown",
+            }
+        )
+        self._save(chunks)
+
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = 0
         for record in self.list_records():

@@ -76,6 +76,8 @@ async def _full_cycle(settings):
             "redacto_plan",
             "redacto_apply",
             "redacto_verify",
+            "redacto_tombstones",
+            "redacto_quarantine",
         }
 
         status = _payload(await session.call_tool("redacto_status", {}))
@@ -127,6 +129,14 @@ async def _full_cycle(settings):
         )
         assert verified["counts"]["residual_matches"] == 0
         assert verified["status"] in {"VERIFIED_WITHIN_SCOPE", "NEEDS_REVIEW"}
+
+        tombstones = _payload(await session.call_tool("redacto_tombstones", {}))
+        assert tombstones["count"] == 1
+        assert tombstones["tombstones"][0]["target_id"] == SOURCE_ID
+        assert tombstones["tombstones"][0]["status"] == "active"
+
+        quarantine = _payload(await session.call_tool("redacto_quarantine", {}))
+        assert quarantine["ok"] is True
         return verified
 
     return await _with_session(env, callback)

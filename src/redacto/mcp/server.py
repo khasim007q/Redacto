@@ -91,6 +91,29 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
         )
 
     @mcp.tool(annotations=READ_ONLY)
+    def redacto_tombstones(statuses: Sequence[str] | None = None) -> dict[str, Any]:
+        """List revocation tombstones: scope, policy and status only.
+
+        Read-only. Returns keyed-fingerprint-backed tombstone metadata, never the revoked
+        content. Use this to explain that a trace is already revoked and will be blocked
+        if it is re-ingested.
+        """
+        return _guard(
+            lambda: engine.tombstones(statuses=tuple(statuses) if statuses else ("active",))
+        )
+
+    @mcp.tool(annotations=READ_ONLY)
+    def redacto_quarantine(statuses: Sequence[str] | None = None) -> dict[str, Any]:
+        """List records held by the ingestion guard for human review.
+
+        Read-only. Entries contain a store locator, a redacted match reason and a score,
+        never record content. Quarantined records are not in the active graph.
+        """
+        return _guard(
+            lambda: engine.quarantine(statuses=tuple(statuses) if statuses else ("pending_review",))
+        )
+
+    @mcp.tool(annotations=READ_ONLY)
     def redacto_trace(source_record_id: str, depth: int = 3) -> dict[str, Any]:
         """Explain recorded lineage and candidates for a source record. Read-only.
 

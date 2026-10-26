@@ -358,6 +358,14 @@ def seed_workspace(settings: Settings) -> dict[str, object]:
             "vec:chunk-0003",
         ],
         "unreachable_simulation": "Point REDACTO_JSONL_PATH at a missing file to produce a partial receipt.",
+        "reingestion_expectations": {
+            "restored_target": "blocked:same_target",
+            "renamed_exact_copy": "blocked:exact_fingerprint",
+            "replayed_jsonl_event": "blocked:exact_fingerprint or revoked_record_id",
+            "rebuilt_vector_chunk": "blocked:exact_derivative_fingerprint or partial_copy",
+            "paraphrased_memory": "quarantined:anchor_overlap",
+            "unrelated_note": "allowed",
+        },
     }
     (settings.workspace_root.parent / "expected_results.json").write_text(
         json.dumps(expected, indent=2) + "\n", encoding="utf-8"

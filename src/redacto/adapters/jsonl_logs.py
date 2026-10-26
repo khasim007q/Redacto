@@ -126,6 +126,25 @@ class JsonlLogAdapter(StoreAdapter):
         except OSError as exc:
             raise AdapterError(f"jsonl delete failed: {exc}", code="delete_failed") from exc
 
+    def write_record(self, record: Record) -> None:
+        event_id = record.locator.get("event_id")
+        if not event_id:
+            raise AdapterError("jsonl locator requires 'event_id'", code="invalid_locator")
+        payload = {
+            "event_id": event_id,
+            "kind": record.metadata.get("kind", "ingested"),
+            "content": record.content,
+            "sensitivity": ",".join(record.sensitivity) if record.sensitivity else "unknown",
+            "ts": record.metadata.get("created_at") or "",
+        }
+        try:
+            existing = self._path.read_text(encoding="utf-8")
+            prefix = "" if not existing or existing.endswith("\n") else "\n"
+            with self._path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(prefix + json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            raise AdapterError(f"jsonl write failed: {exc}", code="write_failed") from exc
+
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = 0
         for record in self.list_records():

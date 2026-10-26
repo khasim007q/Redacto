@@ -102,6 +102,17 @@ class FilesystemAdapter(StoreAdapter):
         except OSError as exc:
             raise AdapterError(f"filesystem delete failed: {exc}", code="delete_failed") from exc
 
+    def write_record(self, record: Record) -> None:
+        path = self._safe_path(record.locator)
+        if path.suffix.lower() not in SCAN_SUFFIXES:
+            raise AdapterError("only configured text file types may be written", code="out_of_scope")
+        if not path.parent.is_dir():
+            raise AdapterError("target directory is not in scope", code="out_of_scope")
+        try:
+            path.write_text(record.content, encoding="utf-8")
+        except OSError as exc:
+            raise AdapterError(f"filesystem write failed: {exc}", code="write_failed") from exc
+
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = 0
         for record in self.list_records():

@@ -42,6 +42,10 @@ destructive or leaking component**.
 | T13 | Unauthenticated remote exposure | HTTP mode refuses to start without a token, binds localhost by default, bearer middleware on every request | `test_http_mode_refuses_to_serve_without_a_token`, `test_http_requests_require_a_valid_bearer_token` |
 | T14 | Model provider unavailable or hostile | Timeout/invalid JSON/provider errors → `unassessed`; deterministic flow continues | `test_invalid_model_json_is_unassessed_and_non_destructive`, `test_model_timeout_is_unassessed` |
 | T15 | Stack traces or internals leaked to clients | Tool guard converts unexpected errors into a generic `internal_error` payload | `mcp/server.py::_guard` |
+| T16 | The tombstone becomes a new copy of the revoked secret | Tombstones store only keyed HMAC fingerprints, derived shingle/anchor hashes, scope and status; no content | `test_tombstone_stores_no_revoked_content`, `test_secret_tombstone_never_stores_the_secret`, `test_tombstones_response_has_no_fingerprints` |
+| T17 | Re-ingestion recreates a revoked trace (restored file, replayed log, rebuilt index) | The guard runs before store writes and graph admission; exact/near copies are blocked | `test_restoring_the_original_file_is_blocked`, `test_renamed_exact_copy_is_blocked_by_fingerprint`, `test_replaying_an_old_jsonl_event_is_blocked`, `test_rebuilt_vector_chunk_is_blocked`, `test_ingest_refuses_to_write_a_blocked_record_to_a_store` |
+| T18 | An uncertain match is silently dropped, losing useful data | Uncertain matches are quarantined with a locator and reason, never deleted; review is explicit | `test_paraphrased_memory_is_quarantined_not_dropped`, `test_quarantine_can_be_reviewed`, `test_unrelated_records_are_still_allowed` |
+| T19 | A stale or foreign tombstone blocks legitimate data | Tombstones only activate after a real applied revocation; HMAC binding means a different key cannot match; false positives are quarantined, not deleted | `test_no_tombstone_before_apply`, `test_guard_uses_hmac_so_another_key_cannot_match` |
 
 ## Residual risks (accepted, disclosed)
 
@@ -50,8 +54,13 @@ destructive or leaking component**.
 - **Paraphrase detection is incomplete.** Verification matches planned record IDs and
   the keyed whole-target fingerprint; a reworded remnant in an unlinked store may
   survive and is not detectable by this method.
-- **Re-ingestion can recreate a trace.** There is no tombstone check on the ingestion
-  path yet; this is the highest-value next hardening item.
+- **Re-ingestion is mitigated, not eliminated.** Exact and near copies are blocked and
+  anchor-bearing paraphrases are quarantined, but a paraphrase with no shared
+  distinctive anchors can still pass. Embedding-based detection is the next step.
+- **Tombstone material is key-bound.** Changing `REDACTO_HMAC_KEY` invalidates existing
+  tombstone matching until material is re-derived; key rotation is a manual procedure.
+- **Quarantine is a queue, not a workflow.** Approving a quarantine entry records the
+  decision but does not admit the record to the graph.
 - **Keyed fingerprints are only as strong as `REDACTO_HMAC_KEY`.** The fixture default
   is not a secret; production use requires a real key and rotation story.
 - **Model assessment quality is not benchmarked** in this MVP; the deterministic path

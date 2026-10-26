@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS revocation_requests (
     state TEXT NOT NULL,
     created_at TEXT NOT NULL,
     approved_at TEXT,
-    approved_by TEXT
+    approved_by TEXT,
+    target_fingerprint TEXT,
+    target_shingles_json TEXT NOT NULL DEFAULT '[]',
+    target_anchors_json TEXT NOT NULL DEFAULT '[]',
+    target_tokens_json TEXT NOT NULL DEFAULT '[]',
+    target_label_redacted TEXT
 );
 
 CREATE TABLE IF NOT EXISTS revocation_plans (
@@ -130,4 +135,58 @@ CREATE INDEX IF NOT EXISTS idx_candidate_source ON candidate_edges(source_id, st
 CREATE INDEX IF NOT EXISTS idx_items_plan ON revocation_plan_items(plan_id);
 CREATE INDEX IF NOT EXISTS idx_actions_request ON actions(request_id);
 CREATE INDEX IF NOT EXISTS idx_verify_request ON verification_runs(request_id);
+
+-- Revocation tombstones retain only keyed fingerprints and derived match anchors,
+-- never the revoked content itself.
+CREATE TABLE IF NOT EXISTS tombstones (
+    tombstone_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    label_redacted TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    shingles_json TEXT NOT NULL DEFAULT '[]',
+    anchors_json TEXT NOT NULL DEFAULT '[]',
+    tokens_json TEXT NOT NULL DEFAULT '[]',
+    related_record_ids_json TEXT NOT NULL DEFAULT '[]',
+    related_fingerprints_json TEXT NOT NULL DEFAULT '[]',
+    scope_json TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    activated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_events (
+    event_id TEXT PRIMARY KEY,
+    tombstone_id TEXT,
+    store_id TEXT,
+    record_id TEXT NOT NULL,
+    locator_json TEXT NOT NULL DEFAULT '{}',
+    decision TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    match_score REAL NOT NULL DEFAULT 0,
+    present_in_store INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE (tombstone_id, record_id, decision)
+);
+
+CREATE TABLE IF NOT EXISTS quarantine (
+    quarantine_id TEXT PRIMARY KEY,
+    tombstone_id TEXT,
+    store_id TEXT,
+    record_id TEXT NOT NULL,
+    locator_json TEXT NOT NULL DEFAULT '{}',
+    reason_code TEXT NOT NULL,
+    match_score REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending_review',
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    UNIQUE (tombstone_id, record_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tombstones_status ON tombstones(status);
+CREATE INDEX IF NOT EXISTS idx_quarantine_status ON quarantine(status);
+CREATE INDEX IF NOT EXISTS idx_ingestion_tombstone ON ingestion_events(tombstone_id, decision);
 """
