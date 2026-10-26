@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from threading import Barrier, Thread
 
 import pytest
 
@@ -250,3 +251,79 @@ def test_executing_plan_can_be_retried_without_duplicate_work(engine):
     assert result.get("already_completed") is not True
     assert result["counts"]["succeeded"] == 7
     assert result["plan_state"] == "VERIFYING"
+
+
+def test_approval_claim_is_atomic(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    engine.approve_plan(plan_id=plan["plan_id"], approval_ref="operator-approval")
+    approval = engine.repo.find_approval(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="operator-approval",
+    )
+    assert engine.repo.claim_approval(approval["approval_id"]) is True
+    assert engine.repo.claim_approval(approval["approval_id"]) is False
+
+
+def test_claimed_token_cannot_be_applied_again(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="operator-approval")
+    row = engine.repo.find_approval(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="operator-approval",
+    )
+    assert engine.repo.claim_approval(row["approval_id"]) is True
+    with pytest.raises(RedactoError) as excinfo:
+        engine.apply(
+            plan_id=plan["plan_id"],
+            plan_version=plan["plan_version"],
+            approval_ref="operator-approval",
+            confirmation_token=approval["confirmation_token"],
+        )
+    assert excinfo.value.code == "unauthorized_apply"
+
+
+def test_scan_reports_stores_cut_off_by_the_record_cap(tmp_path):
+    settings = seeded_settings(tmp_path, max_scan_records=2)
+    scan = Engine(settings).scan(target_id=SOURCE_ID)
+    assert scan["truncated_stores"]
+    capped = [entry for entry in scan["coverage"] if entry.get("truncated")]
+    assert capped
+    assert all(entry["limit"] == 2 for entry in capped)
+    assert any("Record cap" in limitation for entry in capped for limitation in entry["limitations"])
+
+
+def test_verification_is_partial_when_the_record_cap_is_reached(tmp_path):
+    settings = seeded_settings(tmp_path, max_scan_records=2)
+    engine = Engine(settings)
+    plan = engine.plan(target_id=SOURCE_ID)
+    applied = approve_and_apply(engine, plan)
+    verified = engine.verify(request_id=applied["request_id"])
+    assert verified["status"] == "PARTIAL"
+    assert any(store.get("truncated") for store in verified["stores"])
+    assert any("Record cap" in limitation for limitation in verified["limitations"])
+
+
+def test_concurrent_approval_claims_have_exactly_one_winner(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    engine.approve_plan(plan_id=plan["plan_id"], approval_ref="operator-approval")
+    approval = engine.repo.find_approval(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="operator-approval",
+    )
+    barrier = Barrier(4)
+    outcomes: list[bool] = []
+
+    def worker():
+        local = Engine(engine.settings)
+        barrier.wait()
+        outcomes.append(local.repo.claim_approval(approval["approval_id"]))
+
+    threads = [Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(outcomes) == [False, False, False, True]

@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 114 automated tests pass (`pytest`).
+- 131 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -33,6 +33,11 @@ is **off by default**; with no provider configured its candidates are unassessed
 - Local embedding similarity generates paraphrase candidates and risk scores. It is advisory:
   embeddings never prove lineage and never block on their own.
 - Verification is scoped and enforced by code, not by wording in a prompt.
+- Plans show blast radius (record bytes, match share, collateral risk). A substring
+  match inside a larger record is held for review instead of auto-deleted, and a
+  verbatim passage buried in other notes is never labelled non-disclosing.
+- Runtime dependencies install without dev extras; CI covers Linux + Windows and a
+  runtime-only install.
 
 ## Quick start
 
@@ -100,13 +105,29 @@ stdio (any MCP client that supports a local process):
 {
   "mcpServers": {
     "redacto": {
-      "command": "C:\\Users\\HI\\Downloads\\Redacto\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "redacto.mcp.stdio_server"],
-      "env": { "PYTHONPATH": "C:\\Users\\HI\\Downloads\\Redacto\\src" }
+      "command": "redacto-stdio",
+      "cwd": "C:\\path\\to\\Redacto",
+      "env": {
+        "REDACTO_WORKSPACE_ROOT": "C:\\path\\to\\Redacto\\fixtures\\workspace",
+        "REDACTO_DB_PATH": "C:\\path\\to\\Redacto\\var\\redacto.sqlite3",
+        "REDACTO_SQLITE_PATH": "C:\\path\\to\\Redacto\\fixtures\\workspace\\agent_memory.sqlite3",
+        "REDACTO_JSONL_PATH": "C:\\path\\to\\Redacto\\fixtures\\workspace\\agent_events.jsonl",
+        "REDACTO_VECTOR_PATH": "C:\\path\\to\\Redacto\\fixtures\\workspace\\vector_chunks.json"
+      }
     }
   }
 }
 ```
+
+`cwd` and the `REDACTO_*` paths matter: without them the server resolves defaults
+relative to whatever folder the client launches it from and sees no stores. Replace
+`C:\path\to\Redacto` with the actual clone path. If `redacto-stdio` is not on the
+client's PATH, use the absolute interpreter path plus `-m redacto.mcp.stdio_server`
+and keep the same `cwd`/`env`.
+
+The repo also ships `.mcp.json` and a repo-local `plugin.json` (MCP command plus the
+`skills/redacto` wiring) for clients that load a plugin manifest. Validate the
+manifest against your client's schema; it is not an Alan-marketplace listing.
 
 Streamable HTTP (for connectors that expect a URL). A bearer token is mandatory:
 
@@ -126,7 +147,7 @@ default. Do not expose it publicly.
 
 | Check | Command | Result |
 |---|---|---|
-| stdio, real MCP client session | `.venv\Scripts\python.exe scripts\mcp_smoke.py` | PASS — discovers all 6 tools, `redacto_status` returns adapter health |
+| stdio, real MCP client session | `.venv\Scripts\python.exe scripts\mcp_smoke.py` | PASS — discovers all 8 tools, `redacto_status` returns adapter health |
 | stdio, full cycle in pytest | `.venv\Scripts\python.exe -m pytest tests/test_mcp_tools.py` | PASS — scan → plan → denied self-approval → approved apply → verify |
 | Streamable HTTP + bearer auth | `.venv\Scripts\python.exe scripts\mcp_http_smoke.py` | PASS — 401 without token, discovery + status with token |
 
@@ -216,6 +237,11 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - No `execute_shell`, no arbitrary SQL, no arbitrary filesystem operations.
 - Failures are never reported as success: adapter errors produce per-record failures
   and a `PARTIAL` result.
+- Approval consumption is atomic: one token cannot authorize two concurrent applies.
+- JSONL event identity is stable even without `event_id` (keyed line hash), and
+  malformed lines are matched by that identity rather than a shifted line number.
+- Record-cap truncation is reported in scan coverage and verification; absence is not
+  claimed for unscanned records.
 - Tombstones retain keyed HMAC fingerprints, derived anchors and an embedding vector.
   A different key or key version cannot match them, and the revoked content is
   unrecoverable.
@@ -236,7 +262,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-114 passed in 42.65s
+131 passed in 40.83s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -265,6 +291,19 @@ The spec asks for counts rather than one accuracy score:
 | Model JSON-schema validity | not measured while the model provider is disabled |
 
 These are fixture-level engineering targets, not production accuracy claims.
+
+### Collateral risk controls
+
+- **Blast radius:** every plan item carries `size_bytes`, `matched_bytes`,
+  `match_ratio`, `match_kind`, `partial_match` and a `collateral_note`. Approved
+  actions whose match covers less than 34% of the record are marked `risk: high`.
+- **Partial matches:** a fact/secret found as a substring of a larger record is
+  `REVIEW_REQUIRED`, not an automatic delete. Whole-copy matches keep the normal path.
+- **Buried verbatim copies:** source-mode scans compare 8-word shingles against the
+  target. A record quoting a target passage inside other notes becomes
+  `SUSPECTED_DERIVATIVE` for review, never `RELATED_NONDISCLOSING`.
+- **Still missing:** precise `REDACT_SPAN` editing, regeneration and a timed undo/trash
+  window. Those are documented as remaining work, not silently claimed.
 
 ### Embedding calibration (synthetic labelled set)
 
@@ -342,6 +381,10 @@ Demo (`python -m redacto demo`) on the seeded fixture:
   exceptional outcomes are expressed through `PARTIAL`/`NEEDS_REVIEW`.
 - `find_exact` is implemented centrally in discovery rather than per adapter, and
   `REDACT_SPAN`/regeneration have no supported adapter yet.
+- Partial matches are reviewed rather than redacted in place; a reviewer still chooses
+  whole-record deletion or rejection. There is no undo/trash window yet.
+- The plan flags collateral risk but does not automatically regenerate a descendant
+  from its other parents (option 6 in the review).
 - Two revocation modes exist in code; **source revocation** is the tested path.
   Fact/secret revocation is functional but narrower (bounded substring matching).
 - Receipt integrity is evidence metadata, not proof of physical overwrite.
@@ -359,12 +402,14 @@ src/redacto/
   adapters/    base.py registry.py filesystem.py sqlite_store.py jsonl_logs.py vector_fixture.py
   mcp/         server.py stdio_server.py http_server.py
 skills/redacto/SKILL.md
+.mcp.json      plugin.json
+.github/workflows/ci.yml
 scripts/       mcp_smoke.py mcp_http_smoke.py
 fixtures/      workspace/ expected_results.json
 tests/         test_graph.py test_discovery.py test_policy.py test_execution.py
                test_verification.py test_security.py test_mcp_tools.py test_transport.py
                test_tombstones.py test_quarantine.py test_key_rotation.py test_embeddings.py
-               test_evaluation.py
+               test_evaluation.py test_jsonl.py test_hardening_collateral.py
 docs/          architecture.md threat-model.md demo-script.md key-rotation.md
                spec-compliance.md
 ```
@@ -379,7 +424,12 @@ visualization, and Alan connector registration.
 
 ## Next highest-value task
 
-Replace the local hashing embedding with a **configurable neural embedding provider**
+Implement safe **`REDACT_SPAN` editing** for Markdown, SQLite rows and JSONL content,
+then a short **undo/trash window** guarded by tombstones. That closes the remaining
+collateral options: a partial match can be redacted instead of deleting the whole
+record, and a mistaken deletion is recoverable during a development session.
+
+After that, replace the local hashing embedding with a **configurable neural embedding provider**
 and recalibrate on a larger labelled corpus, reporting false positives and missed
 paraphrases per provider. The provider interface and quarantine default already exist;
 the work is integration, cost/latency measurement and a corpus that is not synthetic.

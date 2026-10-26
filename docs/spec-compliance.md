@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **114 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **131 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -115,9 +115,12 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
 ## 8. Modes and execution
 
 - **8.1 Source revocation: Compliant.**
-- **8.2 Fact/secret revocation: Partial.** No precise `REDACT_SPAN` support; records
-  containing the value are deleted or invalidated. Secret values are never persisted.
-- **8.3 Action types: Partial.** All action names exist. `DELETE_RECORD`,
+- **8.2 Fact/secret revocation: Partial.** A fact/secret found as a substring of a
+  larger record is now held for review with `risk: high` and a blast-radius note; a
+  whole-copy match follows the normal approval path. No precise `REDACT_SPAN` support
+  yet, so the reviewer still chooses whole-record deletion or rejection.
+- **8.3 Action types: Partial.** All action names exist. A partial substring match is
+  mapped to `REVIEW_REQUIRED`, not an automatic delete. `DELETE_RECORD`,
   `INVALIDATE_INDEX`, `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE` and
   `UNREACHABLE` are used. `REDACT_SPAN` and `REGENERATE_FROM_ALLOWED_SOURCES` are
   defined but unsupported by the current adapters.
@@ -186,6 +189,9 @@ that optional after engine correctness.
 - HTTPS? HTTP transport requires bearer auth and localhost bind;
 - dry-run default (`REDACTO_DRY_RUN=true`);
 - oversized records skipped and reported (`REDACTO_MAX_RECORD_BYTES`);
+- record-cap truncation reported in scan and verification;
+- JSONL identity stable without `event_id`, malformed lines matched by keyed identity;
+- approval consumption is an atomic single-use claim;
 - receipt explicitly disclaims universal overwrite.
 
 ## 15. Test and evaluation plan
@@ -199,12 +205,20 @@ candidate. Unreachable-store and delete-failure simulations are implemented in t
 (`test_store_that_disappears_after_planning_fails_visibly`,
 `test_adapter_failure_is_reported_not_hidden`) rather than as permanent fixtures.
 
+### 15.1a Collateral and hardening regressions
+
+`tests/test_hardening_collateral.py` pins blast-radius fields, partial-match review,
+verbatim-passage detection, unrelated-record preservation and dry-run completeness.
+`tests/test_jsonl.py` pins stable event identity and malformed-line deletion.
+`tests/test_execution.py` pins atomic approval claiming and record-cap reporting.
+
 ### 15.2 Required automated tests
 
 All bullets are covered; see `tests/test_graph.py`, `test_discovery.py`,
 `test_policy.py`, `test_execution.py`, `test_verification.py`, `test_security.py`,
 `test_tombstones.py`, `test_quarantine.py`, `test_key_rotation.py`,
-`test_embeddings.py`, `test_evaluation.py`, `test_mcp_tools.py`, `test_transport.py`.
+`test_embeddings.py`, `test_evaluation.py`, `test_jsonl.py`,
+`test_hardening_collateral.py`, `test_mcp_tools.py`, `test_transport.py`.
 
 ### 15.3 Demo acceptance targets
 
@@ -282,10 +296,25 @@ done by the user in Alan Settings.
 The external links were not fetched during the audit; the product claims do not depend
 on them.
 
+## Review follow-up (post-839028c)
+
+Fixed after the readiness review:
+
+- runtime dependency install (`httpx`, `uvicorn` moved to main dependencies);
+- README client config now includes `cwd` and `REDACTO_*` paths, plus `.mcp.json` and
+  `plugin.json`;
+- JSONL stable identity and malformed-line deletion;
+- atomic single-use approval claim;
+- record-cap truncation reporting in scan and verify;
+- OS-independent traversal test plus GitHub Actions CI on Linux and Windows;
+- blast-radius fields (`size_bytes`, `matched_bytes`, `match_ratio`, `risk`);
+- partial substring matches held for review;
+- buried verbatim passages classified as suspected derivatives.
+
 ## Remaining deviations worth fixing next
 
 1. Add a per-adapter `find_exact` method if strict interface parity is required.
 2. Implement editable `DRAFT` plans and explicit `CANCELLED`/`FAILED` transitions.
-3. Add safe span redaction and regeneration for adapters that can support them.
+3. Implement safe `REDACT_SPAN` editing, regeneration and an undo/trash window.
 4. Add a graph visualization that styles confirmed vs candidate edges.
 5. Register the Alan connector (user action) and publish the docs/demo publicly.

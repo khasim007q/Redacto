@@ -1,7 +1,8 @@
 """JSONL log adapter: one synthetic event per line.
 
-Deletes rewrite the file atomically after verifying the target line still holds
-the expected event ID, so a stale locator can never remove the wrong event.
+Event identity is stable even when a line has no `event_id`: a keyed hash of the
+line is used. Deletes match that identity (and prefer the recorded line index), so
+duplicate or malformed lines cannot make Redacto delete the wrong event.
 """
 
 from __future__ import annotations
@@ -40,22 +41,34 @@ class JsonlLogAdapter(StoreAdapter):
             notes=["Configured JSONL file only; delete rewrites the file atomically."],
         )
 
-    def _events(self) -> list[dict]:
+    def _lines(self) -> list[str]:
         try:
-            lines = self._path.read_text(encoding="utf-8").splitlines()
+            return self._path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
             raise AdapterError(f"jsonl log unreadable: {exc}", code="store_unreadable") from exc
+
+    def _events(self) -> list[dict]:
         events: list[dict] = []
-        for index, line in enumerate(lines):
+        for index, line in enumerate(self._lines()):
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    payload = {"_malformed": True, "content": line}
             except json.JSONDecodeError:
                 payload = {"_malformed": True, "content": line}
             payload["_line_index"] = index
+            payload["_event_id"] = self._event_id(payload, index, line)
             events.append(payload)
         return events
+
+    def _event_id(self, payload: dict, index: int, line: str) -> str:
+        explicit = payload.get("event_id") or payload.get("id")
+        if explicit:
+            return str(explicit)
+        # Stable across line shifts and independent of the line number.
+        return "sha-" + fingerprint(line, self._key)[:24]
 
     @staticmethod
     def _content(payload: dict) -> str:
@@ -63,7 +76,7 @@ class JsonlLogAdapter(StoreAdapter):
         return "\n".join(part for part in parts if part)
 
     def _to_record(self, payload: dict) -> Record:
-        event_id = str(payload.get("event_id") or payload.get("id") or f"line-{payload['_line_index']}")
+        event_id = str(payload["_event_id"])
         return Record(
             record_id=f"log:{event_id}",
             record_type="log",
@@ -96,25 +109,33 @@ class JsonlLogAdapter(StoreAdapter):
         event_id = locator.get("event_id")
         if not event_id:
             raise AdapterError("jsonl locator requires 'event_id'", code="invalid_locator")
-        try:
-            lines = self._path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            raise AdapterError(f"jsonl log unreadable: {exc}", code="store_unreadable") from exc
-        target: int | None = None
-        for index, line in enumerate(lines):
+        raw_lines = self._lines()
+        matches: list[int] = []
+        for index, line in enumerate(raw_lines):
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    payload = {"_malformed": True, "content": line}
             except json.JSONDecodeError:
-                continue
-            candidate_id = str(payload.get("event_id") or payload.get("id") or f"line-{index}")
-            if candidate_id == event_id:
-                target = index
-                break
-        if target is None:
+                payload = {"_malformed": True, "content": line}
+            if self._event_id(payload, index, line) == event_id:
+                matches.append(index)
+        if not matches:
             raise AdapterError("record no longer exists", code="not_found")
-        remaining = [line for index, line in enumerate(lines) if index != target]
+
+        # Prefer the recorded line if it still holds the same identity; otherwise
+        # delete the first matching line. Malformed and duplicate-id lines are
+        # matched by their keyed identity, never by a shifted position.
+        preferred_line: int | None = None
+        if locator.get("line") is not None:
+            try:
+                preferred_line = int(locator["line"])
+            except (TypeError, ValueError):
+                preferred_line = None
+        target = preferred_line if preferred_line in matches else matches[0]
+        remaining = [line for index, line in enumerate(raw_lines) if index != target]
         self._atomic_write("\n".join(remaining) + ("\n" if remaining else ""))
 
     def _atomic_write(self, content: str) -> None:

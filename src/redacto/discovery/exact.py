@@ -36,6 +36,12 @@ _ENTITY_STOPWORDS = {
 class ExactMatch:
     kind: str
     detail: str
+    matched_chars: int = 0
+    record_chars: int = 0
+
+    @property
+    def is_partial(self) -> bool:
+        return self.kind == "normalized_variant" and self.record_chars > 0
 
 
 class ExactMatcher:
@@ -58,19 +64,24 @@ class ExactMatcher:
         ]
 
     def match(self, record: Record) -> ExactMatch | None:
+        length = len(record.content)
         if record.record_id == self._target_id:
-            return ExactMatch("record_id", "Record is the revocation target.")
+            return ExactMatch("record_id", "Record is the revocation target.", length, length)
         if record.locator == self._target_locator:
-            return ExactMatch("locator", "Same adapter locator as the target.")
+            return ExactMatch("locator", "Same adapter locator as the target.", length, length)
         loose = normalize_loose(record.content)
         if self._target_loose and loose == self._target_loose:
-            return ExactMatch("normalized_content", "Normalized whole-content copy of the target.")
+            return ExactMatch(
+                "normalized_content", "Normalized whole-content copy of the target.", length, length
+            )
         if self._target_kind in {"secret", "fact"}:
             for variant in self._variants:
                 if normalize_loose(variant) in loose:
                     return ExactMatch(
                         "normalized_variant",
                         "Contains a bounded normalized variant of the target value.",
+                        len(variant),
+                        length,
                     )
         return None
 

@@ -20,7 +20,8 @@ from redacto.fixtures import SOURCE_ID
 
 def test_path_traversal_is_rejected(engine):
     adapter = FilesystemAdapter(engine.settings.workspace_root)
-    for locator in ({"path": "../../secret.txt"}, {"path": "C:/Windows/win.ini"}, {"path": ".."}):
+    outside = engine.settings.workspace_root.parent / "secret.txt"
+    for locator in ({"path": "../../secret.txt"}, {"path": str(outside)}, {"path": ".."}):
         with pytest.raises(AdapterError) as excinfo:
             adapter.read_record(locator)
         assert excinfo.value.code in {"out_of_scope", "invalid_locator"}

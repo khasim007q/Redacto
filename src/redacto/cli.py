@@ -214,7 +214,9 @@ def cmd_demo(args: argparse.Namespace) -> int:
         flag = "APPROVED-ITEM" if item["approved"] else "review/preserve"
         print(
             f"      {item['evidence_class']:<22} {item['proposed_action']:<18} "
-            f"{item['record_id']:<32} [{flag}] {item['reason_redacted']}"
+            f"{item['record_id']:<32} [{flag}] risk={item['risk']:<6} "
+            f"{item.get('size_bytes', 0)}B ~{item.get('match_ratio', 0):.0%} "
+            f"{item['reason_redacted']}"
         )
     print(f"    estimated impact: {plan['estimated_impact']}")
     for warning in plan["warnings"]:

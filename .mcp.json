@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "redacto": {
+      "command": "python",
+      "args": ["-m", "redacto.mcp.stdio_server"],
+      "cwd": ".",
+      "env": {
+        "REDACTO_WORKSPACE_ROOT": "fixtures/workspace",
+        "REDACTO_DB_PATH": "var/redacto.sqlite3",
+        "REDACTO_SQLITE_PATH": "fixtures/workspace/agent_memory.sqlite3",
+        "REDACTO_JSONL_PATH": "fixtures/workspace/agent_events.jsonl",
+        "REDACTO_VECTOR_PATH": "fixtures/workspace/vector_chunks.json"
+      }
+    }
+  }
+}

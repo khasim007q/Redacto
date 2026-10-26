@@ -401,6 +401,29 @@ class TombstoneGuard:
         return _allowed()
 
 
+def overlap_ratio(target_text: str, record_text: str) -> float:
+    """Share of the record's 5-word shingles that also occur in the target."""
+    record_shingles = set(shingles(record_text))
+    if not record_shingles:
+        return 0.0
+    target_shingles = set(shingles(target_text))
+    return len(record_shingles & target_shingles) / len(record_shingles)
+
+
+def contains_verbatim_passage(
+    target_text: str, record_text: str, *, size: int = 8
+) -> bool:
+    """True when the record contains a verbatim run of target words.
+
+    Used to catch a confidential sentence quoted inside a larger, useful record.
+    The whole-record copy case is handled earlier by the exact matcher.
+    """
+    target_shingles = set(shingles(target_text, size=size))
+    if not target_shingles:
+        return False
+    return bool(target_shingles & set(shingles(record_text, size=size)))
+
+
 def summarize_guard_findings(findings: Sequence[dict[str, Any]]) -> dict[str, int]:
     return {
         "blocked": sum(1 for item in findings if item["decision"] == BLOCKED),

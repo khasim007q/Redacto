@@ -27,6 +27,8 @@ from redacto.ingestion import (
     ALLOWED,
     BLOCKED,
     QUARANTINED,
+    contains_verbatim_passage,
+    overlap_ratio,
     TombstoneGuard,
     TombstoneMaterial,
     summarize_guard_findings,
@@ -86,7 +88,14 @@ def _statement_for(
 class Engine:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or load_settings()
-        self.repo = Repository(self.settings.db_path)
+        self._repo: Repository | None = None
+
+    @property
+    def repo(self) -> Repository:
+        """Lazily open the graph database so read-only status calls do not create it."""
+        if self._repo is None:
+            self._repo = Repository(self.settings.db_path)
+        return self._repo
 
     # ----------------------------------------------------------------- utils
     def adapters(self) -> dict[str, AdapterSlot]:
@@ -290,13 +299,21 @@ class Engine:
         evidence_type: str | None = None,
         confirmed: bool = False,
         unreachable: bool = False,
+        content_overlap: float = 1.0,
+        size_bytes: int = 0,
+        matched_bytes: int = 0,
+        match_kind: str | None = None,
+        partial_match: bool = False,
     ) -> dict[str, Any]:
         action, approved, risk = classify.propose_action(
             record_type=record_type,
             capabilities=capabilities,
             evidence_class=evidence_class,
             unreachable=unreachable,
+            partial_match=partial_match,
+            content_overlap=content_overlap,
         )
+        risk = classify.collateral_risk(action, risk, content_overlap)
         return {
             "record_id": record_id,
             "store_id": store_id,
@@ -315,6 +332,17 @@ class Engine:
             "candidate_only": evidence_class
             in {classify.SUSPECTED_DERIVATIVE, classify.RELATED_NONDISCLOSING, classify.UNKNOWN},
             "unreachable": unreachable,
+            "size_bytes": size_bytes,
+            "matched_bytes": matched_bytes,
+            "match_ratio": round(content_overlap, 4),
+            "match_kind": match_kind,
+            "partial_match": partial_match,
+            "collateral_note": (
+                f"Removes {size_bytes} bytes; about {content_overlap:.0%} of the record "
+                "matches the target."
+                if size_bytes
+                else ""
+            ),
         }
 
     # ------------------------------------------------------------------ scan
@@ -356,6 +384,7 @@ class Engine:
         scanned: dict[str, Record] = {}
         coverage: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
+        truncated_stores: list[str] = []
 
         for store in scope_stores:
             slot = slots[store]
@@ -369,8 +398,9 @@ class Engine:
                 coverage.append(entry)
                 unreachable.append(entry)
                 continue
+            limit = self.settings.max_scan_records
             try:
-                records = list(slot.adapter.list_records(limit=self.settings.max_scan_records))
+                records = list(slot.adapter.list_records(limit=limit + 1))
             except AdapterError as exc:
                 entry = {
                     "store_id": store,
@@ -381,6 +411,10 @@ class Engine:
                 coverage.append(entry)
                 unreachable.append(entry)
                 continue
+            truncated = len(records) > limit
+            if truncated:
+                records = records[:limit]
+                truncated_stores.append(store)
             for scanned_record in records:
                 scanned[scanned_record.record_id] = scanned_record
             coverage.append(
@@ -388,7 +422,16 @@ class Engine:
                     "store_id": store,
                     "status": "scanned",
                     "records_scanned": len(records),
-                    "limitations": [],
+                    "truncated": truncated,
+                    "limit": limit,
+                    "limitations": (
+                        [
+                            f"Record cap reached ({limit}); some records in this store were "
+                            "not scanned and are not proven clean."
+                        ]
+                        if truncated
+                        else []
+                    ),
                 }
             )
             caps = self._record_capabilities(store, slot)
@@ -442,8 +485,21 @@ class Engine:
                 # not re-admitted as a fresh candidate.
                 continue
             capabilities = self._record_capabilities(scanned_record.store_id, slots[scanned_record.store_id])
+            size = len(scanned_record.content.encode("utf-8"))
+            ratio = overlap_ratio(target_content, scanned_record.content)
+            common = {
+                "content_overlap": ratio,
+                "size_bytes": size,
+                "matched_bytes": int(ratio * size),
+            }
             match = matcher.match(scanned_record)
             if match is not None:
+                size = len(scanned_record.content.encode("utf-8"))
+                if match.kind in {"record_id", "locator", "normalized_content"}:
+                    matched, ratio = size, 1.0
+                else:
+                    matched = min(match.matched_chars or size, size)
+                    ratio = (matched / size) if size else 0.0
                 candidates[record_id] = self._candidate(
                     record_id=record_id,
                     store_id=scanned_record.store_id,
@@ -456,11 +512,18 @@ class Engine:
                         action=classify.DELETE_RECORD,
                         match_detail=match.detail,
                     ),
+                    content_overlap=ratio,
+                    size_bytes=size,
+                    matched_bytes=matched,
+                    match_kind=match.kind,
+                    partial_match=match.is_partial,
                 )
                 continue
             if record_id in descendant_by_id:
                 node = descendant_by_id[record_id]
                 last_edge = node.via[-1] if node.via else {}
+                size = len(scanned_record.content.encode("utf-8"))
+                ratio = overlap_ratio(target_content, scanned_record.content)
                 candidates[record_id] = self._candidate(
                     record_id=record_id,
                     store_id=scanned_record.store_id,
@@ -478,6 +541,10 @@ class Engine:
                     depth=node.depth,
                     relation=last_edge.get("relation"),
                     evidence_type=last_edge.get("evidence_type"),
+                    content_overlap=ratio,
+                    size_bytes=size,
+                    matched_bytes=int(ratio * size),
+                    match_kind="lineage",
                 )
                 continue
 
@@ -500,7 +567,45 @@ class Engine:
                         candidate_evidence=edge["evidence_summary_redacted"],
                     ),
                     relation=edge["relation_guess"],
+                    match_kind="candidate_edge",
+                    **common,
                 )
+                continue
+
+            if not fact_mode and contains_verbatim_passage(
+                target_content, scanned_record.content
+            ):
+                evidence = (
+                    "A verbatim passage from the target appears inside a larger record; "
+                    "review the whole-record deletion."
+                )
+                candidates[record_id] = self._candidate(
+                    record_id=record_id,
+                    store_id=scanned_record.store_id,
+                    record_type=scanned_record.record_type,
+                    capabilities=capabilities,
+                    evidence_class=classify.SUSPECTED_DERIVATIVE,
+                    reason_redacted=classify.explain(
+                        evidence_class=classify.SUSPECTED_DERIVATIVE,
+                        record_type=scanned_record.record_type,
+                        action=classify.REVIEW_REQUIRED,
+                        candidate_evidence=evidence,
+                    ),
+                    match_kind="verbatim_passage",
+                    **common,
+                )
+                if record_id not in candidate_edges:
+                    self.repo.add_candidate_edge(
+                        source_id=target_id,
+                        target_id=record_id,
+                        relation_guess="possible_derivative",
+                        evidence_summary_redacted=evidence,
+                        model_id="heuristic_passage",
+                    )
+                    candidate_edges[record_id] = {
+                        "target_id": record_id,
+                        "relation_guess": "possible_derivative",
+                    }
                 continue
 
             if shares_entity(target_content, scanned_record.content):
@@ -517,6 +622,8 @@ class Engine:
                         action=classify.SKIP_PRESERVE,
                         candidate_evidence=evidence,
                     ),
+                    match_kind="shared_entity",
+                    **common,
                 )
                 new_edge_id = self.repo.add_candidate_edge(
                     source_id=target_id,
@@ -552,6 +659,8 @@ class Engine:
                             candidate_evidence=evidence,
                         ),
                         relation="possible_derivative",
+                        match_kind="embedding",
+                        **common,
                     )
                     embedding_candidates += 1
                     if record_id not in candidate_edges:
@@ -677,7 +786,9 @@ class Engine:
                 "Semantic candidates stay advisory; unassessed candidates are never destructive.",
                 "Records matching an active tombstone are blocked or quarantined and never re-admitted to the graph.",
                 "Records larger than REDACTO_MAX_RECORD_BYTES are skipped before matching and reported.",
+                "Stores that reach REDACTO_MAX_SCAN_RECORDS are marked truncated; unscanned records are not proven clean.",
             ],
+            "truncated_stores": truncated_stores,
         }
 
     def _assess_candidates(
@@ -1278,17 +1389,22 @@ class Engine:
         counts = {ALLOWED: 0, BLOCKED: 0, QUARANTINED: 0, "skipped": 0}
         findings: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
+        truncated_stores: list[str] = []
 
         for store in scope_stores:
             slot = slots[store]
             if slot.adapter is None:
                 unreachable.append({"store_id": store, "reason": slot.unavailable_reason})
                 continue
+            limit = self.settings.max_scan_records
             try:
-                records = list(slot.adapter.list_records(limit=self.settings.max_scan_records))
+                records = list(slot.adapter.list_records(limit=limit + 1))
             except AdapterError as exc:
                 unreachable.append({"store_id": store, "reason": f"{exc.code}: {exc}"})
                 continue
+            if len(records) > limit:
+                records = records[:limit]
+                truncated_stores.append(store)
             capabilities = self._record_capabilities(store, slot)
             for record in records:
                 if self._record_is_oversized(record):
@@ -1309,6 +1425,7 @@ class Engine:
             "counts": counts,
             "findings": findings,
             "unreachable_stores": unreachable,
+            "truncated_stores": truncated_stores,
             "guard": {"active_tombstones": guard.active_count},
             "note": (
                 "Blocked and quarantined records were not admitted to the graph. "
@@ -1620,6 +1737,14 @@ class Engine:
 
         simulate = self.settings.dry_run if dry_run is None else dry_run
         if not simulate:
+            # Claim the single-use approval atomically before any mutation. Two
+            # concurrent applies with the same token cannot both win.
+            if not self.repo.claim_approval(approval["approval_id"]):
+                raise RedactoError(
+                    "unauthorized_apply",
+                    "Apply rejected: approval_already_used.",
+                    {"reason": "approval_already_used"},
+                )
             # Enter EXECUTING before any mutation; verify finalises the state.
             self.repo.set_plan_state(plan_id, "EXECUTING")
             self.repo.set_request_state(plan["request_id"], "EXECUTING")
@@ -1818,9 +1943,6 @@ class Engine:
                 }
             )
 
-        if approval is not None and not simulate:
-            self.repo.mark_approval_used(approval["approval_id"])
-
         if simulate:
             final_state = plan["state"]
             message = "Dry run only: no destructive operation was performed."
@@ -1934,8 +2056,9 @@ class Engine:
                     {"store_id": store, "outcome": "unreachable", "residual_count": 0, "limitations": limitations}
                 )
                 continue
+            limit = self.settings.max_scan_records
             try:
-                records = list(slot.adapter.list_records(limit=self.settings.max_scan_records))
+                records = list(slot.adapter.list_records(limit=limit + 1))
             except AdapterError as exc:
                 limitations = [f"rescan failed: {exc.code}"]
                 self.repo.add_verification(
@@ -1957,6 +2080,9 @@ class Engine:
                 )
                 continue
 
+            truncated = len(records) > limit
+            if truncated:
+                records = records[:limit]
             residuals: list[str] = []
             for record in records:
                 if record.record_id in planned_removals:
@@ -1967,12 +2093,17 @@ class Engine:
                     residuals.append(record.record_id)
             residual_total += len(residuals)
             outcome = "verified" if not residuals else "residual"
-            if key_unavailable:
+            if key_unavailable or truncated:
                 outcome = "not_verifiable"
             limitations = [
                 "Rescan checks planned record IDs and exact/normalized copies of the target content.",
                 "Paraphrased remnants cannot be proven absent by this method.",
             ]
+            if truncated:
+                limitations.append(
+                    f"Record cap reached ({limit}); some records were not rescanned and "
+                    "absence is not claimed for them."
+                )
             if key_unavailable:
                 limitations.append(
                     "The HMAC key version that produced this target fingerprint is unavailable; "
@@ -1994,6 +2125,8 @@ class Engine:
                     "residual_count": len(residuals),
                     "residual_record_ids": residuals,
                     "records_scanned": len(records),
+                    "truncated": truncated,
+                    "limit": limit,
                     "limitations": limitations,
                 }
             )
@@ -2026,6 +2159,13 @@ class Engine:
             limitations.append("Unreachable stores, not verified: " + ", ".join(unreachable_stores))
         if not_verifiable:
             limitations.append("Stores that could not be verified: " + ", ".join(not_verifiable))
+        truncated_stores = [s["store_id"] for s in store_results if s.get("truncated")]
+        if truncated_stores:
+            limitations.append(
+                "Record cap reached in stores: "
+                + ", ".join(truncated_stores)
+                + "; unscanned records are not proven absent."
+            )
         if key_unavailable:
             limitations.append(
                 f"The HMAC key version {target_key_version} that produced the target "

@@ -47,6 +47,8 @@ def propose_action(
     capabilities: dict[str, bool],
     evidence_class: str,
     unreachable: bool = False,
+    partial_match: bool = False,
+    content_overlap: float = 1.0,
 ) -> tuple[str, bool, str]:
     """Return (action, approved_for_plan, collateral_risk).
 
@@ -62,6 +64,11 @@ def propose_action(
     if evidence_class not in {DIRECT_MATCH, CONFIRMED_DESCENDANT}:
         return REVIEW_REQUIRED, False, "high"
 
+    # A substring match inside a larger, useful record is not a safe automatic
+    # delete: hold it for review so the reviewer sees the collateral damage.
+    if partial_match and evidence_class == DIRECT_MATCH:
+        return REVIEW_REQUIRED, False, "high"
+
     risk = "low" if evidence_class == DIRECT_MATCH else "medium"
     if record_type == "index_entry" and capabilities.get("invalidate"):
         return INVALIDATE_INDEX, True, risk
@@ -72,6 +79,13 @@ def propose_action(
     if capabilities.get("redact"):
         return REDACT_SPAN, True, risk
     return REVIEW_REQUIRED, False, "high"
+
+
+def collateral_risk(action: str, base_risk: str, content_overlap: float) -> str:
+    """Raise risk when an approved action would remove mostly unrelated content."""
+    if action in ACTIONABLE and content_overlap < 0.34:
+        return "high"
+    return base_risk
 
 
 def _clean(text: str, *, limit: int = 200) -> str:
@@ -139,4 +153,10 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "approved": item["approved"],
         "depth": item.get("depth"),
         "unreachable": item.get("unreachable", False),
+        "size_bytes": item.get("size_bytes", 0),
+        "matched_bytes": item.get("matched_bytes", 0),
+        "match_ratio": item.get("match_ratio", 1.0),
+        "match_kind": item.get("match_kind"),
+        "partial_match": item.get("partial_match", False),
+        "collateral_note": item.get("collateral_note", ""),
     }

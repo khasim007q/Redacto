@@ -208,6 +208,15 @@ sequenceDiagram
 - **Idempotency**: each action has a unique key. A dry run writes keys prefixed
   `dryrun:` so a later real apply still executes. Re-applying an applied plan
   returns `already_completed` with the recorded results instead of repeating work.
+- **Single-use approvals**: the token is claimed with an atomic conditional update
+  before the first mutation, so two concurrent applies cannot both win.
+- **Capacity honesty**: stores are asked for `limit + 1`; a full extra record marks
+  the store `truncated`. Scan reports it and verification returns `not_verifiable`
+  rather than claiming absence for unscanned records.
+- **Blast radius**: plan items carry `size_bytes`, `matched_bytes`, `match_ratio`,
+  `match_kind`, `partial_match` and a collateral note. Substring matches are
+  review-only; low overlap raises risk to high. Source scans also detect shared
+  8-word passages and raise them as suspected derivatives.
 - **Verification**: rescan reachable in-scope stores, check planned record IDs and
   the keyed whole-target fingerprint, and report residuals. Unreachable stores are
   reported as gaps, never as clean.

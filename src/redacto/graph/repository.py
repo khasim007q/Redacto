@@ -531,6 +531,20 @@ class Repository:
             )
             conn.commit()
 
+    def claim_approval(self, approval_id: str) -> bool:
+        """Atomically consume a single-use approval.
+
+        Returns True only for the caller that won the claim. Concurrent applies
+        presenting the same token cannot both proceed.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE approvals SET used_at = ? WHERE approval_id = ? AND used_at IS NULL",
+                (now_iso(), approval_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
     # ---------------------------------------------------------------- actions
     def get_action_by_key(self, idempotency_key: str) -> dict[str, Any] | None:
         with self._connect() as conn:

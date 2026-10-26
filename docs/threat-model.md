@@ -52,6 +52,12 @@ destructive or leaking component**.
 | T23 | A quarantine approval outlives the policy it was granted under | The recheck snapshot, reviewer, note and safety mode are persisted with the decision; strict mode refuses uncertainty overrides | `test_strict_mode_refuses_uncertain_override`, `test_approval_admits_through_audited_path` |
 | T24 | Oversized input exhausts memory or floods the model path | Records above `REDACTO_MAX_RECORD_BYTES` are skipped before matching/ingestion and reported; model snippets are capped separately | `test_oversized_ingestion_is_skipped_and_not_written`, `test_oversized_scanned_records_are_reported_not_admitted` |
 | T25 | A caller promotes an unverified claim to confirmed lineage | `record_lineage` is internal-only, validates evidence, requires evidence refs/verifier, and downgrades model/heuristic claims to candidate edges | `test_record_lineage_hook_requires_trustworthy_evidence`, `test_record_lineage_hook_keeps_model_claims_as_candidates` |
+| T26 | JSONL delete removes the wrong event when `event_id` is absent | Events without an id use a keyed hash of the line; deletes match that identity and prefer the recorded line | `test_event_without_event_id_is_deleted_by_content_identity` |
+| T27 | Two concurrent applies reuse one approval token | Approval consumption is an atomic `UPDATE ... WHERE used_at IS NULL`; only one caller wins | `test_approval_claim_is_atomic`, `test_claimed_token_cannot_be_applied_again` |
+| T28 | A malformed log line holding a secret is reported as already gone | Malformed lines are parsed as content and matched by the keyed line identity, so deletion succeeds and is verified | `test_malformed_line_holding_a_secret_is_deleted_not_reported_absent`, `test_plan_apply_deletes_a_malformed_copy_and_counts_it_as_success` |
+| T29 | Scan/verify silently stop at the record cap and claim clean | Stores that reach the cap are marked `truncated`; verification becomes `not_verifiable` and the receipt is `PARTIAL` | `test_scan_reports_stores_cut_off_by_the_record_cap`, `test_verification_is_partial_when_the_record_cap_is_reached` |
+| T30 | A tiny match deletes a mostly useful record | Plans expose size/match share/risk; substring matches are review-only; low overlap raises risk to high | `tests/test_hardening_collateral.py` |
+| T31 | A verbatim leak is labelled non-disclosing | Source scans detect 8-word shared passages and classify them as suspected derivatives for review | `test_verbatim_sentence_inside_other_notes_is_never_nondisclosing` |
 
 ## Residual risks (accepted, disclosed)
 

@@ -17,11 +17,16 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
         candidates,
         key=lambda c: (classify.severity(c["evidence_class"]), c["record_id"]),
     ):
-        action, approved, risk = classify.propose_action(
+        action, approved, base_risk = classify.propose_action(
             record_type=candidate.get("record_type", "unknown"),
             capabilities=candidate.get("capabilities", {}),
             evidence_class=candidate["evidence_class"],
             unreachable=bool(candidate.get("unreachable")),
+            partial_match=bool(candidate.get("partial_match")),
+            content_overlap=float(candidate.get("match_ratio", 1.0)),
+        )
+        risk = classify.collateral_risk(
+            action, base_risk, float(candidate.get("match_ratio", 1.0))
         )
         items.append(
             {
@@ -37,6 +42,12 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
                 "approved": approved,
                 "depth": candidate.get("depth"),
                 "unreachable": bool(candidate.get("unreachable")),
+                "size_bytes": int(candidate.get("size_bytes", 0)),
+                "matched_bytes": int(candidate.get("matched_bytes", 0)),
+                "match_ratio": float(candidate.get("match_ratio", 1.0)),
+                "match_kind": candidate.get("match_kind"),
+                "partial_match": bool(candidate.get("partial_match")),
+                "collateral_note": candidate.get("collateral_note", ""),
             }
         )
     return items
