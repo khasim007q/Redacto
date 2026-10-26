@@ -1,0 +1,34 @@
+{
+  "target_id": "fs:acquisition-plan.md",
+  "direct_matches": [
+    "fs:acquisition-plan.md",
+    "log:evt-dup-1"
+  ],
+  "confirmed_descendants": [
+    "fs:generated-summary.md",
+    "mem:mem-summary-paraphrase",
+    "vec:chunk-0001",
+    "cache:cache-response-1",
+    "log:evt-summary-gen"
+  ],
+  "weak_exposure_only": [
+    "log:evt-read-1"
+  ],
+  "suspected_derivatives": [
+    "mem:mem-candidate-paraphrase",
+    "vec:chunk-0002"
+  ],
+  "preserved_related": [
+    "fs:eng-notes.md",
+    "fs:sibling-public-mention.md",
+    "mem:mem-sibling-public",
+    "log:evt-instruction"
+  ],
+  "must_never_touch": [
+    "mem:mem-unrelated-eng",
+    "cache:cache-unrelated-1",
+    "log:evt-unrelated",
+    "vec:chunk-0003"
+  ],
+  "unreachable_simulation": "Point REDACTO_JSONL_PATH at a missing file to produce a partial receipt."
+}

@@ -1,0 +1,26 @@
+{
+  "chunks": [
+    {
+      "id": "chunk-0001",
+      "text": "Meridian Capital will acquire Halcyon Robotics for $42 million in an all-cash transaction.",
+      "metadata": {
+        "doc_id": "acquisition-plan.md"
+      },
+      "sensitivity": "confidential"
+    },
+    {
+      "id": "chunk-0002",
+      "text": "The pending Kestrel deal is worth roughly forty-two million dollars.",
+      "metadata": {
+        "doc_id": "generated-summary.md"
+      },
+      "sensitivity": "confidential"
+    },
+    {
+      "id": "chunk-0003",
+      "text": "Embedding sharding improves recall for long documents.",
+      "metadata": {},
+      "sensitivity": "internal"
+    }
+  ]
+}
