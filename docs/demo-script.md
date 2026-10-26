@@ -101,6 +101,17 @@ Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
 Point at the `blocked` decision and explain that the file on disk was not deleted by
 the guard: blocking admission is not the same as a new destructive action.
 
+## Optional: secret revocation (20 seconds)
+
+```powershell
+$secret = "sk-synthetic-DEMO-KEY-1234567890"
+"$secret" | Set-Content fixtures\workspace\leaked-key.txt
+.venv\Scripts\python.exe -m redacto plan --target-id "fs:acquisition-plan.md" --kind secret --target-text $secret
+```
+
+Point out that `fixtures/workspace/leaked-key.txt` is planned for deletion while the anchor
+document is preserved, and that verify rescans the stores for the value itself.
+
 ## Optional: key rotation and embedding calibration (20 seconds)
 
 ```powershell

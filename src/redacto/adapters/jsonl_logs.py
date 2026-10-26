@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Iterable
@@ -70,10 +71,45 @@ class JsonlLogAdapter(StoreAdapter):
         # Stable across line shifts and independent of the line number.
         return "sha-" + fingerprint(line, self._key)[:24]
 
-    @staticmethod
-    def _content(payload: dict) -> str:
-        parts = [str(payload.get(key, "")) for key in ("content", "text", "message", "output")]
-        return "\n".join(part for part in parts if part)
+    _IDENTITY_KEYS = {
+        "event_id",
+        "id",
+        "kind",
+        "ts",
+        "timestamp",
+        "created_at",
+        "sensitivity",
+        "_line_index",
+        "_event_id",
+        "_malformed",
+    }
+
+    @classmethod
+    def _content(cls, payload: dict) -> str:
+        """Every string value in the event, including nested tool-call arguments.
+
+        Identity/metadata keys are skipped so a record id cannot masquerade as
+        content, but arguments, payloads and nested objects are all scanned.
+        """
+        parts: list[str] = []
+
+        def walk(value, depth: int = 0) -> None:
+            if depth > 8:
+                return
+            if isinstance(value, str):
+                if value:
+                    parts.append(value)
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    if key in cls._IDENTITY_KEYS:
+                        continue
+                    walk(item, depth + 1)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, depth + 1)
+
+        walk(payload)
+        return "\n".join(parts)
 
     def _to_record(self, payload: dict) -> Record:
         event_id = str(payload["_event_id"])
@@ -105,7 +141,13 @@ class JsonlLogAdapter(StoreAdapter):
                 return record
         raise AdapterError("record no longer exists", code="not_found")
 
-    def delete_record(self, locator: dict[str, str]) -> None:
+    def delete_record(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
         event_id = locator.get("event_id")
         if not event_id:
             raise AdapterError("jsonl locator requires 'event_id'", code="invalid_locator")
@@ -135,14 +177,28 @@ class JsonlLogAdapter(StoreAdapter):
             except (TypeError, ValueError):
                 preferred_line = None
         target = preferred_line if preferred_line in matches else matches[0]
+        if expected_fingerprint:
+            line = raw_lines[target]
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    payload = {"_malformed": True, "content": line}
+            except json.JSONDecodeError:
+                payload = {"_malformed": True, "content": line}
+            if fingerprint(self._content(payload), key or self._key) != expected_fingerprint:
+                raise AdapterError(
+                    "record content changed since planning", code="content_changed"
+                )
         remaining = [line for index, line in enumerate(raw_lines) if index != target]
         self._atomic_write("\n".join(remaining) + ("\n" if remaining else ""))
 
     def _atomic_write(self, content: str) -> None:
         try:
+            mode = stat.S_IMODE(self._path.stat().st_mode)
             fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
+            os.chmod(tmp, mode)
             os.replace(tmp, self._path)
         except OSError as exc:
             raise AdapterError(f"jsonl delete failed: {exc}", code="delete_failed") from exc

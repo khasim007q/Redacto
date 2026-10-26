@@ -54,9 +54,11 @@ class ExactMatcher:
         target_record_id: str,
         target_locator: dict[str, str],
         target_kind: str = "source",
+        include_target_identity: bool = True,
     ):
         self._target_id = target_record_id
         self._target_locator = target_locator
+        self._include_identity = include_target_identity
         self._target_kind = target_kind
         self._target_loose = normalize_loose(target_text)
         self._variants = [
@@ -69,9 +71,9 @@ class ExactMatcher:
 
     def match(self, record: Record) -> ExactMatch | None:
         length = len(record.content)
-        if record.record_id == self._target_id:
+        if self._include_identity and record.record_id == self._target_id:
             return ExactMatch("record_id", "Record is the revocation target.", length, length)
-        if record.locator == self._target_locator:
+        if self._include_identity and record.locator == self._target_locator:
             return ExactMatch("locator", "Same adapter locator as the target.", length, length)
         loose = normalize_loose(record.content)
         if self._target_loose and loose == self._target_loose:

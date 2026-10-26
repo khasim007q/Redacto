@@ -72,7 +72,18 @@ destructive or leaking component**.
 | T43 | A raising custom assessor breaks a scan | Assessor construction and invocation are both guarded; failures become `unassessed` | `test_engine_guards_a_raising_custom_assessor` |
 | T44 | A file rewritten after planning is deleted during apply | Plan items store a content fingerprint; apply re-reads and refuses with `content_changed` | `test_changed_content_is_not_deleted_on_apply` |
 | T45 | Two recovery tokens both report the same work | Apply takes an exclusive DB lease; the loser gets `apply_in_progress` | `test_plan_execution_lease_is_exclusive`, `test_concurrent_recovery_tokens_cannot_both_report_the_work` |
-| T46 | A hard-killed apply leaves a lease behind | Recovery approval clears the stale lease; completed actions remain idempotent | `test_recovery_approval_clears_a_stale_execution_lease` |
+| T46 | A hard-killed apply leaves a lease behind | The lease records owner PID/host; recovery clears it only when the owner is gone or the lease is older than 15 minutes | `test_recovery_approval_clears_a_stale_execution_lease`, `test_recovery_clears_a_lease_whose_owner_pid_is_gone` |
+| T47 | A second person "recovers" a plan that is still running | Recovery approval refuses while the lease owner is alive (`apply_in_progress`) | `test_recovery_approval_refuses_a_live_lease` |
+| T48 | A forged token holds the lease and blocks a real apply | The approval token is verified before the lease is claimed; forged tokens never take it | `test_forged_token_never_takes_the_lease` |
+| T49 | Content changes between the re-check and the delete | Verification moved into the mutation: SQLite verifies under a write lock, the filesystem adapter re-reads and re-stats before unlink | `test_sqlite_adapter_verifies_fingerprint_atomically`, `test_filesystem_adapter_verifies_fingerprint` |
+| T50 | A secret revocation deletes the anchor that never held the secret | The anchor no longer matches by identity; only records containing the value are actionable | `test_secret_anchor_without_the_secret_is_not_deleted`, `test_secret_journey_removes_secret_but_keeps_anchor` |
+| T51 | Verify says clean while the secret is still in a store | Fact/secret verification rescans every reachable store for the value's tokens and reports residuals | `test_secret_written_back_before_verify_is_reported`, `test_secret_verify_catches_a_reintroduced_secret_even_when_planned_records_are_gone` |
+| T52 | A secret hides in a nested tool-call argument or chunk metadata | Logs and vector chunks are matched over every string field, recursively | `test_secret_is_found_in_log_tool_arguments`, `test_secret_is_found_in_vector_metadata` |
+| T53 | A reworded note with the price and closing date is labelled harmless | Weighted anchor overlap >= 4 escalates to suspected derivative for review | `test_price_and_closing_date_note_goes_to_review` |
+| T54 | Deleted content survives in SQLite free pages or the WAL | `PRAGMA secure_delete=ON` plus a WAL truncate checkpoint attempt | `test_sqlite_uses_secure_delete_and_checkpoints` |
+| T55 | A rewrite silently changes file permissions | Atomic rewrites restore the original mode | `test_jsonl_rewrite_preserves_file_mode`, `test_vector_rewrite_preserves_file_mode` |
+| T56 | Unscanned file types create invisible gaps | Status reports unscanned files per adapter; scan documents the gap | `test_status_reports_unscanned_files` |
+| T57 | Model snippets leak spelled-out amounts | Snippets mask digit and spelled-out number words | `test_snippet_masks_spelled_out_amounts` |
 
 ## Residual risks (accepted, disclosed)
 
@@ -81,6 +92,14 @@ destructive or leaking component**.
 - **Paraphrase detection is incomplete.** Verification matches planned record IDs and
   the keyed whole-target fingerprint; a reworded remnant in an unlinked store may
   survive and is not detectable by this method.
+- **Secret verification is token-based.** The value is never stored, so a value embedded
+  inside a longer token, and reworded traces, are not proven absent.
+- **Physical removal is best effort.** Files are unlinked, and SQLite secure-delete plus a
+  WAL checkpoint can be delayed by another open writer.
+- **Unscanned file types.** Only configured extensions under a root are scanned; status
+  reports the rest.
+- **Provider transcripts are out of reach.** Pasting a secret into an agent conversation
+  creates a copy at the provider.
 - **Re-ingestion is mitigated, not eliminated.** Exact and near copies are blocked;
   anchor-bearing paraphrases and embedding-similar paraphrases are quarantined. A
   paraphrase below the calibrated embedding threshold can still pass, and the local

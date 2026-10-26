@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS revocation_plans (
     approved_by TEXT,
     applied_at TEXT,
     execution_token TEXT,
+    execution_pid INTEGER,
+    execution_host TEXT,
+    execution_started_at TEXT,
     FOREIGN KEY (request_id) REFERENCES revocation_requests(request_id)
 );
 

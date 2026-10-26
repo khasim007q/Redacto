@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import socket
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -104,8 +106,14 @@ class Repository:
                 conn.execute(f"ALTER TABLE revocation_plan_items ADD COLUMN {column} {ddl}")
 
         plan_columns = {row[1] for row in conn.execute("PRAGMA table_info(revocation_plans)")}
-        if "execution_token" not in plan_columns:
-            conn.execute("ALTER TABLE revocation_plans ADD COLUMN execution_token TEXT")
+        for column, ddl in {
+            "execution_token": "TEXT",
+            "execution_pid": "INTEGER",
+            "execution_host": "TEXT",
+            "execution_started_at": "TEXT",
+        }.items():
+            if column not in plan_columns:
+                conn.execute(f"ALTER TABLE revocation_plans ADD COLUMN {column} {ddl}")
 
         record_columns = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
         if "fingerprint_key_version" not in record_columns:
@@ -470,17 +478,30 @@ class Repository:
         token = new_id("exec")
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE revocation_plans SET execution_token = ? "
+                "UPDATE revocation_plans SET execution_token = ?, execution_pid = ?, "
+                "execution_host = ?, execution_started_at = ? "
                 "WHERE plan_id = ? AND execution_token IS NULL",
-                (token, plan_id),
+                (token, os.getpid(), socket.gethostname(), now_iso(), plan_id),
             )
             conn.commit()
             return token if cursor.rowcount == 1 else None
 
+    def plan_execution_lease(self, plan_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT execution_token, execution_pid, execution_host, execution_started_at "
+                "FROM revocation_plans WHERE plan_id = ?",
+                (plan_id,),
+            ).fetchone()
+        if row is None or not row["execution_token"]:
+            return None
+        return dict(row)
+
     def release_plan_execution(self, plan_id: str, token: str) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE revocation_plans SET execution_token = NULL "
+                "UPDATE revocation_plans SET execution_token = NULL, execution_pid = NULL, "
+                "execution_host = NULL, execution_started_at = NULL "
                 "WHERE plan_id = ? AND execution_token = ?",
                 (plan_id, token),
             )
@@ -489,7 +510,8 @@ class Repository:
     def clear_plan_execution(self, plan_id: str) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE revocation_plans SET execution_token = NULL WHERE plan_id = ?",
+                "UPDATE revocation_plans SET execution_token = NULL, execution_pid = NULL, "
+                "execution_host = NULL, execution_started_at = NULL WHERE plan_id = ?",
                 (plan_id,),
             )
             conn.commit()

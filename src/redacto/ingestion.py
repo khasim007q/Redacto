@@ -128,6 +128,11 @@ def anchor_items(text: str) -> list[tuple[str, int]]:
     return list(weighted.items())[:MAX_ANCHORS]
 
 
+def token_set(text: str) -> set[str]:
+    """All normalized tokens, uncapped, for verification scans."""
+    return {word for word in normalize_loose(text).split() if len(word) >= 2}
+
+
 def anchors(text: str) -> list[str]:
     """Anchor values only; weights are applied by the tombstone builder."""
     return [value for value, _weight in anchor_items(text)]

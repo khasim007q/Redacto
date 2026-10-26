@@ -20,10 +20,18 @@ from redacto.discovery.relationship_assessor import (
     build_assessor,
     minimize_snippet,
 )
+import errno
+import os
+import socket
+from datetime import datetime, timezone
+
 from redacto.errors import HmacKeyError, RedactoError
 from redacto.graph.repository import RECEIPT_VERSION, Repository, new_id, now_iso
 from redacto.graph.traversal import traverse
 from redacto.ingestion import (
+    anchor_items,
+    tokens,
+    token_set,
     ALLOWED,
     BLOCKED,
     QUARANTINED,
@@ -58,6 +66,8 @@ GLOBAL_VERIFICATION_LIMITATIONS = [
     "Verification covers only configured, reachable stores; unreachable stores are reported, not assumed clean.",
     "Detection uses planned record IDs plus a keyed fingerprint of the whole target content.",
     "Paraphrased remnants, backups, provider logs, replication queues and model weights are outside this scope.",
+    "SQLite deletes overwrite rows and attempt a WAL truncate checkpoint; another open writer can delay physical removal.",
+    "Files are unlinked rather than overwritten, and files with other extensions under a configured root are not scanned.",
 ]
 
 
@@ -380,6 +390,9 @@ class Engine:
             target_record_id=target_id,
             target_locator=record["locator"],
             target_kind=target_kind,
+            # A fact/secret anchor is only a lookup handle: it must not match by
+            # identity or it would be deleted without containing the value.
+            include_target_identity=target_kind == "source",
         )
 
         slots = self.adapters()
@@ -620,6 +633,48 @@ class Engine:
                     }
                 continue
 
+            if not fact_mode:
+                target_anchor_weights = dict(anchor_items(target_content))
+                overlap_score = sum(
+                    weight
+                    for value, weight in anchor_items(scanned_record.content)
+                    if value in target_anchor_weights
+                )
+                if overlap_score >= 4:
+                    evidence = (
+                        "Shares distinctive amounts/dates with the target; review before "
+                        "deciding. Reworded disclosure is not proven clean."
+                    )
+                    candidates[record_id] = self._candidate(
+                        record_id=record_id,
+                        store_id=scanned_record.store_id,
+                        record_type=scanned_record.record_type,
+                        capabilities=capabilities,
+                        evidence_class=classify.SUSPECTED_DERIVATIVE,
+                        reason_redacted=classify.explain(
+                            evidence_class=classify.SUSPECTED_DERIVATIVE,
+                            record_type=scanned_record.record_type,
+                            action=classify.REVIEW_REQUIRED,
+                            candidate_evidence=evidence,
+                        ),
+                        match_kind="anchor_disclosure",
+                        **common,
+                    )
+                    if record_id not in candidate_edges:
+                        self.repo.add_candidate_edge(
+                            source_id=target_id,
+                            target_id=record_id,
+                            relation_guess="possible_derivative",
+                            evidence_summary_redacted=evidence,
+                            model_id="heuristic_anchors",
+                            confidence=min(0.95, overlap_score / 10),
+                        )
+                        candidate_edges[record_id] = {
+                            "target_id": record_id,
+                            "relation_guess": "possible_derivative",
+                        }
+                    continue
+
             if shares_entity(target_content, scanned_record.content):
                 evidence = "Shares a named entity with the target but shows no disclosure evidence."
                 candidates[record_id] = self._candidate(
@@ -796,6 +851,7 @@ class Engine:
             },
             "limitations": [
                 "Scan is read-only with respect to record content; only minimized graph metadata is written.",
+                "Only configured file types are scanned; other files under the root are reported in status.",
                 "Semantic candidates stay advisory; unassessed candidates are never destructive.",
                 "Records matching an active tombstone are blocked or quarantined and never re-admitted to the graph.",
                 "Records larger than REDACTO_MAX_RECORD_BYTES are skipped before matching and reported.",
@@ -1738,7 +1794,15 @@ class Engine:
         plan = self.repo.get_plan(plan_id)
         recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED"})
         if recovery:
-            # A hard-killed apply leaves its lease behind; recovery explicitly clears it.
+            # Never steal a live execution lease. Only clear it when the owner is
+            # provably gone (dead PID on this host) or the lease is older than the TTL.
+            lease = self.repo.plan_execution_lease(plan_id)
+            if lease is not None and not self._lease_is_stale(lease):
+                raise RedactoError(
+                    "apply_in_progress",
+                    "This plan is still executing; recovery approval is refused.",
+                    {"plan_id": plan_id, "pid": lease.get("execution_pid")},
+                )
             self.repo.clear_plan_execution(plan_id)
         try:
             issued = authorization.issue_approval(
@@ -1879,6 +1943,32 @@ class Engine:
         }
 
     # ----------------------------------------------------------------- apply
+    EXECUTION_LEASE_SECONDS = 900
+
+    def _lease_is_stale(self, lease: dict[str, Any]) -> bool:
+        """A lease is stale when its owner is gone or it has outlived the TTL."""
+        pid = lease.get("execution_pid")
+        host = lease.get("execution_host")
+        if host == socket.gethostname() and pid:
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                return True
+            except OSError as exc:
+                # Windows reports a dead PID as WinError 87, POSIX as ESRCH.
+                if getattr(exc, "winerror", None) == 87 or exc.errno == errno.ESRCH:
+                    return True
+            except ValueError:
+                pass
+        started = lease.get("execution_started_at")
+        if not started:
+            return True
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(started)
+        except ValueError:
+            return True
+        return age.total_seconds() > self.EXECUTION_LEASE_SECONDS
+
     def apply(
         self,
         *,
@@ -1897,6 +1987,21 @@ class Engine:
             and plan is not None
             and plan["state"] in {"APPROVED", "EXECUTING", "FAILED"}
         ):
+            # Validate the token before taking the lease, so a forged token can never
+            # block a legitimate apply.
+            ok_token, token_reason, _ = authorization.verify_approval(
+                self.repo,
+                plan_id=plan_id,
+                plan_version=int(plan["version"]),
+                approval_ref=approval_ref,
+                confirmation_token=confirmation_token,
+            )
+            if not ok_token:
+                raise RedactoError(
+                    "unauthorized_apply",
+                    f"Apply rejected: {token_reason}.",
+                    {"reason": token_reason},
+                )
             execution_token = self.repo.claim_plan_execution(plan_id)
             if execution_token is None:
                 raise RedactoError(
@@ -2134,80 +2239,49 @@ class Engine:
                 )
                 continue
 
-            # TOCTOU guard: only mutate content that still matches the plan-time
-            # fingerprint. Recovery approvals can stretch the plan's age indefinitely.
+            # TOCTOU guard: adapters verify the plan-time fingerprint as part of the
+            # mutation itself (SQLite does it under a write lock).
             expected_fingerprint = item.get("expected_fingerprint")
             expected_key = self.settings.key_for_version(
                 item.get("fingerprint_key_version")
             )
-            content_error: str | None = None
             if not expected_fingerprint or expected_key is None:
-                content_error = "content_unverifiable"
-            else:
-                try:
-                    current = slot.adapter.read_record(record["locator"])
-                except AdapterError as exc:
-                    if exc.code == "not_found":
-                        self.repo.record_action(
-                            request_id=plan["request_id"],
-                            item_id=item["item_id"],
-                            adapter_id=record["store_id"],
-                            operation=action,
-                            result="already_absent",
-                            error_code=None,
-                            started_at=started,
-                            finished_at=now_iso(),
-                            idempotency_key=idempotency_key,
-                        )
-                        self.repo.set_item_state(item["item_id"], "already_absent")
-                        self.repo.mark_record_deleted(item["record_id"])
-                        counts["already_absent"] += 1
-                        results.append(
-                            {
-                                "item_id": item["item_id"],
-                                "record_id": item["record_id"],
-                                "result": "already_absent",
-                                "operation": action,
-                            }
-                        )
-                        continue
-                    content_error = exc.code
-                else:
-                    if fingerprint(current.content, expected_key) != expected_fingerprint:
-                        content_error = "content_changed"
-
-            if content_error is not None:
                 self.repo.record_action(
                     request_id=plan["request_id"],
                     item_id=item["item_id"],
                     adapter_id=record["store_id"],
                     operation=action,
                     result="failed",
-                    error_code=content_error,
+                    error_code="content_unverifiable",
                     started_at=started,
                     finished_at=now_iso(),
                     idempotency_key=idempotency_key,
                 )
-                self.repo.set_item_state(
-                    item["item_id"],
-                    "content_changed" if content_error == "content_changed" else "failed",
-                )
+                self.repo.set_item_state(item["item_id"], "failed")
                 counts["failed"] += 1
                 results.append(
                     {
                         "item_id": item["item_id"],
                         "record_id": item["record_id"],
                         "result": "failed",
-                        "error_code": content_error,
+                        "error_code": "content_unverifiable",
                     }
                 )
                 continue
 
             try:
                 if action == classify.DELETE_RECORD:
-                    slot.adapter.delete_record(record["locator"])
+                    slot.adapter.delete_record(
+                        record["locator"],
+                        expected_fingerprint=expected_fingerprint,
+                        key=expected_key,
+                    )
                 elif action in {classify.INVALIDATE_INDEX, classify.INVALIDATE_CACHE}:
-                    slot.adapter.invalidate_derived(record["locator"])
+                    slot.adapter.invalidate_derived(
+                        record["locator"],
+                        expected_fingerprint=expected_fingerprint,
+                        key=expected_key,
+                    )
                 else:
                     raise AdapterError(
                         f"{action} is not supported by this adapter", code="unsupported_operation"
@@ -2243,11 +2317,17 @@ class Engine:
                         finished_at=now_iso(),
                         idempotency_key=idempotency_key,
                     )
-                    self.repo.set_item_state(item["item_id"], "failed")
+                    self.repo.set_item_state(
+                        item["item_id"],
+                        "content_changed" if exc.code == "content_changed" else "failed",
+                    )
                     counts["failed"] += 1
                     results.append(
                         {
                             "item_id": item["item_id"],
+                            "record_id": item["record_id"],
+                            "adapter_id": record["store_id"],
+                            "operation": action,
                             "result": "failed",
                             "error_code": exc.code,
                             "message": str(exc),
@@ -2367,7 +2447,19 @@ class Engine:
             if item["approved"] and item["proposed_action"] in classify.ACTIONABLE
         }
         target_record = self.repo.get_record(request["target_id"])
-        target_fingerprint = target_record["fingerprint"] if target_record else None
+        if request["target_kind"] in {"fact", "secret"}:
+            # Verify the value itself. The anchor record is only a lookup handle and
+            # its own fingerprint must not be treated as the target.
+            target_fingerprint = request.get("target_fingerprint")
+        else:
+            target_fingerprint = target_record["fingerprint"] if target_record else None
+        # Fact/secret revocation must be verified against the value itself, not the
+        # anchor record: a secret written back into any store is a residual.
+        secret_tokens = (
+            set(request.get("target_tokens", []))
+            if request["target_kind"] in {"fact", "secret"}
+            else set()
+        )
         target_key_version = (
             request.get("target_key_version")
             or (target_record or {}).get("fingerprint_key_version")
@@ -2438,10 +2530,19 @@ class Engine:
             for record in records:
                 if record.record_id in planned_removals:
                     residuals.append(record.record_id)
-                elif target_fingerprint and verify_key and fingerprint(
+                    continue
+                if target_fingerprint and verify_key and fingerprint(
                     record.content, verify_key
                 ) == target_fingerprint:
                     residuals.append(record.record_id)
+                    continue
+                if secret_tokens and verify_key:
+                    record_tokens = {
+                        fingerprint(token_value, verify_key)
+                        for token_value in token_set(record.content)
+                    }
+                    if secret_tokens.issubset(record_tokens):
+                        residuals.append(record.record_id)
             residual_total += len(residuals)
             outcome = "verified" if not residuals else "residual"
             if key_unavailable or truncated:
@@ -2450,6 +2551,12 @@ class Engine:
                 "Rescan checks planned record IDs and exact/normalized copies of the target content.",
                 "Paraphrased remnants cannot be proven absent by this method.",
             ]
+            if request["target_kind"] in {"fact", "secret"}:
+                limitations.append(
+                    "Fact/secret verification rescans every reachable store for the value's "
+                    "distinctive tokens. The value is never stored, so a value embedded inside "
+                    "a longer token and reworded traces are not proven absent."
+                )
             if truncated:
                 limitations.append(
                     f"Record cap reached ({limit}); some records were not rescanned and "
@@ -2567,6 +2674,12 @@ class Engine:
             "limitations": limitations,
             "model": request["policy"].get("model", {}),
             "approved_by": "application-issued-approval",
+            "physical_overwrite": {
+                "sqlite": "deleted rows overwritten in place (PRAGMA secure_delete=ON); WAL checkpoint attempted",
+                "jsonl_vector": "files rewritten atomically with the original permission mode",
+                "filesystem": "files unlinked, not overwritten",
+                "note": "This receipt is evidence metadata, not proof that every copy is physically overwritten.",
+            },
             "tombstone": self._tombstone_public(tombstone),
             "checked_at": now_iso(),
             "statement": _statement_for(status, review_pending, unreachable_stores, not_verifiable),

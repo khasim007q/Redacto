@@ -6,6 +6,7 @@ and traversal attempts fail closed.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -91,16 +92,57 @@ class FilesystemAdapter(StoreAdapter):
             metadata={"suffix": path.suffix.lower()},
         )
 
-    def delete_record(self, locator: dict[str, str]) -> None:
+    def delete_record(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
         path = self._safe_path(locator)
         if not path.exists():
             raise AdapterError("record no longer exists", code="not_found")
         if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES:
             raise AdapterError("record is not an in-scope file", code="out_of_scope")
+        if expected_fingerprint:
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                    stats = os.fstat(handle.fileno())
+            except OSError as exc:
+                raise AdapterError(f"filesystem read failed: {exc}", code="read_failed") from exc
+            content = data.decode("utf-8", errors="replace")
+            if fingerprint(content, key or self._key) != expected_fingerprint:
+                raise AdapterError(
+                    "record content changed since planning", code="content_changed"
+                )
+            try:
+                current = path.stat()
+            except OSError as exc:
+                raise AdapterError(f"filesystem stat failed: {exc}", code="read_failed") from exc
+            same_file = (current.st_dev, current.st_ino) == (stats.st_dev, stats.st_ino)
+            same_stamp = (current.st_size, current.st_mtime_ns) == (stats.st_size, stats.st_mtime_ns)
+            if not (same_file or same_stamp):
+                raise AdapterError(
+                    "record was replaced during apply", code="content_changed"
+                )
         try:
             path.unlink()
         except OSError as exc:
             raise AdapterError(f"filesystem delete failed: {exc}", code="delete_failed") from exc
+
+    def unscanned_files(self, *, limit: int = 20) -> list[str]:
+        """In-scope root files this adapter cannot scan, by extension."""
+        found: list[str] = []
+        for path in sorted(self._root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if path.suffix.lower() in SCAN_SUFFIXES:
+                continue
+            found.append(path.relative_to(self._root).as_posix())
+            if len(found) >= limit:
+                break
+        return found
 
     def write_record(self, record: Record) -> None:
         path = self._safe_path(record.locator)

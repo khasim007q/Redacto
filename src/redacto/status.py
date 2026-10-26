@@ -118,14 +118,20 @@ def collect_status(settings: Settings, *, transport: str) -> dict[str, object]:
                 }
             )
             continue
-        adapters.append(
-            {
-                "adapter_id": adapter_id,
-                "store_id": slot.adapter.store_id,
-                "capabilities": slot.adapter.capabilities().as_dict(),
-                "health": slot.adapter.health(),
+        entry = {
+            "adapter_id": adapter_id,
+            "store_id": slot.adapter.store_id,
+            "capabilities": slot.adapter.capabilities().as_dict(),
+            "health": slot.adapter.health(),
+        }
+        if hasattr(slot.adapter, "unscanned_files"):
+            unscanned = slot.adapter.unscanned_files()
+            entry["unscanned_files"] = {
+                "count": len(unscanned),
+                "sample": unscanned,
+                "note": "Files under the configured root that this adapter does not scan.",
             }
-        )
+        adapters.append(entry)
 
     reachable = [a for a in adapters if a.get("health", {}).get("reachable")] if adapters else []
     unreachable = [a["adapter_id"] for a in adapters if a not in reachable]

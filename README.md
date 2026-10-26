@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 161 automated tests pass (`pytest`).
+- 178 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -32,6 +32,11 @@ is **off by default**; with no provider configured its candidates are unassessed
   a required key is missing.
 - Local embedding similarity generates paraphrase candidates and risk scores. It is advisory:
   embeddings never prove lineage and never block on their own.
+- Secret/fact revocation deletes only records that contain the value; the anchor record is
+  a lookup handle and is preserved unless it holds the value.
+- Secret verification rescans every reachable store for the value itself, not the anchor.
+- Logs and vector chunks are scanned across every string field, including nested tool-call
+  arguments and chunk metadata.
 - Verification is scoped and enforced by code, not by wording in a prompt.
 - Plans show blast radius (record bytes, match share, collateral risk). A substring
   match inside a larger record is held for review instead of auto-deleted, and a
@@ -260,13 +265,22 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Plan item reviews are audited; approving one bumps the plan version and invalidates
   the old token.
 - Apply takes an exclusive execution lease, so two recovery tokens used at once cannot
-  both report the same work. A hard-killed lease is cleared by a recovery approval.
-- Each plan item stores its plan-time content fingerprint. Apply re-reads the record and
-  refuses to delete if the content changed (`content_changed`) or cannot be verified.
+  both report the same work. The lease records the owning PID/host; a recovery approval
+  refuses while the owner is alive and clears the lease only when the owner is gone or the
+  lease exceeds 15 minutes. The token is validated before the lease is taken, so a forged
+  token cannot block a real apply.
+- Each plan item stores its plan-time content fingerprint. Adapters verify it as part of the
+  mutation: SQLite does the check and delete under one write lock, the filesystem adapter
+  re-reads and re-stats the file before unlinking, and file-backed stores re-read before
+  rewriting. A mismatch fails with `content_changed`.
 - JSONL event identity is stable even without `event_id` (keyed line hash), and
   malformed lines are matched by that identity rather than a shifted line number.
 - Record-cap truncation is reported in scan coverage and verification; absence is not
   claimed for unscanned records.
+- SQLite deletes set `PRAGMA secure_delete=ON` and attempt a WAL truncate checkpoint.
+  Files are unlinked, not overwritten, and JSONL/vector rewrites keep the original mode.
+- Files under a configured root with other extensions are not scanned; `redacto_status`
+  reports them per adapter so the gap is visible.
 - Tombstones retain keyed HMAC fingerprints, derived anchors and an embedding vector.
   A different key or key version cannot match them, and the revoked content is
   unrecoverable.
@@ -287,7 +301,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-161 passed in 67.27s
+178 passed in 90.61s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -330,6 +344,9 @@ These are fixture-level engineering targets, not production accuracy claims.
 - **Buried verbatim copies:** source-mode scans compare 8-word shingles against the
   target. A record quoting a target passage inside other notes becomes
   `SUSPECTED_DERIVATIVE` for review, never `RELATED_NONDISCLOSING`.
+- **Distinctive amounts/dates:** a record that shares a numeric amount or date with the
+  target (score >= 4 on weighted anchors) is `SUSPECTED_DERIVATIVE` for review, so a
+  reworded price+closing-date note is never labelled harmless.
 - **Still missing:** precise `REDACT_SPAN` editing, regeneration and a timed undo/trash
   window. Those are documented as remaining work, not silently claimed.
 
@@ -391,7 +408,11 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 ## Limitations
 
 - **Not universal erasure.** Backups, replicas, provider logs, caches and model
-  weights are out of reach; the receipt says so.
+  weights are out of reach; the receipt says so. Deleted files are unlinked rather than
+  overwritten, and SQLite physical removal can be delayed by another open WAL writer.
+- **Asking an agent to forget a secret by pasting it adds a copy** to that agent's model
+  provider conversation. Redacto cannot revoke provider-side chat history; use a managed
+  secret reference instead of pasting the value.
 - Verification detects planned record IDs and exact/normalized whole-target copies.
   Paraphrased remnants in unlinked stores may survive undetected.
 - Re-ingestion protects exact and near copies and now quarantines embedding-similar
@@ -414,8 +435,10 @@ Demo (`python -m redacto demo`) on the seeded fixture:
   reviewer chooses whole-record deletion or rejection. There is no undo/trash window yet.
 - The plan flags collateral risk but does not automatically regenerate a descendant
   from its other parents (option 6 in the review).
-- Two revocation modes exist in code; **source revocation** is the tested path.
-  Fact/secret revocation is functional but narrower (bounded substring matching).
+- Two revocation modes exist in code; both are tested. Fact/secret revocation deletes
+  records containing the value (the anchor is preserved), and verification searches for
+  the value's tokens; the value is never stored, so a value embedded inside a longer token
+  and reworded traces are not proven absent.
 - Receipt integrity is evidence metadata, not proof of physical overwrite.
 
 ## Repository layout
@@ -440,7 +463,7 @@ tests/         test_graph.py test_discovery.py test_policy.py test_execution.py
                test_verification.py test_security.py test_mcp_tools.py test_transport.py
                test_tombstones.py test_quarantine.py test_key_rotation.py test_embeddings.py
                test_evaluation.py test_jsonl.py test_hardening_collateral.py
-               test_recovery_and_review.py test_packaging.py
+               test_recovery_and_review.py test_packaging.py test_trace_completeness.py
 docs/          architecture.md threat-model.md demo-script.md key-rotation.md
                spec-compliance.md
 ```

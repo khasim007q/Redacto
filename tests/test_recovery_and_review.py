@@ -178,7 +178,7 @@ def test_all_actions_failing_marks_the_plan_failed(engine, monkeypatch):
 def test_unexpected_exception_marks_the_plan_failed(engine, monkeypatch):
     from redacto.adapters.filesystem import FilesystemAdapter
 
-    def boom(self, locator):
+    def boom(self, locator, **kwargs):
         raise RuntimeError("unexpected adapter crash")
 
     monkeypatch.setattr(FilesystemAdapter, "delete_record", boom)
@@ -230,7 +230,7 @@ def test_failed_plan_can_be_reapproved_and_resumed(engine, monkeypatch):
     original = FilesystemAdapter.delete_record
     calls = {"count": 0}
 
-    def flaky(self, locator):
+    def flaky(self, locator, **kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("crash before recording the action")
@@ -341,11 +341,39 @@ def test_plan_execution_lease_is_exclusive(engine):
     assert second
 
 
+def test_recovery_approval_refuses_a_live_lease(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    token = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert token
+    engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
+    with pytest.raises(RedactoError) as excinfo:
+        engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
+    assert excinfo.value.code == "apply_in_progress"
+
+
+def _backdate_lease(engine, plan_id: str, seconds: int) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    started = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).replace(
+        microsecond=0
+    ).isoformat()
+    conn = __import__("sqlite3").connect(engine.settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE revocation_plans SET execution_started_at = ? WHERE plan_id = ?",
+            (started, plan_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_recovery_approval_clears_a_stale_execution_lease(engine):
     plan = engine.plan(target_id=SOURCE_ID)
     token = engine.repo.claim_plan_execution(plan["plan_id"])
     assert token
     engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
+    _backdate_lease(engine, plan["plan_id"], 7200)
     recovery = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
     assert recovery["recovery"] is True
     assert engine.repo.get_plan(plan["plan_id"])["execution_token"] is None
@@ -366,7 +394,7 @@ def test_concurrent_recovery_tokens_cannot_both_report_the_work(engine, monkeypa
 
     original = FilesystemAdapter.delete_record
 
-    def slow(self, locator):
+    def slow(self, locator, **kwargs):
         time.sleep(0.15)
         return original(self, locator)
 
@@ -394,3 +422,44 @@ def test_concurrent_recovery_tokens_cannot_both_report_the_work(engine, monkeypa
         r.get("ok") is False and r.get("error") == "apply_in_progress" or r.get("already_completed")
         for r in results
     )
+
+
+def test_recovery_clears_a_lease_whose_owner_pid_is_gone(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    token = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert token
+    conn = __import__("sqlite3").connect(engine.settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE revocation_plans SET execution_pid = ? WHERE plan_id = ?",
+            (999_999, plan["plan_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
+    recovery = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
+    assert recovery["recovery"] is True
+
+
+def test_forged_token_never_takes_the_lease(engine):
+    plan = engine.plan(target_id=SOURCE_ID)
+    with pytest.raises(RedactoError) as excinfo:
+        engine.apply(
+            plan_id=plan["plan_id"],
+            plan_version=plan["plan_version"],
+            approval_ref="forged",
+            confirmation_token="forged-token",
+        )
+    assert excinfo.value.code == "unauthorized_apply"
+    assert engine.repo.plan_execution_lease(plan["plan_id"]) is None
+
+    # A real approval can still proceed afterwards.
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="real")
+    applied = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="real",
+        confirmation_token=approval["confirmation_token"],
+    )
+    assert applied["counts"]["succeeded"] == 7

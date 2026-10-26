@@ -73,8 +73,20 @@ class StoreAdapter(ABC):
     def read_record(self, locator: dict[str, str]) -> Record: ...
 
     @abstractmethod
-    def delete_record(self, locator: dict[str, str]) -> None:
-        """Delete one in-scope record. Raise AdapterError on any failure."""
+    def delete_record(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        """Delete one in-scope record.
+
+        When expected_fingerprint is given the adapter must verify the stored
+        content still matches before deleting, and raise AdapterError with code
+        content_changed if it does not. Adapters that can do this atomically
+        (SQLite) must.
+        """
 
     def write_record(self, record: Record) -> None:
         """Admit a record into this store.
@@ -91,7 +103,13 @@ class StoreAdapter(ABC):
             f"{self.adapter_id}: redaction is not supported", code="unsupported_operation"
         )
 
-    def invalidate_derived(self, locator: dict[str, str]) -> None:
+    def invalidate_derived(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
         raise AdapterError(
             f"{self.adapter_id}: invalidation is not supported", code="unsupported_operation"
         )

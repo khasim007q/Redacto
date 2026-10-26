@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Iterable
@@ -53,13 +54,28 @@ class VectorFixtureAdapter(StoreAdapter):
 
     def _save(self, chunks: list[dict]) -> None:
         try:
+            mode = stat.S_IMODE(self._path.stat().st_mode)
             fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump({"chunks": chunks}, handle, indent=2)
                 handle.write("\n")
+            os.chmod(tmp, mode)
             os.replace(tmp, self._path)
         except OSError as exc:
             raise AdapterError(f"vector fixture write failed: {exc}", code="delete_failed") from exc
+
+    @staticmethod
+    def _content(chunk: dict) -> str:
+        """Chunk text plus every string value in its metadata."""
+        parts = [str(chunk.get("text") or chunk.get("chunk") or "")]
+        metadata = chunk.get("metadata") or {}
+        if isinstance(metadata, dict):
+            for value in metadata.values():
+                if isinstance(value, str) and value:
+                    parts.append(value)
+                elif isinstance(value, list):
+                    parts.extend(str(item) for item in value if isinstance(item, str) and item)
+        return "\n".join(part for part in parts if part)
 
     def _to_record(self, chunk: dict) -> Record:
         chunk_id = str(chunk.get("id") or chunk.get("chunk_id"))
@@ -68,7 +84,7 @@ class VectorFixtureAdapter(StoreAdapter):
             record_type="index_entry",
             store_id=self.store_id,
             locator={"id": chunk_id},
-            content=str(chunk.get("text") or chunk.get("chunk") or ""),
+            content=self._content(chunk),
             sensitivity=[str(chunk.get("sensitivity"))] if chunk.get("sensitivity") else ["unknown"],
             metadata={k: str(v) for k, v in (chunk.get("metadata") or {}).items()},
         )
@@ -90,18 +106,39 @@ class VectorFixtureAdapter(StoreAdapter):
                 return self._to_record(chunk)
         raise AdapterError("record no longer exists", code="not_found")
 
-    def delete_record(self, locator: dict[str, str]) -> None:
+    def delete_record(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
         chunk_id = locator.get("id")
         if not chunk_id:
             raise AdapterError("vector locator requires 'id'", code="invalid_locator")
         chunks = self._load()
-        remaining = [c for c in chunks if str(c.get("id") or c.get("chunk_id")) != chunk_id]
-        if len(remaining) == len(chunks):
+        target = next(
+            (c for c in chunks if str(c.get("id") or c.get("chunk_id")) == chunk_id), None
+        )
+        if target is None:
             raise AdapterError("record no longer exists", code="not_found")
+        if expected_fingerprint:
+            text = self._content(target)
+            if fingerprint(text, key or self._key) != expected_fingerprint:
+                raise AdapterError(
+                    "record content changed since planning", code="content_changed"
+                )
+        remaining = [c for c in chunks if str(c.get("id") or c.get("chunk_id")) != chunk_id]
         self._save(remaining)
 
-    def invalidate_derived(self, locator: dict[str, str]) -> None:
-        self.delete_record(locator)
+    def invalidate_derived(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        self.delete_record(locator, expected_fingerprint=expected_fingerprint, key=key)
 
     def write_record(self, record: Record) -> None:
         chunk_id = record.locator.get("id")

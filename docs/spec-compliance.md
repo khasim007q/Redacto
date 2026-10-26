@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **161 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **178 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -115,12 +115,12 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
 ## 8. Modes and execution
 
 - **8.1 Source revocation: Compliant.**
-- **8.2 Fact/secret revocation: Partial.** A fact/secret substring covering less than
-  half of a record is held for review with `risk: high`; at or above half the normal
-  delete path applies, so a leaked key that dominates its record is removable. A
-  reviewer can approve or reject a review item through `review-item`. No precise
-  `REDACT_SPAN` support yet, so the reviewer still chooses whole-record deletion or
-  rejection.
+- **8.2 Fact/secret revocation: Partial.** Only records containing the value are
+  actionable; the anchor record is preserved unless it holds the value. A substring
+  covering less than half of a record is held for review; at or above half the normal
+  delete path applies. Verification rescans stores for the value's tokens. A reviewer
+  can approve or reject a review item through `review-item`. No precise `REDACT_SPAN`
+  support yet, so the reviewer still chooses whole-record deletion or rejection.
 - **8.3 Action types: Partial.** All action names exist. A partial substring match is
   mapped to `REVIEW_REQUIRED`, not an automatic delete. `DELETE_RECORD`,
   `INVALIDATE_INDEX`, `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE` and
@@ -132,8 +132,10 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
   `CANCELLED` is entered by `redacto cancel` before execution, `FAILED` when every
   approved action fails, and an `EXECUTING` plan can be re-approved after a crash.
   There is no editable `DRAFT` stage.
-- **8.5 Verification: Compliant.** Only configured reachable stores; per-store method
-  and limitations; `not_verifiable` when the target key version is unavailable.
+- **8.5 Verification: Compliant with stated limits.** Only configured reachable stores;
+  per-store method and limitations; `not_verifiable` when the target key version is
+  unavailable; fact/secret requests rescan for the value itself. Physical overwrite and
+  provider-side copies remain explicit limitations.
 
 ## 9. MCP tool contract
 
@@ -341,6 +343,24 @@ Fixed after the MVP-readiness review:
   both report the same work; recovery approval clears a stale hard-kill lease;
 - a broken key ring now raises `current_key_unavailable`/`keyring_invalid` from scan
   instead of `target_unreachable`.
+
+## Fourth review follow-up (trace completeness)
+
+Fixed after the "does it remove every trace" audit:
+
+- secret revocation no longer deletes the anchor unless it contains the value;
+- secret verification rescans every reachable store for the value's tokens instead of the
+  anchor's fingerprint;
+- log events and vector chunks are matched across every string field, including nested
+  tool-call arguments and metadata;
+- SQLite secure delete plus WAL truncate checkpoint; receipts describe physical overwrite
+  limits; JSONL/vector rewrites preserve file mode;
+- unscanned file types under a configured root are reported by status;
+- weighted amount/date overlap escalates reworded disclosures to review;
+- model snippets mask spelled-out numbers;
+- verify-and-delete is atomic per adapter (SQLite write lock, filesystem re-read/re-stat);
+- execution leases record owner PID/host, refuse live-owner recovery, and validate the
+  token before claiming the lease.
 
 ## Remaining deviations worth fixing next
 

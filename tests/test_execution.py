@@ -126,7 +126,7 @@ def test_adapter_failure_is_reported_not_hidden(tmp_path, monkeypatch):
 
     from redacto.adapters.filesystem import FilesystemAdapter
 
-    def boom(self, locator):
+    def boom(self, locator, **kwargs):
         raise AdapterError("simulated delete failure", code="delete_failed")
 
     monkeypatch.setattr(FilesystemAdapter, "delete_record", boom)
@@ -209,7 +209,7 @@ def test_apply_enters_executing_before_any_mutation(engine, monkeypatch):
 
     original_delete = FilesystemAdapter.delete_record
 
-    def wrapped(self, locator):
+    def wrapped(self, locator, **kwargs):
         observed.append(engine.repo.get_plan(plan["plan_id"])["state"])
         return original_delete(self, locator)
 

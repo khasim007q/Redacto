@@ -49,11 +49,24 @@ class SqliteMemoryAdapter(StoreAdapter):
     def _connect(self):
         """Short-lived connection so Windows file locks are released promptly."""
         conn = sqlite3.connect(self._path, timeout=5)
+        # Overwrite deleted cell content instead of leaving it in free pages.
+        conn.execute("PRAGMA secure_delete=ON")
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
+
+    def _checkpoint(self) -> None:
+        conn = None
+        try:
+            conn = sqlite3.connect(self._path, timeout=5)
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
 
     @staticmethod
     def _present_tables(conn: sqlite3.Connection) -> dict[str, str]:
@@ -139,7 +152,13 @@ class SqliteMemoryAdapter(StoreAdapter):
             raise AdapterError("record no longer exists", code="not_found")
         return self._row_to_record(table, row)
 
-    def delete_record(self, locator: dict[str, str]) -> None:
+    def delete_record(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
         table = locator.get("table")
         if table not in self._tables:
             raise AdapterError("unapproved table", code="out_of_scope")
@@ -148,17 +167,40 @@ class SqliteMemoryAdapter(StoreAdapter):
             raise AdapterError("sqlite locator requires 'id'", code="invalid_locator")
         try:
             with self._connect() as conn:
+                # IMMEDIATE takes the write lock, so verify + delete cannot interleave
+                # with another writer.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    f"SELECT content FROM {table} WHERE id = ?", (record_id,)
+                ).fetchone()
+                if row is None:
+                    raise AdapterError("record no longer exists", code="not_found")
+                if expected_fingerprint and (
+                    fingerprint(row[0] or "", key or self._key) != expected_fingerprint
+                ):
+                    raise AdapterError(
+                        "record content changed since planning", code="content_changed"
+                    )
                 cursor = conn.execute(f"DELETE FROM {table} WHERE id = ?", (record_id,))
-                conn.commit()
-                deleted = cursor.rowcount
+                if cursor.rowcount != 1:
+                    raise AdapterError("record no longer exists", code="not_found")
+        except AdapterError:
+            raise
         except sqlite3.Error as exc:
             raise AdapterError(f"sqlite delete failed: {exc}", code="delete_failed") from exc
-        if deleted != 1:
-            raise AdapterError("record no longer exists", code="not_found")
+        self._checkpoint()
 
-    def invalidate_derived(self, locator: dict[str, str]) -> None:
+    def invalidate_derived(
+        self,
+        locator: dict[str, str],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
         if locator.get("table") == "response_cache":
-            self.delete_record(locator)
+            self.delete_record(
+                locator, expected_fingerprint=expected_fingerprint, key=key
+            )
             return
         raise AdapterError(
             "INVALIDATE_CACHE applies only to the response_cache table",

@@ -32,9 +32,11 @@ honestly be claimed.**
 
 - **Source revocation** (most common): a document/file/record must be revoked
   along with everything derived from it. Use `target_kind="source"`.
-- **Fact/secret revocation** (limited): one value must be removed wherever it
-  appears. Use `target_kind="fact"` or `"secret"` and pass the value as
-  `target_text`. It is used transiently and never persisted.
+- **Fact/secret revocation**: one value must be removed wherever it appears. Use
+  `target_kind="fact"` or `"secret"` and pass the value as `target_text`. It is used
+  transiently and never persisted. The anchor record you name is only a lookup handle:
+  it is preserved unless it contains the value. Verification rescans stores for the
+  value itself, not the anchor.
 
 ## Step 2 — Check the environment
 

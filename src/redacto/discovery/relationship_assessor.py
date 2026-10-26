@@ -28,6 +28,12 @@ _TOKEN = re.compile(r"\b(?:sk|pk|api|token|key)[-_][A-Za-z0-9_-]{6,}\b", re.IGNO
 _NUMBER = re.compile(r"\b\d[\d,.]*\b")
 _URL = re.compile(r"https?://\S+")
 _LONG_VALUE = re.compile(r"\b[A-Za-z0-9_\-]{16,}\b")
+_NUMBER_WORD = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion)"
+)
+_SPELLED_NUMBER = re.compile(rf"\b{_NUMBER_WORD}(?:[-\s]{_NUMBER_WORD})*\b", re.IGNORECASE)
 
 
 class CandidateAssessment(BaseModel):
@@ -69,6 +75,7 @@ def minimize_snippet(text: str, *, limit: int = MAX_SNIPPET_CHARS) -> str:
     scrubbed = _TOKEN.sub("[TOKEN]", scrubbed)
     scrubbed = _URL.sub("[URL]", scrubbed)
     scrubbed = _LONG_VALUE.sub("[VALUE]", scrubbed)
+    scrubbed = _SPELLED_NUMBER.sub("[NUMBER]", scrubbed)
     scrubbed = _NUMBER.sub("[NUMBER]", scrubbed)
     scrubbed = re.sub(r"\s+", " ", scrubbed).strip()
     return scrubbed[:limit]
