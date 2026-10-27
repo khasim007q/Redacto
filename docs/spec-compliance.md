@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **255 passed, 1 skipped**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **272 passed, 2 skipped**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -48,9 +48,9 @@ providers.
 ## 4. User journeys
 
 - **Journey A (source revocation): Compliant.** Covered by the demo and tests.
-- **Journey B (secret/fact revocation): Partial.** Exact/normalized substring
-  matching, HMAC fingerprints, redaction-by-deletion or invalidation. Precise span
-  redaction and safe regeneration are not implemented for any adapter.
+- **Journey B (secret/fact revocation): Compliant.** Exact/normalized substring
+  matching, HMAC fingerprints, precise span redaction in files, memories and logs, and
+  invalidation of index and cache entries.
 - **Journey C (ambiguous sibling): Compliant.** Related non-disclosing records are
   preserved; suspected derivatives are review-only.
 
@@ -119,12 +119,14 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
   actionable; the anchor record is preserved unless it holds the value. When the value
   is under half of a file, memory row or log event, the plan redacts only the value
   (`REDACT_SPAN`, located again at apply time by keyed fingerprints, never stored).
-  Spaced or rewritten forms, records over 256 KB and vector chunks go to review.
-  Verification rescans stores for the value itself. Regeneration is not implemented.
+  Spaced or rewritten forms and records over 256 KB go to review; index and cache entries
+  are invalidated. Verification rescans stores for the value itself. Derivatives of a
+  revoked source can be regenerated from their remaining sources (opt-in, leak-checked).
 - **8.3 Action types: Mostly met.** `DELETE_RECORD`, `REDACT_SPAN`,
   `INVALIDATE_INDEX`, `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE` and
   `UNREACHABLE` are used (`UNREACHABLE` also marks copies in unapproved SQLite tables).
-  `REGENERATE_FROM_ALLOWED_SOURCES` is defined but unsupported.
+  `REGENERATE_FROM_ALLOWED_SOURCES` rewrites files and memories from their remaining
+  confirmed sources through a configured model, refusing any rewrite that resembles the target.
 - **8.4 State machine: Partial.** `READY_FOR_APPROVAL → APPROVED → EXECUTING →
   VERIFYING → {VERIFIED_WITHIN_SCOPE, PARTIAL, NEEDS_REVIEW}` is implemented and
   `EXECUTING` is set before the first mutation (`test_apply_enters_executing_before_any_mutation`).
@@ -259,8 +261,8 @@ there is no `dashboard/` (optional). Extra modules: `ingestion.py`, `evaluation.
 
 **P0 complete.** P1 is partially complete: embeddings, historical discovery and
 tombstone re-ingestion are done; graph visualization and a failure-recovery UI are
-not. P2 intentionally deferred (fact-level span redaction, real vector DBs, multi-agent
-orchestration, scheduled scans).
+not. P2: fact-level span redaction, regeneration, a real vector DB (Chroma) and a real
+cache (Redis) are done; multi-agent orchestration and scheduled scans are deferred.
 
 ## 19. Demo storyboard
 
@@ -381,6 +383,6 @@ Fixed after the "does it remove every trace" audit:
 
 1. Add a per-adapter `find_exact` method if strict interface parity is required.
 2. Implement editable `DRAFT` plans (CANCELLED/FAILED transitions are implemented).
-3. Implement regeneration from allowed sources and an undo/trash window.
+3. ~~Regeneration from allowed sources~~ done (opt-in). An undo/trash window remains.
 4. ~~Graph visualization~~ done: `redacto report` draws confirmed, exposure and candidate edges.
 5. Register the Alan connector (user action) and publish the docs/demo publicly.

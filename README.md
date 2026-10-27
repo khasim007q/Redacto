@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 255 automated tests pass (`pytest`); one opt-in live-model test is skipped by default.
+- 272 automated tests pass (`pytest`); two opt-in live-model tests are skipped by default.
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -74,9 +74,13 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 On Linux/macOS use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
 
 The demo runs in a fresh temp workspace and never touches your configured stores
-(`--use-configured` opts in). A full run is in [docs/demo-transcript.txt](docs/demo-transcript.txt);
-it also writes `demo_report.html`, the read-only report described below. It writes `demo_receipt.json` and `demo_receipt.md` next to
-the demo's graph DB and prints the path (`var/` with `--use-configured`).
+(`--use-configured` opts in). It writes `demo_receipt.json`, `demo_receipt.md` and
+`demo_report.html` (the read-only report described below) next to the demo's graph DB and
+prints the path (`var/` with `--use-configured`).
+
+A narrated, motion-designed walkthrough of the same story (about 4.5 minutes, 1080p) is
+built from [demo-video/](demo-video/README.md): the script, the scenes and the render pipeline
+are all in the repo, so the video can be regenerated after any change.
 
 `seed` refuses with `seed_would_destroy_data` when the workspace holds files it did not
 create, the memory store has extra tables, or the graph has tombstones or revocation
@@ -125,10 +129,36 @@ python -m redacto resolve-quarantine --id <ID> --decision approved|rejected \
 python -m redacto keyring                          # key versions + rotation safety
 python -m redacto calibrate-embeddings             # FP / missed-paraphrase metrics
 python -m redacto evaluate                         # metrics; run after `seed` on a pristine fixture
-python -m redacto report --request-id <REQUEST_ID> --out var\report.html   # read-only HTML report
+python -m redacto report [--request-id <REQUEST_ID>] [--out var\report.html]   # HTML report; default: latest request
 python -m redacto clean-temps [--delete]           # temp copies left by an interrupted rewrite
 python -m redacto serve  --transport stdio   # or: --transport http
 ```
+
+## Compatibility
+
+**MCP clients.** Redacto speaks standard MCP over stdio and Streamable HTTP, so any MCP
+client can use it, whatever language the client is written in: Claude Code, Claude
+Desktop, the Python and TypeScript MCP SDKs, and other MCP-capable agents. Tested here:
+the Python MCP SDK client (stdio and HTTP) and Claude Code.
+
+**Your project's language does not matter.** Redacto does not read source code. It reads
+the context an agent keeps, wherever the project lives:
+
+| Scanned | Not scanned |
+|---|---|
+| `.md`, `.txt`, `.rst` files under `REDACTO_WORKSPACE_ROOT` | Source files (`.py`, `.js`, `.go`, ...), `.env`, `.json` and other suffixes. `status` lists them so the gap is visible |
+| SQLite `memories` / `response_cache` tables (other tables read-only) | Other databases (Postgres, MySQL, ...) |
+| A JSONL log, a JSON vector fixture, Chroma collections, Redis keys | Other vector stores and caches |
+
+So a Python backend, a Node app or a Go service all work the same way: point the
+`REDACTO_*` paths at the agent's notes, memory DB, logs and index for that project.
+Redacto itself runs on Python 3.12+ and is installed from this repo, not into the
+project it protects.
+
+**Natural language.** Exact and normalized matching is Unicode-aware, so copies and
+secrets are found in any language. Paraphrase signals (capitalised anchors, 5-word
+shingles) are tuned for English and other space-separated languages; for Chinese or
+Japanese text, expect paraphrases to be missed more often.
 
 ## MCP tools
 
@@ -232,6 +262,40 @@ Tool logic is transport-independent, so both entry points share the same engine.
   assessment requires an explicitly configured OpenAI-compatible endpoint or local
   Ollama; otherwise the deterministic path runs and candidates stay unassessed.
 
+## Real stores: Chroma and Redis
+
+Beyond the four local adapters, Redacto can reach a real vector database and a real cache.
+Each joins the scope only when configured, and only for what you list:
+
+| Store | Install | Configure | What Redacto does |
+|---|---|---|---|
+| Chroma (persistent) | `pip install 'redacto[chroma]'` | `REDACTO_CHROMA_PATH`, `REDACTO_CHROMA_COLLECTIONS` | Scans each item's document and metadata. A match is `INVALIDATE_INDEX`, which deletes the item and its embedding after re-checking its content. |
+| Redis cache | `pip install 'redacto[redis]'` | `REDACTO_REDIS_URL`, `REDACTO_REDIS_KEY_PATTERNS` | Scans string (JSON-aware), hash and list keys that match the patterns. A match is `INVALIDATE_CACHE`, deleted under `WATCH`/`MULTI`, so a concurrent change aborts it. |
+
+A fact or secret that is only a small part of an index entry or cached answer invalidates it
+too: both are derived data the system rebuilds, and an embedding keeps the value even if
+the text were edited. Tests run against a real Chroma database and fakeredis; set
+`REDACTO_TEST_REDIS_URL` to run them against a Redis server.
+
+## Regenerating derivatives from allowed sources
+
+A summary or memory built from several sources does not have to be lost when one source
+is revoked. With `REDACTO_REGENERATE=true` and a model configured (`REDACTO_MODEL_*`, a
+local Ollama for example), a confirmed derivative whose other parents are not being revoked
+becomes `REGENERATE_FROM_ALLOWED_SOURCES`:
+
+1. The plan lists the allowed sources for the item, and the plan hash binds them.
+2. At apply, only those sources are sent to the model. The revoked source never is.
+3. The rewrite is checked against the revoked target's keyed material (fingerprint,
+   shingles, anchors and embedding). Anything that resembles the target is refused and
+   nothing is written; the plan ends `PARTIAL`.
+4. The record keeps its id; its old lineage is marked revoked and a `REGENERATED_FROM`
+   edge is recorded. Verify re-checks the rewrite.
+
+Fact and secret revocations never regenerate, because a model could write the value back.
+A live run with `llama3` rewrote the fixture summary from the remaining board minutes
+and passed the leak check.
+
 ## Report and model evaluation
 
 `redacto report --request-id <id>` writes one self-contained HTML page: store health,
@@ -279,7 +343,8 @@ Full diagrams (component flow, ER model, revocation sequence) are in
   `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE`, `UNREACHABLE` are exercised.
   `REDACT_SPAN` is supported by the filesystem, SQLite and JSONL adapters; vector chunks are
   invalidated instead, because their embedding would outlive a text edit.
-  `REGENERATE_FROM_ALLOWED_SOURCES` is defined but unsupported.
+  `REGENERATE_FROM_ALLOWED_SOURCES` rewrites a file or memory from its remaining sources
+  (see below).
 - **Node types**: stored records map to `MEMORY`, `LOG_RECORD`, `INDEX_ENTRY`,
   `CACHE_ENTRY` and `ARTIFACT`; scan/trace targets are labelled `SOURCE` or `FACT`.
 - **Persistence**: records, lineage edges, candidate edges, requests, plans, items,
@@ -371,7 +436,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-255 passed, 1 skipped in 66s (Windows 11, Python 3.12)
+272 passed, 2 skipped in 80s (Windows 11, Python 3.12)
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -421,8 +486,9 @@ These are fixture-level engineering targets, not production accuracy claims.
   rather than deleting the whole file. Verification honestly reports `PARTIAL` until a
   reviewer resolves it with `review-item`, and `review-item` is accepted even after the
   plan has applied its other items.
-- **Still missing:** precise `REDACT_SPAN` editing, regeneration and a timed undo/trash
-  window. Those are documented as remaining work, not silently claimed.
+- **Redaction and regeneration:** a secret that is a small part of a file, memory row or
+  log event is redacted in place; a derivative with other sources can be regenerated from
+  them. A timed undo/trash window is still missing.
 
 ### Embedding calibration (synthetic labelled set)
 
@@ -503,10 +569,13 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 - No editable `DRAFT` plan stage. `CANCELLED` is available before execution,
   `FAILED` when every approved action fails (and is retryable), and `PARTIAL` when only
   some actions fail.
-- `find_exact` is implemented centrally in discovery rather than per adapter, and
-  `REDACT_SPAN`/regeneration have no supported adapter yet.
-- Partial matches below half the record are reviewed rather than redacted in place; a
-  reviewer chooses whole-record deletion or rejection. There is no undo/trash window yet.
+- `find_exact` is implemented centrally in discovery rather than per adapter.
+- A spaced or rewritten form of a secret, or one inside a record over 256 KB, cannot be
+  cut out precisely and still goes to review. There is no undo/trash window yet.
+- Regeneration quality depends on the configured model; Redacto only guarantees that a
+  rewrite resembling the revoked target is refused, not that the rewrite is good.
+- The Chroma adapter checks content and deletes in two calls (Chroma has no
+  transactions); it re-reads right before the delete and confirms the item is gone.
 - The plan flags collateral risk but does not automatically regenerate a descendant
   from its other parents (option 6 in the review).
 - Two revocation modes exist in code; both are tested. Fact/secret revocation deletes
@@ -548,8 +617,8 @@ docs/          architecture.md threat-model.md demo-script.md key-rotation.md
 A section-by-section audit against `REDACTO_SPEC.md`, including deviations and
 evidence, is in [docs/spec-compliance.md](docs/spec-compliance.md). The headline:
 all P0 requirements are implemented; the remaining deviations are an editable draft
-plan stage, per-adapter `find_exact`, span redaction/regeneration, a graph
-visualization, and Alan connector registration.
+plan stage, per-adapter `find_exact`, an undo/trash window, and Alan connector
+registration.
 
 ## Next highest-value task
 

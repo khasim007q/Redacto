@@ -46,6 +46,7 @@ class FilesystemAdapter(StoreAdapter):
             can_redact=True,
             can_invalidate=False,
             can_verify=True,
+            can_regenerate=True,
             notes=[
                 "Markdown/text files inside the configured root only.",
                 "Redaction rewrites a UTF-8 file atomically with the value replaced.",
@@ -156,6 +157,28 @@ class FilesystemAdapter(StoreAdapter):
         expected_fingerprint: str | None = None,
         key: str | None = None,
     ) -> None:
+        def transform(content: str) -> str:
+            redacted, count = redact_spans(content, spans, key or self._key)
+            if count == 0:
+                raise AdapterError("no planned span is present any more", code="not_found")
+            return redacted
+
+        self._rewrite(locator, transform, expected_fingerprint=expected_fingerprint, key=key)
+
+    def replace_content(
+        self,
+        locator: dict[str, str],
+        content: str,
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        self._rewrite(
+            locator, lambda _old: content, expected_fingerprint=expected_fingerprint, key=key
+        )
+
+    def _rewrite(self, locator, transform, *, expected_fingerprint, key) -> None:
+        """Atomically rewrite one UTF-8 file after checking it is unchanged."""
         path = self._safe_path(locator)
         if not path.exists():
             raise AdapterError("record no longer exists", code="not_found")
@@ -171,13 +194,11 @@ class FilesystemAdapter(StoreAdapter):
             content = data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise AdapterError(
-                "file is not UTF-8; it cannot be redacted safely", code="unsupported_operation"
+                "file is not UTF-8; it cannot be rewritten safely", code="unsupported_operation"
             ) from exc
         if expected_fingerprint and fingerprint(content, key or self._key) != expected_fingerprint:
             raise AdapterError("record content changed since planning", code="content_changed")
-        redacted, count = redact_spans(content, spans, key or self._key)
-        if count == 0:
-            raise AdapterError("no planned span is present any more", code="not_found")
+        redacted = transform(content)
         tmp: str | None = None
         try:
             current = path.stat()
@@ -192,7 +213,7 @@ class FilesystemAdapter(StoreAdapter):
             os.replace(tmp, path)
             tmp = None
         except OSError as exc:
-            raise AdapterError(f"filesystem redact failed: {exc}", code="redact_failed") from exc
+            raise AdapterError(f"filesystem rewrite failed: {exc}", code="write_failed") from exc
         finally:
             if tmp is not None:
                 try:

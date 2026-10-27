@@ -44,6 +44,7 @@ from redacto.ingestion import (
 )
 from redacto.policy import authorization, classify
 from redacto.process import pid_alive
+from redacto.regeneration import RegenerationError, build_regenerator
 from redacto.policy.plan import build_plan_items, compute_plan_hash, estimated_impact
 from redacto.status import collect_status
 
@@ -276,6 +277,7 @@ class Engine:
             "delete": caps.can_delete,
             "redact": caps.can_redact,
             "invalidate": caps.can_invalidate,
+            "regenerate": caps.can_regenerate,
         }
 
     def _upsert_scanned(self, record: Record, capabilities: dict[str, bool]) -> None:
@@ -345,6 +347,103 @@ class Engine:
             return False
         identity = " ".join([record.record_id, *record.locator.values()])
         return any(fingerprint(value, key) in tokens for value in token_set(identity))
+
+    def regenerator(self):
+        return build_regenerator(
+            provider=self.settings.model_provider,
+            base_url=self.settings.model_base_url,
+            model=self.settings.model_name,
+            timeout=max(30.0, self.settings.model_timeout_seconds),
+        )
+
+    def _allowed_sources(self, record_id: str, revoked: set[str]) -> list[str]:
+        """Confirmed parents of a derivative that are not being revoked."""
+        allowed: list[str] = []
+        for edge in self.repo.parent_edges(record_id):
+            source = edge["source_id"]
+            if edge["relation"] == "READ_FROM" or source in revoked or source in allowed:
+                continue
+            parent = self.repo.get_record(source)
+            if parent is None or parent.get("status") != "active":
+                continue
+            allowed.append(source)
+        return allowed
+
+    def _leak_guard(self, request: dict[str, Any]) -> TombstoneGuard:
+        """A guard built from the request's keyed material, before any tombstone exists."""
+        material = {
+            "tombstone_id": "pending",
+            "status": "active",
+            "target_id": request["target_id"],
+            "target_kind": request["target_kind"],
+            "label_redacted": request.get("target_label_redacted") or request["target_id"],
+            "fingerprint": request.get("target_fingerprint"),
+            "shingles": request.get("target_shingles", []),
+            "anchors": request.get("target_anchors", []),
+            "tokens": request.get("target_tokens", []),
+            "related_record_ids": [],
+            "related_fingerprints": [],
+            "key_version": request.get("target_key_version") or 1,
+            "embedding": request.get("target_embedding", []),
+        }
+        return TombstoneGuard(
+            [material],
+            self.settings.hmac_keys,
+            self.settings.hmac_key_version,
+            embedder=self.embedder() if material["embedding"] else None,
+            embedding_threshold=self.settings.embedding_quarantine_threshold,
+        )
+
+    def _regenerate(self, *, item, record, slot, request, plan, expected_fingerprint, expected_key) -> None:
+        """Rewrite a derivative from its allowed sources, refusing any leak."""
+        sources = list(item.get("regen_sources") or [])
+        if not sources:
+            raise AdapterError("no allowed sources were planned", code="regenerate_unavailable")
+        slots = self.adapters()
+        texts: list[str] = []
+        for source_id in sources:
+            source = self.repo.get_record(source_id)
+            source_slot = slots.get(source["store_id"]) if source else None
+            if source is None or source_slot is None or source_slot.adapter is None:
+                raise AdapterError("an allowed source is unreachable", code="regenerate_unavailable")
+            texts.append(
+                source_slot.adapter.read_record(
+                    self._resolve_locator(source_slot.adapter, source["locator"])
+                ).content
+            )
+        locator = self._resolve_locator(slot.adapter, record["locator"])
+        current = slot.adapter.read_record(locator)
+        try:
+            text = self.regenerator().regenerate(
+                record_type=record["record_type"],
+                current_length=len(current.core_content or current.content),
+                sources=texts,
+            )
+        except RegenerationError as exc:
+            raise AdapterError(str(exc), code=exc.code) from exc
+        decision = self._leak_guard(request).evaluate(
+            record_id=f"regenerated:{item['record_id']}", content=text
+        )
+        if decision.decision != ALLOWED:
+            raise AdapterError(
+                f"regenerated text still resembles the revoked target ({decision.reason_code}); "
+                "nothing was written",
+                code="regenerate_leak",
+            )
+        slot.adapter.replace_content(
+            locator, text, expected_fingerprint=expected_fingerprint, key=expected_key
+        )
+        self.repo.revoke_edges(request["target_id"], item["record_id"])
+        for parent in self.repo.parent_edges(item["record_id"]):
+            if parent["source_id"] not in sources:
+                self.repo.revoke_edges(parent["source_id"], item["record_id"])
+        self.record_lineage(
+            source_ids=sources,
+            output_id=item["record_id"],
+            relation="REGENERATED_FROM",
+            evidence_type="instrumented",
+            evidence_ref=f"{plan['plan_id']}:{item['item_id']}",
+        )
 
     # Redaction hashes every window of a record at apply time; past this size the
     # record goes to review instead.
@@ -506,6 +605,7 @@ class Engine:
         expected_fingerprint: str | None = None,
         fingerprint_key_version: int | None = None,
         redact_spans: list[dict[str, Any]] | None = None,
+        regen_sources: list[str] | None = None,
     ) -> dict[str, Any]:
         action, approved, risk = classify.propose_action(
             record_type=record_type,
@@ -515,10 +615,12 @@ class Engine:
             partial_match=partial_match,
             content_overlap=content_overlap,
             redactable=bool(redact_spans),
+            regenerable=bool(regen_sources),
         )
         risk = classify.collateral_risk(action, risk, content_overlap)
         return {
             "redact_spans": list(redact_spans or []),
+            "regen_sources": list(regen_sources or []),
             "record_id": record_id,
             "store_id": store_id,
             "record_type": record_type,
@@ -691,6 +793,14 @@ class Engine:
             {} if fact_mode else {node.record_id: node for node in traversal.descendants}
         )
         candidate_edges = {edge["target_id"]: edge for edge in traversal.candidates}
+        # Regeneration needs an opt-in, a model, and is never used for fact/secret
+        # targets (the value could be regenerated straight back).
+        regenerate = (
+            not fact_mode
+            and self.settings.regenerate_derivatives
+            and self.regenerator().model_id != "none"
+        )
+        revoked_ids = {target_id, *descendant_by_id}
         candidates: dict[str, dict[str, Any]] = {}
         unrelated_preserved = 0
         embedding_candidates = 0
@@ -786,6 +896,11 @@ class Engine:
                     match_kind="lineage",
                     expected_fingerprint=common["expected_fingerprint"],
                     fingerprint_key_version=common["fingerprint_key_version"],
+                    regen_sources=(
+                        self._allowed_sources(record_id, revoked_ids)
+                        if regenerate and capabilities.get("regenerate")
+                        else []
+                    ),
                 )
                 continue
 
@@ -1530,7 +1645,14 @@ class Engine:
             return None
 
         items = self.repo.plan_items(plan_id)
-        removed = [i for i in items if i["state"] in {"done", "already_absent"}]
+        # Redacted and regenerated records stay in their stores without the revoked
+        # content; their ids and new fingerprints must not be blocked later.
+        removed = [
+            i
+            for i in items
+            if i["state"] in {"done", "already_absent"}
+            and i["proposed_action"] not in {classify.REDACT_SPAN, classify.REGENERATE}
+        ]
         related_ids = [i["record_id"] for i in removed if i["record_id"] != request["target_id"]]
         related_fingerprints: list[dict[str, Any]] = []
         for record_id in related_ids:
@@ -2559,6 +2681,16 @@ class Engine:
                         expected_fingerprint=expected_fingerprint,
                         key=expected_key,
                     )
+                elif action == classify.REGENERATE:
+                    self._regenerate(
+                        item=item,
+                        record=record,
+                        slot=slot,
+                        request=self.repo.get_request(plan["request_id"]),
+                        plan=plan,
+                        expected_fingerprint=expected_fingerprint,
+                        expected_key=expected_key,
+                    )
                 elif action == classify.REDACT_SPAN:
                     slot.adapter.redact_record(
                         self._resolve_locator(slot.adapter, record["locator"]),
@@ -2646,7 +2778,8 @@ class Engine:
                 idempotency_key=idempotency_key,
             )
             self.repo.set_item_state(item["item_id"], "done")
-            if action != classify.REDACT_SPAN:  # a redacted record stays, minus the value
+            # A redacted or regenerated record stays, without the revoked content.
+            if action not in {classify.REDACT_SPAN, classify.REGENERATE}:
                 self.repo.mark_record_deleted(item["record_id"])
             counts["succeeded"] += 1
             results.append(
@@ -2746,8 +2879,14 @@ class Engine:
             for item in items
             if item["approved"]
             and item["proposed_action"] in classify.ACTIONABLE
-            and item["proposed_action"] != classify.REDACT_SPAN
+            and item["proposed_action"] not in {classify.REDACT_SPAN, classify.REGENERATE}
         }
+        regenerated = {
+            item["record_id"]
+            for item in items
+            if item["proposed_action"] == classify.REGENERATE and item["state"] == "done"
+        }
+        leak_guard = self._leak_guard(request) if regenerated and request.get("target_fingerprint") else None
         planned_out_of_scope = {
             item["record_id"]
             for item in items
@@ -2849,6 +2988,13 @@ class Engine:
                     shown = alias
                 if record.record_id in planned_removals or alias in planned_removals:
                     residuals.append(shown)
+                    continue
+                # A regenerated derivative must still not resemble the target.
+                if leak_guard is not None and record.record_id in regenerated:
+                    if leak_guard.evaluate(
+                        record_id=f"regenerated:{record.record_id}", content=record.content
+                    ).decision != ALLOWED:
+                        residuals.append(shown)
                     continue
                 if target_fingerprint and verify_key and fingerprint(
                     record.content, verify_key

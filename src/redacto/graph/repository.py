@@ -103,6 +103,7 @@ class Repository:
             "expected_fingerprint": "TEXT",
             "fingerprint_key_version": "INTEGER",
             "redact_spans_json": "TEXT NOT NULL DEFAULT '[]'",
+            "regen_sources_json": "TEXT NOT NULL DEFAULT '[]'",
         }.items():
             if column not in item_columns:
                 conn.execute(f"ALTER TABLE revocation_plan_items ADD COLUMN {column} {ddl}")
@@ -287,6 +288,22 @@ class Repository:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def parent_edges(self, target_id: str, *, status: str = "confirmed") -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM lineage_edges WHERE target_id = ? AND status = ? ORDER BY created_at",
+                (target_id, status),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def revoke_edges(self, source_id: str, target_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE lineage_edges SET status = 'revoked' WHERE source_id = ? AND target_id = ?",
+                (source_id, target_id),
+            )
+            conn.commit()
+
     def all_lineage_edges(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM lineage_edges ORDER BY created_at").fetchall()
@@ -399,6 +416,13 @@ class Repository:
             conn.commit()
         return request_id
 
+    def latest_request_id(self) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT request_id FROM revocation_requests ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return row[0] if row else None
+
     def get_request(self, request_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -453,8 +477,8 @@ class Repository:
                     """INSERT INTO revocation_plan_items
                        (item_id, plan_id, request_id, record_id, evidence_class, proposed_action,
                         reason_redacted, risk, approved, state, expected_fingerprint,
-                        fingerprint_key_version, redact_spans_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)""",
+                        fingerprint_key_version, redact_spans_json, regen_sources_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)""",
                     (
                         item["item_id"],
                         plan_id,
@@ -468,6 +492,7 @@ class Repository:
                         item.get("expected_fingerprint"),
                         item.get("fingerprint_key_version"),
                         _json(item.get("redact_spans") or []),
+                        _json(item.get("regen_sources") or []),
                     ),
                 )
             conn.commit()
@@ -504,6 +529,7 @@ class Repository:
         for item in items:
             item["approved"] = bool(item["approved"])
             item["redact_spans"] = _loads(item.pop("redact_spans_json", None) or "[]", [])
+            item["regen_sources"] = _loads(item.pop("regen_sources_json", None) or "[]", [])
         return items
 
     def get_plan_item(self, item_id: str) -> dict[str, Any] | None:

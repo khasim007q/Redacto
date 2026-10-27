@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Redacto demo</title>
+<style>
+  :root {
+    --bg: #0a0f1c; --bg2: #111a2e; --panel: #131d33; --line: #26324d;
+    --fg: #eef2f8; --muted: #8b97b0; --dim: #4c5875;
+    --teal: #2dd4bf; --blue: #60a5fa; --violet: #c084fc; --amber: #fbbf24;
+    --red: #f87171; --green: #4ade80; --gray: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); }
+  #stage {
+    position: relative; width: 1920px; height: 1080px; overflow: hidden;
+    background: radial-gradient(1200px 700px at 70% 20%, #16223d 0%, var(--bg) 60%);
+    font-family: "Segoe UI", "Inter", system-ui, sans-serif; color: var(--fg);
+  }
+  .grid { position: absolute; inset: 0; opacity: .35;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 80px 80px; mask-image: radial-gradient(circle at 50% 50%, #000 0%, transparent 75%); }
+  .scene { position: absolute; inset: 0; opacity: 0; }
+  .abs { position: absolute; }
+  .kicker { font-size: 22px; letter-spacing: .18em; text-transform: uppercase; color: var(--teal); font-weight: 600; }
+  .h1 { font-size: 64px; font-weight: 700; letter-spacing: -.01em; line-height: 1.1; }
+  .h2 { font-size: 44px; font-weight: 650; line-height: 1.15; }
+  .body { font-size: 28px; color: var(--muted); line-height: 1.4; }
+  .mono { font-family: "Cascadia Code", "Consolas", monospace; }
+  .card { background: var(--panel); border: 1.5px solid var(--line); border-radius: 18px; }
+  .chip { display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px; border-radius: 999px;
+    font-size: 22px; font-weight: 600; border: 1.5px solid currentColor; white-space: nowrap; }
+  .node { position: absolute; padding: 14px 20px; border-radius: 14px; background: var(--panel);
+    border: 2px solid var(--line); font-size: 24px; white-space: nowrap; transform: translate(-50%, -50%); }
+  .node small { display: block; font-size: 17px; color: var(--muted); margin-top: 2px; }
+  svg.full { position: absolute; inset: 0; width: 1920px; height: 1080px; overflow: visible; }
+  .caption { position: absolute; left: 0; right: 0; bottom: 64px; text-align: center; font-size: 30px; color: var(--muted); }
+  table.plan { border-collapse: collapse; font-size: 22px; }
+  table.plan td { padding: 9px 16px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .bar { height: 12px; border-radius: 6px; background: var(--line); width: 160px; position: relative; overflow: hidden; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--teal); border-radius: 6px; }
+  .term { font-family: "Cascadia Code", Consolas, monospace; font-size: 23px; line-height: 1.55; padding: 28px 30px;
+    background: #070b15; border: 1.5px solid var(--line); border-radius: 16px; white-space: pre; }
+  .stat { text-align: center; } .stat b { display: block; font-size: 84px; font-weight: 700; }
+  .stat span { font-size: 24px; color: var(--muted); }
+  .redact { background: #000; color: #000; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="stage"><div class="grid"></div></div>
+<script>
+/* ---------- timing ---------- */
+let TIMING = window.__TIMING || [];
+const FADE = 0.45;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const easeOut = x => 1 - Math.pow(1 - clamp(x), 3);
+const easeInOut = x => { x = clamp(x); return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+const prog = (t, start, dur = 0.6) => easeOut((t - start) / dur);
+const lerp = (a, b, p) => a + (b - a) * p;
+const $ = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild; };
+const stage = document.getElementById('stage');
+
+/* time (s from scene start) at which `word` is spoken; nth occurrence; fallback */
+function cueOf(entry, word, nth = 1, fallback = 0) {
+  if (!entry) return fallback;
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  let seen = 0;
+  for (const w of entry.words) if (norm(w.w) === norm(word) && ++seen === nth) return w.t;
+  return fallback;
+}
+
+/* show: opacity + upward slide */
+function rise(el, p, dist = 24) { const base = el.dataset.base ?? (el.classList.contains('node') ? 'translate(-50%, -50%)' : ''); el.style.opacity = p; el.style.transform = base + ` translateY(${(1 - p) * dist}px)`; }
+function fade(el, p) { el.style.opacity = p; }
+function place(el, x, y, extra = '') { el.dataset.base = `translate(${x}px, ${y}px) ${extra}`; el.style.left = '0'; el.style.top = '0'; el.style.transform = el.dataset.base; }
+
+/* ---------- scenes ---------- */
+const SCENES = {};
+function scene(id, build) { SCENES[id] = build; }
+
+function docCard(label, sub = 'CONFIDENTIAL') {
+  return $(`<div class="card abs" style="width:300px;height:380px;padding:26px">
+    <div style="font-size:22px;font-weight:700">${label}</div>
+    <div style="margin-top:6px;font-size:16px;color:var(--red);letter-spacing:.2em;font-weight:700">${sub}</div>
+    ${[...Array(9)].map((_, i) => `<div style="height:12px;border-radius:6px;background:var(--line);margin-top:${i ? 16 : 26}px;width:${[92,80,96,70,88,60,94,76,50][i]}%"></div>`).join('')}
+  </div>`);
+}
+
+/* 1. title */
+scene('title', (root, cue) => {
+  const doc = docCard('acquisition-plan.md'); root.append(doc); place(doc, 810, 300);
+  const strike = $(`<div class="abs" style="left:770px;top:480px;width:380px;height:10px;background:var(--red);border-radius:5px;transform-origin:left"></div>`); root.append(strike);
+  const word = $(`<div class="abs h1" style="left:0;right:0;top:420px;text-align:center;font-size:150px;letter-spacing:-.02em">Red<span id="bar" style="display:inline-block;position:relative">acto<i style="position:absolute;inset:14px -6px 10px -6px;background:var(--teal);transform-origin:left;border-radius:6px"></i></span></div>`); root.append(word);
+  const tag = $(`<div class="abs body" style="left:0;right:0;top:640px;text-align:center;font-size:34px">Provenance-aware revocation for AI agent context</div>`); root.append(tag);
+  const bar = word.querySelector('i');
+  const tGone = cue('gone', 1, 3.5), tThis = cue('Redacto', 1, 7.5);
+  return t => {
+    const pIn = prog(t, 0.3, .8), pGone = prog(t, tGone, .5), pOut = prog(t, tThis - .6, .5);
+    fade(doc, pIn * (1 - pOut)); doc.style.filter = `grayscale(${pGone})`;
+    strike.style.opacity = 1 - pOut; strike.style.transform = `scaleX(${pGone})`;
+    const pW = prog(t, tThis - .2, .6); fade(word, pW); fade(tag, prog(t, tThis + .6, .6));
+    // the redaction bar sweeps across "acto", then lifts to reveal the name
+    const sweep = clamp((t - tThis + .2) / .5), lift = clamp((t - tThis - .6) / .5);
+    bar.style.transform = `scaleX(${easeOut(sweep) * (1 - easeInOut(lift))})`;
+    bar.style.transformOrigin = lift > 0 ? 'right' : 'left';
+    word.querySelector('#bar').style.color = lift > .5 ? 'var(--teal)' : 'var(--fg)';
+  };
+});
+
+/* 2. spread */
+const STORES = [
+  { id: 'summary', label: 'Generated summary', sub: 'fs:generated-summary.md', x: 1430, y: 220, kind: 'paraphrase' },
+  { id: 'memory', label: 'Agent memory', sub: 'mem:mem-summary-paraphrase', x: 1560, y: 470, kind: 'paraphrase' },
+  { id: 'cached', label: 'Cached response', sub: 'cache:cache-response-1', x: 1430, y: 740, kind: 'paraphrase' },
+  { id: 'vector', label: 'Vector index chunk', sub: 'vec:chunk-0001', x: 520, y: 760, kind: 'verbatim' },
+  { id: 'logs', label: 'Tool-call logs', sub: 'log:evt-dup-1', x: 420, y: 470, kind: 'verbatim' },
+];
+scene('spread', (root, cue) => {
+  const svg = $(`<svg class="full"></svg>`); root.append(svg);
+  const cx = 960, cy = 470;
+  const center = $(`<div class="node" style="border-color:var(--red);font-weight:700">acquisition-plan.md<small style="color:var(--red)">board only · read once</small></div>`);
+  root.append(center); center.style.left = cx + 'px'; center.style.top = cy + 'px';
+  const items = STORES.map(s => {
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const mx = (cx + s.x) / 2, my = (cy + s.y) / 2 - 40;
+    path.setAttribute('d', `M${cx} ${cy} Q${mx} ${my} ${s.x} ${s.y}`);
+    path.setAttribute('fill', 'none'); path.setAttribute('stroke', 'var(--red)'); path.setAttribute('stroke-width', '3');
+    svg.append(path);
+    const len = path.getTotalLength(); path.style.strokeDasharray = len;
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle'); dot.setAttribute('r', 7); dot.setAttribute('fill', 'var(--red)'); svg.append(dot);
+    const node = $(`<div class="node">${s.label}<small class="mono">${s.sub}</small></div>`); root.append(node);
+    node.style.left = s.x + 'px'; node.style.top = s.y + 'px';
+    const badge = $(`<div class="chip abs" style="color:${s.kind === 'verbatim' ? 'var(--amber)' : 'var(--violet)'};font-size:18px;padding:4px 12px">${s.kind === 'verbatim' ? 'word for word' : 'paraphrase'}</div>`);
+    root.append(badge); badge.style.left = (s.x - 70) + 'px'; badge.style.top = (s.y + 52) + 'px';
+    return { s, path, len, dot, node, badge, at: cue(s.id, 1, 4) };
+  });
+  const title = $(`<div class="abs kicker" style="left:120px;top:90px">The problem</div>`); root.append(title);
+  const unknown = $(`<div class="abs h2" style="left:0;right:0;bottom:90px;text-align:center;color:var(--muted)">Where did it all go? <span style="color:var(--red)">No record.</span></div>`); root.append(unknown);
+  const tWord = cue('word', 1, 13), tPara = cue('paraphrases', 1, 15), tNobody = cue('Nobody', 1, 17);
+  return t => {
+    fade(title, prog(t, .2)); fade(center, prog(t, .4));
+    for (const it of items) {
+      const p = prog(t, it.at - .3, .9);
+      it.path.style.strokeDashoffset = it.len * (1 - p);
+      const travel = clamp((t - it.at) / 1.6) % 1; const pt = it.path.getPointAtLength(it.len * ((t * .45 + it.len) % 1));
+      it.dot.setAttribute('cx', pt.x); it.dot.setAttribute('cy', pt.y); it.dot.style.opacity = p > .99 ? .9 : 0;
+      fade(it.node, prog(t, it.at + .3)); it.node.style.borderColor = p > .99 ? 'var(--red)' : 'var(--line)';
+      const pb = it.s.kind === 'verbatim' ? prog(t, tWord) : prog(t, tPara);
+      fade(it.badge, pb);
+      it.path.style.strokeDasharray = t > tNobody ? '10 12' : it.len;
+      if (t > tNobody) it.path.style.opacity = 1 - .5 * prog(t, tNobody, 1);
+    }
+    rise(unknown, prog(t, tNobody + .3));
+  };
+});
+
+/* 3. not enough */
+scene('notenough', (root, cue) => {
+  const tDelete = cue('Delete', 1, 1), tStill = cue('still', 1, 3), tSearch = cue('Search', 1, 8), tLook = cue('similar', 1, 12);
+  const left = $(`<div class="abs" style="left:150px;top:180px;width:760px"></div>`); root.append(left);
+  const doc = docCard('acquisition-plan.md'); left.append(doc); doc.style.left = '0'; doc.style.top = '0';
+  const trash = $(`<div class="chip abs" style="left:20px;top:410px;color:var(--green)">✓ original deleted</div>`); left.append(trash);
+  const traces = STORES.map((s, i) => $(`<div class="node" style="left:${560 + (i % 2) * 40}px;top:${40 + i * 78}px;transform:none;border-color:var(--red)">${s.label}</div>`));
+  traces.forEach(n => left.append(n));
+  const still = $(`<div class="abs h2" style="left:360px;top:480px;color:var(--red)">5 traces still there</div>`); left.append(still);
+  const right = $(`<div class="abs" style="left:1060px;top:200px;width:720px"></div>`); root.append(right);
+  const opt1 = $(`<div class="card" style="padding:30px 34px"><div class="kicker" style="color:var(--amber)">Search by file name</div><div class="h2" style="margin-top:12px">Misses every paraphrase</div></div>`);
+  const opt2 = $(`<div class="card" style="padding:30px 34px;margin-top:34px"><div class="kicker" style="color:var(--red)">Delete everything similar</div><div class="h2" style="margin-top:12px">Destroys useful work that only shares a company name</div></div>`);
+  right.append(opt1, opt2);
+  return t => {
+    const pDel = prog(t, tDelete, .7);
+    fade(doc, 1 - .75 * pDel); doc.style.filter = `grayscale(${pDel}) blur(${pDel * 1.5}px)`; fade(trash, prog(t, tDelete + .5));
+    traces.forEach((n, i) => { const p = prog(t, tStill - .3 + i * .12); n.style.opacity = p;
+      n.style.boxShadow = `0 0 ${18 + 10 * Math.sin(t * 4 + i)}px rgba(248,113,113,${.35 * p})`; });
+    rise(still, prog(t, tStill + .4)); rise(opt1, prog(t, tSearch - .2)); rise(opt2, prog(t, tLook - 1.2));
+  };
+});
+
+/* 4. pipeline */
+scene('pipeline', (root, cue) => {
+  const steps = [
+    ['Scan', 'scans', 'deterministic + discovery'], ['Trace', 'traces', 'confirmed lineage'], ['Plan', 'plan', 'evidence per record'],
+    ['Approve', 'approves', 'a human, not the agent'], ['Apply', 'apply', 'only the approved plan'], ['Verify', 'rescans', 'what can honestly be claimed'],
+  ];
+  const head = $(`<div class="abs h1" style="left:0;right:0;top:170px;text-align:center">Revocation as an <span style="color:var(--teal)">evidence</span> problem</div>`); root.append(head);
+  const row = $(`<div class="abs" style="left:110px;top:430px;display:flex;gap:22px"></div>`); root.append(row);
+  const els = steps.map(([name, word, sub], i) => {
+    const human = name === 'Approve';
+    const el = $(`<div class="card" style="width:262px;height:230px;padding:26px 24px;${human ? 'border-color:var(--amber)' : ''}">
+      <div class="mono" style="font-size:20px;color:var(--muted)">0${i + 1}</div>
+      <div style="font-size:40px;font-weight:700;margin-top:8px;color:${human ? 'var(--amber)' : 'var(--fg)'}">${name}</div>
+      <div style="font-size:21px;color:var(--muted);margin-top:12px;line-height:1.35">${sub}</div></div>`);
+    row.append(el); return { el, at: cue(word, 1, 3 + i * 1.5) };
+  });
+  const tHuman = cue('human', 1, 9);
+  return t => {
+    rise(head, prog(t, .2));
+    els.forEach(({ el, at }) => rise(el, prog(t, at - .25, .5), 40));
+    els[3].el.style.boxShadow = `0 0 ${40 * prog(t, tHuman, .8)}px rgba(251,191,36,.35)`;
+  };
+});
+
+/* 5. trace */
+scene('trace', (root, cue) => {
+  const svg = $(`<svg class="full"></svg>`); root.append(svg);
+  const NS = 'http://www.w3.org/2000/svg';
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Step 1 · Trace</div>`); root.append(title);
+  const src = { x: 330, y: 520 };
+  const W = 440;
+  const nodes = [
+    { id: 'fs:generated-summary.md', rel: 'DERIVED_FROM', x: 960, y: 160, kind: 'confirmed', word: 'summary' },
+    { id: 'cache:cache-response-1', rel: 'CACHED_AS', x: 960, y: 270, kind: 'confirmed', word: 'cache' },
+    { id: 'log:evt-summary-gen', rel: 'DERIVED_FROM', x: 960, y: 380, kind: 'confirmed', word: 'log' },
+    { id: 'vec:chunk-0001', rel: 'INDEXED_AS', x: 960, y: 490, kind: 'confirmed', word: 'vector' },
+    { id: 'mem:mem-summary-paraphrase', rel: 'DERIVED_FROM · depth 2', x: 1560, y: 160, kind: 'confirmed', word: 'memory', from: 0 },
+    { id: 'log:evt-read-1', rel: 'READ_FROM · exposure only', x: 960, y: 620, kind: 'exposure', word: 'read' },
+    { id: 'mem:mem-candidate-paraphrase', rel: 'candidate · advisory', x: 960, y: 760, kind: 'candidate', word: 'paraphrases' },
+    { id: 'vec:chunk-0002', rel: 'candidate · advisory', x: 960, y: 870, kind: 'candidate', word: 'candidates' },
+  ];
+  const style = { confirmed: ['var(--blue)', ''], exposure: ['var(--gray)', '3 9'], candidate: ['var(--violet)', '14 10'] };
+  const srcEl = $(`<div class="node" style="left:${src.x}px;top:${src.y}px;width:300px;border-color:var(--fg);font-weight:700">acquisition-plan.md<small>source</small></div>`); root.append(srcEl);
+  const drawn = nodes.map((n, i) => {
+    const from = n.from !== undefined ? { x: nodes[n.from].x + W / 2, y: nodes[n.from].y } : { x: src.x + 150, y: src.y };
+    const to = { x: n.x - W / 2, y: n.y };
+    const p = document.createElementNS(NS, 'path');
+    const mx = (from.x + to.x) / 2;
+    p.setAttribute('d', `M${from.x} ${from.y} C${mx} ${from.y} ${mx} ${to.y} ${to.x} ${to.y}`);
+    p.setAttribute('fill', 'none'); p.setAttribute('stroke', style[n.kind][0]); p.setAttribute('stroke-width', n.kind === 'exposure' ? 4.5 : 3.5); p.setAttribute('stroke-linecap', 'round');
+    svg.append(p); const len = p.getTotalLength();
+    const el = $(`<div class="node" style="left:${n.x}px;top:${n.y}px;width:${W}px;border-color:${style[n.kind][0]}"><span class="mono" style="font-size:21px">${n.id}</span><small>${n.rel}</small></div>`);
+    root.append(el);
+    let at = cue(n.word, 1, 3 + i * 2.2);
+    if (n.word === 'candidates') at = cue('candidates', 1, at) + .4;
+    return { n, p, len, el, at };
+  });
+  const legend = $(`<div class="abs" style="left:120px;top:990px;display:flex;gap:46px;font-size:22px;color:var(--muted)">
+    <span><b style="color:var(--blue)">━━</b> confirmed lineage (instrumented)</span>
+    <span><b style="color:var(--gray)">┈┈</b> exposure only, never authorises a delete</span>
+    <span><b style="color:var(--violet)">╍╍</b> candidate, never proof</span></div>`); root.append(legend);
+  const tExp = cue('exposure', 1, 16);
+  return t => {
+    fade(title, prog(t, .2)); fade(srcEl, prog(t, .3));
+    for (const d of drawn) {
+      const pd = prog(t, d.at - .2, .9);
+      d.p.style.strokeDasharray = pd < 1 ? `${d.len * pd} ${d.len}` : style[d.n.kind][1] || 'none';
+      fade(d.el, prog(t, d.at + .2));
+    }
+    fade(legend, prog(t, tExp));
+  };
+});
+
+/* 6. plan */
+const PLAN = [
+  ['fs:acquisition-plan.md', 'DIRECT_MATCH', 'DELETE_RECORD', 100, 'direct'],
+  ['log:evt-dup-1', 'DIRECT_MATCH', 'DELETE_RECORD', 100, 'direct'],
+  ['fs:generated-summary.md', 'CONFIRMED_DESCENDANT', 'DELETE_RECORD', 27, 'desc'],
+  ['cache:cache-response-1', 'CONFIRMED_DESCENDANT', 'INVALIDATE_CACHE', 11, 'desc'],
+  ['log:evt-summary-gen', 'CONFIRMED_DESCENDANT', 'DELETE_RECORD', 71, 'desc'],
+  ['mem:mem-summary-paraphrase', 'CONFIRMED_DESCENDANT', 'DELETE_RECORD', 8, 'desc'],
+  ['vec:chunk-0001', 'CONFIRMED_DESCENDANT', 'INVALIDATE_INDEX', 100, 'desc'],
+  ['mem:mem-candidate-paraphrase', 'SUSPECTED_DERIVATIVE', 'REVIEW_REQUIRED', 0, 'review'],
+  ['vec:chunk-0002', 'SUSPECTED_DERIVATIVE', 'REVIEW_REQUIRED', 0, 'review'],
+  ['fs:eng-notes.md', 'RELATED_NONDISCLOSING', 'SKIP_PRESERVE', 0, 'keep'],
+  ['fs:sibling-public-mention.md', 'RELATED_NONDISCLOSING', 'SKIP_PRESERVE', 0, 'keep'],
+  ['log:evt-instruction', 'RELATED_NONDISCLOSING', 'SKIP_PRESERVE', 0, 'keep'],
+  ['mem:mem-sibling-public', 'RELATED_NONDISCLOSING', 'SKIP_PRESERVE', 0, 'keep'],
+];
+scene('plan', (root, cue) => {
+  const title = $(`<div class="abs kicker" style="left:120px;top:70px">Step 2 · Plan, before anything is touched</div>`); root.append(title);
+  const color = { direct: 'var(--teal)', desc: 'var(--blue)', review: 'var(--amber)', keep: 'var(--gray)' };
+  const tbl = $(`<table class="plan abs" style="left:120px;top:140px"><tbody></tbody></table>`); root.append(tbl);
+  const rows = PLAN.map(([id, ev, act, pct, g]) => {
+    const tr = $(`<table><tr><td class="mono" style="font-size:21px">${id}</td>
+      <td><span class="chip" style="font-size:17px;padding:3px 12px;color:${color[g]}">${ev}</span></td>
+      <td style="font-weight:600;color:${g === 'review' ? 'var(--amber)' : g === 'keep' ? 'var(--gray)' : 'var(--fg)'}">${act}</td>
+      <td><div class="bar"><i style="width:0"></i></div></td><td class="mono" style="color:var(--muted);font-size:19px">${pct ? pct + '%' : '—'}</td>
+      <td style="color:${g === 'review' || g === 'keep' ? 'var(--muted)' : 'var(--green)'};font-size:20px">${g === 'review' ? 'needs a person' : g === 'keep' ? 'preserved' : 'approved'}</td></tr></table>`).querySelector('tr');
+    tbl.tBodies[0].append(tr); return { tr, pct, g };
+  });
+  const tDirect = cue('direct', 1, 8), tReview = cue('review', 1, 13), tPres = cue('preserved', 1, 18), tLost = cue('lost', 1, 22);
+  const head = $(`<div class="abs" style="left:1500px;top:150px;width:330px"></div>`); root.append(head);
+  const counts = [['7', 'delete / invalidate', 'var(--teal)', tDirect], ['2', 'held for review', 'var(--amber)', tReview], ['4', 'preserved', 'var(--gray)', tPres]]
+    .map(([n, l, c, at]) => { const el = $(`<div class="stat" style="text-align:left;margin-bottom:34px"><b style="color:${c};font-size:96px">${n}</b><span>${l}</span></div>`); head.append(el); return { el, at }; });
+  return t => {
+    fade(title, prog(t, .1));
+    rows.forEach((r, i) => {
+      rise(r.tr, prog(t, .4 + i * .22, .4), 14);
+      const focus = (t > tDirect && t < tReview && r.g !== 'review' && r.g !== 'keep') || (t >= tReview && t < tPres && r.g === 'review') || (t >= tPres && t < tLost && r.g === 'keep') || t >= tLost;
+      r.tr.style.opacity = Math.min(prog(t, .4 + i * .22, .4), t > tDirect ? (focus ? 1 : .35) : 1);
+      r.tr.querySelector('.bar i').style.width = `${r.pct * prog(t, tLost, 1.2)}%`;
+    });
+    counts.forEach(c => rise(c.el, prog(t, c.at)));
+  };
+});
+
+/* 7. approval */
+scene('approval', (root, cue) => {
+  const tTries = cue('tries', 1, 4), tRefuses = cue('refuses', 1, 6), tApp = cue('application', 1, 8), tToken = cue('token', 1, 12), tChange = cue('Change', 1, 16);
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Step 3 · The approval boundary</div>`); root.append(title);
+  const agentLbl = $(`<div class="abs h2" style="left:120px;top:150px">The agent</div>`); root.append(agentLbl);
+  const agent = $(`<div class="term abs" style="left:120px;top:230px;width:800px;height:360px"></div>`); root.append(agent);
+  const humanLbl = $(`<div class="abs h2" style="left:1000px;top:150px;color:var(--amber)">A person, in the app</div>`); root.append(humanLbl);
+  const human = $(`<div class="term abs" style="left:1000px;top:230px;width:800px;height:360px"></div>`); root.append(human);
+  const token = $(`<div class="card abs" style="left:1000px;top:640px;width:800px;padding:28px 32px;border-color:var(--amber)">
+    <div class="kicker" style="color:var(--amber)">confirmation token</div>
+    <div class="mono" style="font-size:30px;margin-top:10px">jbuhCzSD…U8lnY4 <span style="color:var(--muted);font-size:22px">· single use · plan v<span class="v">1</span> · 10 min</span></div>
+    <div class="stale" style="margin-top:12px;color:var(--red);font-size:30px;font-weight:650">plan changed to v2 → this token is rejected</div></div>`); root.append(token);
+  const deny = $(`<div class="chip abs" style="left:120px;top:640px;color:var(--red);font-size:28px">✕ unauthorized_apply · approval_not_found</div>`); root.append(deny);
+  const typeOut = (el, text, p) => { el.textContent = text.slice(0, Math.floor(text.length * clamp(p))); };
+  const agentText = '> redacto_plan(target="fs:acquisition-plan.md")\n  plan_9f47… v1 READY_FOR_APPROVAL\n\n> redacto_apply(plan_9f47…, v1,\n    approval_ref="agent says ok",\n    token="made-up")';
+  const humanText = '$ redacto approve --plan-id plan_9f47… \\\n    --ref "Khasim approves"\n\n  approval issued\n  single_use: true';
+  return t => {
+    fade(title, prog(t, .1)); fade(agentLbl, prog(t, .3)); fade(agent, prog(t, .3));
+    typeOut(agent, agentText, (t - .5) / Math.max(1, tTries + 1 - .5));
+    rise(deny, prog(t, tRefuses));
+    agent.style.borderColor = t > tRefuses ? 'var(--red)' : 'var(--line)';
+    fade(humanLbl, prog(t, tApp - .3)); fade(human, prog(t, tApp - .3));
+    typeOut(human, humanText, (t - tApp) / 2.5);
+    rise(token, prog(t, tToken - .4));
+    const pc = prog(t, tChange, .6);
+    token.querySelector('.v').textContent = pc > .5 ? '1 ≠ 2' : '1';
+    token.querySelector('.stale').style.opacity = pc;
+    token.style.borderColor = pc > .5 ? 'var(--red)' : 'var(--amber)';
+    token.style.filter = `grayscale(${pc * .6})`;
+  };
+});
+
+/* 8. apply */
+const COLUMNS = [
+  ['Filesystem', ['fs:acquisition-plan.md', 'fs:generated-summary.md'], ['fs:eng-notes.md', 'fs:sibling-public-mention.md']],
+  ['Memory DB', ['mem:mem-summary-paraphrase', 'cache:cache-response-1'], ['mem:mem-candidate-paraphrase', 'mem:mem-sibling-public']],
+  ['Logs', ['log:evt-dup-1', 'log:evt-summary-gen'], ['log:evt-instruction']],
+  ['Vector index', ['vec:chunk-0001'], ['vec:chunk-0002']],
+];
+function storeColumns(root, top = 220) {
+  const cols = COLUMNS.map(([name, hit, keep], i) => {
+    const col = $(`<div class="card abs" style="left:${120 + i * 430}px;top:${top}px;width:400px;height:420px;padding:24px"></div>`); root.append(col);
+    col.append($(`<div style="font-size:30px;font-weight:700;margin-bottom:18px">${name}</div>`));
+    const chips = [...hit.map(id => [id, true]), ...keep.map(id => [id, false])].map(([id, del]) => {
+      const c = $(`<div class="mono" style="font-size:19px;padding:12px 14px;border:1.5px solid var(--line);border-radius:10px;margin-bottom:12px;position:relative">${id}<span style="position:absolute;right:12px;top:10px"></span></div>`);
+      col.append(c); return { c, del, id };
+    });
+    return { col, chips };
+  });
+  return cols;
+}
+scene('apply', (root, cue) => {
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Step 4 · Apply the approved plan</div>`); root.append(title);
+  const cols = storeColumns(root);
+  const targets = cols.flatMap(c => c.chips.filter(x => x.del));
+  const counter = $(`<div class="abs h1" style="left:120px;top:720px"><span class="n">0</span> <span style="color:var(--muted);font-size:40px">of 7 removed · 0 failed</span></div>`); root.append(counter);
+  const fp = $(`<div class="chip abs" style="left:1100px;top:740px;color:var(--teal);font-size:24px">🔒 content fingerprint checked before every delete</div>`); root.append(fp);
+  const tSeven = cue('Seven', 1, 3), tChecked = cue('checked', 1, 12);
+  const span = Math.max(4, tChecked - tSeven - 1);
+  return t => {
+    fade(title, prog(t, .1)); cols.forEach((c, i) => rise(c.col, prog(t, .2 + i * .12)));
+    let done = 0;
+    targets.forEach((x, i) => {
+      const at = tSeven + i * span / 7, p = prog(t, at, .5);
+      if (p > .5) done++;
+      x.c.style.borderColor = p > 0 ? 'var(--teal)' : 'var(--line)';
+      x.c.style.textDecoration = p > .5 ? 'line-through' : 'none';
+      x.c.style.opacity = 1 - .65 * p;
+      x.c.querySelector('span').textContent = p > .5 ? '✓' : '';
+      x.c.querySelector('span').style.color = 'var(--teal)';
+    });
+    counter.querySelector('.n').textContent = done; fade(counter, prog(t, tSeven - .3));
+    rise(fp, prog(t, tChecked));
+  };
+});
+
+/* 9. verify */
+scene('verify', (root, cue) => {
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Step 5 · Verify, independently</div>`); root.append(title);
+  const cols = storeColumns(root, 200);
+  cols.forEach(c => c.chips.forEach(x => { if (x.del) { x.c.style.opacity = .3; x.c.style.textDecoration = 'line-through'; } }));
+  const beam = $(`<div class="abs" style="top:190px;width:6px;height:440px;background:var(--teal);box-shadow:0 0 30px 8px rgba(45,212,191,.5);border-radius:3px"></div>`); root.append(beam);
+  const okTags = cols.map((c, i) => { const el = $(`<div class="chip abs" style="left:${140 + i * 430}px;top:540px;color:var(--green)">verified · 0 residual</div>`); root.append(el); return el; });
+  const receipt = $(`<div class="card abs" style="left:430px;top:150px;width:1060px;padding:40px 48px;border-color:var(--teal)">
+    <div class="kicker">Receipt rcpt_e5e2… · no content stored</div>
+    <div style="display:flex;justify-content:space-between;margin:26px 0 10px">
+      <div class="stat"><b style="color:var(--teal)">7</b><span>removed</span></div>
+      <div class="stat"><b>0</b><span>residual copies</span></div>
+      <div class="stat"><b style="color:var(--amber)">2</b><span>awaiting review</span></div>
+      <div class="stat"><b style="color:var(--gray)">4</b><span>preserved</span></div></div>
+    <div class="body" style="font-size:24px">Scope: filesystem, sqlite_memory, jsonl_logs, vector_fixture · method: rescan · limitations listed</div></div>`); root.append(receipt);
+  const verdict = $(`<div class="abs" style="left:0;right:0;top:760px;text-align:center"><div class="h1" style="font-size:58px">Verified within configured scope</div><div class="h2" style="color:var(--muted);margin-top:10px">not a claim of universal erasure</div></div>`); root.append(verdict);
+  const tZero = cue('Zero', 1, 5), tTwo = cue('Two', 1, 7), tVerdict = cue('verdict', 1, 16);
+  return t => {
+    fade(title, prog(t, .1));
+    const pHide = prog(t, tTwo - .4, .5);
+    cols.forEach((c, i) => { c.col.style.opacity = prog(t, .2) * (1 - pHide); });
+    const sweep = clamp((t - .8) / Math.max(1.5, tZero - .8));
+    beam.style.left = `${lerp(110, 1830, easeInOut(sweep))}px`; beam.style.opacity = (sweep > 0 && sweep < 1 ? 1 : 0) * (1 - pHide);
+    okTags.forEach((el, i) => fade(el, prog(t, .8 + (i + 1) / 4 * Math.max(1.5, tZero - .8), .4) * (1 - pHide)));
+    rise(receipt, prog(t, tTwo - .2), 40);
+    rise(verdict, prog(t, tVerdict));
+  };
+});
+
+/* 10. secret */
+scene('secret', (root, cue) => {
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Secrets and facts</div>`); root.append(title);
+  const key = $(`<div class="chip abs mono" style="left:120px;top:150px;color:var(--red);font-size:30px">🔑 sk-live-•••••••••••3210</div>`); root.append(key);
+  const places = [
+    ['tool-call arguments', '{"args": {"headers": {"Authorization": "Bearer ███"}}}', 'arguments'],
+    ['metadata field', '{"metadata": {"auth": {"token": "███"}}}', 'metadata'],
+    ["a record's ID", 'event_id: "███" → shown as log:redacted-9f3a…', 'ID'],
+  ].map(([label, code, word], i) => {
+    const el = $(`<div class="card abs" style="left:120px;top:${250 + i * 150}px;width:780px;padding:20px 26px"><div style="font-size:22px;color:var(--muted)">${label}</div><div class="mono" style="font-size:21px;margin-top:8px">${code}</div></div>`);
+    root.append(el); return { el, at: cue(word, 1, 4 + i) };
+  });
+  const book = $(`<div class="card abs" style="left:1000px;top:150px;width:800px;height:640px;padding:30px 34px">
+    <div style="font-size:26px;font-weight:700">team-handbook.md <span style="color:var(--muted);font-size:20px;font-weight:400">· 5 KB of useful notes</span></div>
+    ${[...Array(7)].map((_, i) => `<div style="height:12px;border-radius:6px;background:var(--line);margin-top:20px;width:${[90,78,95,70,85,92,66][i]}%"></div>`).join('')}
+    <div class="mono" style="font-size:24px;margin-top:22px">STRIPE_KEY=<span class="k" style="color:var(--red);position:relative">sk-live-•••••••3210<i style="position:absolute;inset:-2px -4px;background:#000;border:1.5px solid var(--teal);border-radius:4px;transform-origin:left"></i><b style="position:absolute;left:8px;top:0;color:var(--teal);font-weight:700">[REDACTED]</b></span></div>
+    ${[...Array(5)].map((_, i) => `<div style="height:12px;border-radius:6px;background:var(--line);margin-top:20px;width:${[88,74,93,80,60][i]}%"></div>`).join('')}
+    <div class="chip" style="margin-top:28px;color:var(--teal);font-size:20px">REDACT_SPAN · handbook kept</div></div>`); root.append(book);
+  const hmac = $(`<div class="chip abs mono" style="left:1000px;top:830px;color:var(--teal);font-size:22px">stored: HMAC-SHA256(key) = 9f3a…c41e · never the value</div>`); root.append(hmac);
+  const tBook = cue('handbook', 1, 12), tRedact = cue('redacts', 1, 17), tFp = cue('fingerprints', 1, 21);
+  const bar = book.querySelector('.k i'), lbl = book.querySelector('.k b'), chip = book.querySelector('.chip');
+  return t => {
+    fade(title, prog(t, .1)); rise(key, prog(t, .4));
+    places.forEach(p => { rise(p.el, prog(t, p.at - .3)); p.el.style.borderColor = t > p.at ? 'var(--red)' : 'var(--line)'; });
+    rise(book, prog(t, tBook - .6));
+    const pr = prog(t, tRedact, .6); bar.style.transform = `scaleX(${pr})`; lbl.style.opacity = prog(t, tRedact + .5, .3);
+    fade(chip, prog(t, tRedact + .8)); rise(hmac, prog(t, tFp - .3));
+  };
+});
+
+/* 11. guard */
+scene('guard', (root, cue) => {
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Revocation that sticks</div>`); root.append(title);
+  const tomb = $(`<div class="card abs" style="left:780px;top:330px;width:360px;height:300px;padding:30px;text-align:center;border-color:var(--teal)">
+    <div style="font-size:64px">🪦</div><div class="h2" style="font-size:34px">Tombstone</div><div class="body" style="font-size:21px;margin-top:8px">keyed fingerprints,<br>shingles &amp; anchors only</div></div>`); root.append(tomb);
+  const exact = $(`<div class="node" style="left:520px;top:340px;border-color:var(--red)">acquisition-plan.md<small>written back by the agent</small></div>`); root.append(exact);
+  const para = $(`<div class="node" style="left:540px;top:640px;border-color:var(--violet)">mem-reintroduced-paraphrase<small>a lookalike</small></div>`); root.append(para);
+  const blocked = $(`<div class="node" style="left:1560px;top:340px;border-color:var(--red);color:var(--red);font-weight:700">BLOCKED<small>same_target · never stored</small></div>`); root.append(blocked);
+  const quar = $(`<div class="node" style="left:1560px;top:640px;border-color:var(--amber);color:var(--amber);font-weight:700">QUARANTINED<small>held for a person to judge</small></div>`); root.append(quar);
+  const tTomb = cue('tombstone', 1, 2), tBlock = cue('blocked', 1, 7), tQ = cue('quarantined', 1, 11);
+  const svg = $(`<svg class="full"></svg>`); root.prepend(svg);
+  const arrow = (d, color) => { const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d);
+    p.setAttribute('fill', 'none'); p.setAttribute('stroke', color); p.setAttribute('stroke-width', 4); p.setAttribute('stroke-linecap', 'round');
+    svg.append(p); const len = p.getTotalLength(); p.style.strokeDasharray = len; return { p, len }; };
+  const a1 = arrow('M650 340 C780 340 860 420 960 440 C1060 420 1100 340 1420 340', 'var(--red)');
+  const a2 = arrow('M728 640 C820 640 880 560 960 540 C1040 560 1100 640 1420 640', 'var(--amber)');
+  return t => {
+    a1.p.style.strokeDashoffset = a1.len * (1 - prog(t, tBlock - .9, 1));
+    a2.p.style.strokeDashoffset = a2.len * (1 - prog(t, tQ - .9, 1));
+    fade(title, prog(t, .1)); rise(tomb, prog(t, tTomb - .3));
+    fade(exact, prog(t, tBlock - 1.6));
+    rise(blocked, prog(t, tBlock));
+    fade(para, prog(t, tQ - 1.6));
+    rise(quar, prog(t, tQ));
+  };
+});
+
+/* 12. mcp */
+scene('mcp', (root, cue) => {
+  const title = $(`<div class="abs kicker" style="left:120px;top:80px">Ships as an MCP server</div>`); root.append(title);
+  const server = $(`<div class="card abs" style="left:120px;top:300px;width:1000px;padding:34px">
+    <div class="h2">redacto <span style="color:var(--muted);font-size:28px">MCP server</span></div>
+    <div style="display:flex;gap:16px;margin-top:18px"><span class="chip t1" style="color:var(--blue)">stdio</span><span class="chip t2" style="color:var(--blue)">Streamable HTTP + bearer token</span></div>
+    <div class="tools" style="display:flex;flex-wrap:wrap;gap:12px;margin-top:28px"></div></div>`); root.append(server);
+  const tools = ['redacto_status', 'redacto_scan', 'redacto_trace', 'redacto_plan', 'redacto_apply', 'redacto_verify', 'redacto_tombstones', 'redacto_quarantine']
+    .map(name => { const el = $(`<span class="chip mono" style="font-size:20px;color:${name === 'redacto_apply' ? 'var(--amber)' : 'var(--fg)'}">${name}${name === 'redacto_apply' ? ' · token required' : ''}</span>`); server.querySelector('.tools').append(el); return el; });
+  const noApprove = $(`<span class="chip mono" style="font-size:20px;color:var(--red);text-decoration:line-through">redacto_approve</span>`); server.querySelector('.tools').append(noApprove);
+  const stats = $(`<div class="abs" style="left:1230px;top:300px;width:560px"></div>`); root.append(stats);
+  const s1 = $(`<div class="stat" style="text-align:left"><b class="n1" style="color:var(--teal)">0</b><span>automated tests passing</span></div>`);
+  const s2 = $(`<div class="stat" style="text-align:left;margin-top:40px"><b class="n2" style="color:var(--teal)">0/29</b><span>end-to-end checks with a real MCP client</span></div>`);
+  stats.append(s1, s2);
+  const tEight = cue('Eight', 1, 7), tNo = cue('no', 1, 10), tTests = cue('tests', 1, 14), tClient = cue('client', 1, 17);
+  return t => {
+    fade(title, prog(t, .1)); rise(server, prog(t, .3));
+    tools.forEach((el, i) => rise(el, prog(t, tEight - .3 + i * .12, .4), 10));
+    rise(noApprove, prog(t, tNo));
+    rise(s1, prog(t, tTests - 1.5)); s1.querySelector('.n1').textContent = Math.round(255 * prog(t, tTests - 1.5, 1.5));
+    rise(s2, prog(t, tClient - .8)); s2.querySelector('.n2').textContent = `${Math.round(29 * prog(t, tClient - .8, 1.2))}/29`;
+  };
+});
+
+/* 13. close */
+scene('close', (root, cue) => {
+  const word = $(`<div class="abs h1" style="left:0;right:0;top:250px;text-align:center;font-size:130px">Red<span style="color:var(--teal)">acto</span></div>`); root.append(word);
+  const lines = [['Find every trace.', 'Find'], ['Remove only what the evidence supports.', 'remove'], ["Tell the truth about what's left.", 'tell']]
+    .map(([text, w], i) => { const el = $(`<div class="abs h2" style="left:0;right:0;top:${490 + i * 74}px;text-align:center;font-weight:500">${text}</div>`); root.append(el); return { el, at: cue(w, 1, 1.5 + i * 2) }; });
+  const url = $(`<div class="abs mono" style="left:0;right:0;top:800px;text-align:center;font-size:26px;color:var(--muted)">github.com/khasim007q/Redacto</div>`); root.append(url);
+  return t => {
+    rise(word, prog(t, .1));
+    lines.forEach(l => rise(l.el, prog(t, l.at - .15)));
+    fade(url, prog(t, lines[2].at + 1));
+  };
+});
+
+/* ---------- driver ---------- */
+const built = [];
+function init(timing) {
+  TIMING = timing;
+  for (const entry of TIMING) {
+    const root = document.createElement('div'); root.className = 'scene'; stage.append(root);
+    const cue = (word, nth = 1, fallback = 0) => cueOf(entry, word, nth, fallback);
+    const update = SCENES[entry.id](root, cue);
+    built.push({ entry, root, update });
+  }
+}
+window.renderAt = function (T) {
+  for (const s of built) {
+    const local = T - s.entry.start, dur = s.entry.duration;
+    const visible = local > -FADE && local < dur + FADE;
+    if (!visible) { s.root.style.opacity = 0; continue; }
+    const fin = clamp((local + FADE) / FADE), fout = clamp((dur + FADE - local) / FADE);
+    s.root.style.opacity = Math.min(fin, fout);
+    s.update(Math.max(0, local));
+  }
+};
+window.init = init;
+</script>
+</body>
+</html>

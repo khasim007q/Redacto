@@ -1,0 +1,58 @@
+{
+  "voice": "en-US-AndrewNeural",
+  "rate": "-4%",
+  "scenes": [
+    {
+      "id": "title",
+      "text": "Your AI agent read a confidential document. Now you need it gone. Not just the file. Everything the agent made from it. This is Redacto."
+    },
+    {
+      "id": "spread",
+      "text": "Here's the problem. The board's acquisition plan was read once. Since then it has leaked into a generated summary, an agent memory, a cached response, a vector index chunk, and the tool-call logs. Some of those copies are word for word. Some are paraphrases. Nobody wrote down where they all went."
+    },
+    {
+      "id": "notenough",
+      "text": "Delete the original, and every one of those traces is still there. The agent will happily repeat the deal terms tomorrow. Search for the file name, and you miss the paraphrases. Delete everything that looks similar, and you destroy useful work that only mentions the same company."
+    },
+    {
+      "id": "pipeline",
+      "text": "Redacto treats revocation as an evidence problem. It scans, traces lineage, and builds a plan you can read. A human approves the exact plan. Only then does it apply, and afterwards it rescans every store to verify what can honestly be claimed."
+    },
+    {
+      "id": "trace",
+      "text": "First, the trace. Confirmed lineage, written by instrumentation, shows five descendants of the plan: the summary, the cache entry, the log event, the vector chunk, and a memory two hops away. A plain read of the file is shown, but as exposure only. It never authorises a delete. And discovery finds what lineage missed: paraphrases with no recorded history, flagged as candidates, never as proof."
+    },
+    {
+      "id": "plan",
+      "text": "Then the plan. Every record gets a reason, an evidence class, and an action. Two direct copies and five confirmed descendants are approved for deletion or invalidation. Two suspected paraphrases are held for human review. Four related records, like an engineering note that only shares the company name, are preserved. Each row shows how much of the record would be lost, so collateral damage is visible before anything happens."
+    },
+    {
+      "id": "approval",
+      "text": "Now the safety boundary. The agent can ask for a plan, but it cannot approve one. When it tries to apply on its own, Redacto refuses. Approval comes from the application, in a person's hands, as a single-use token bound to that exact plan version. Change the plan, and the token is worthless."
+    },
+    {
+      "id": "apply",
+      "text": "With approval, Redacto applies the plan, one action at a time. Seven records are removed or invalidated across the filesystem, the memory database, the logs, and the vector index. Every action is checked against the content that was planned, so a file that changed in the meantime is never deleted blindly."
+    },
+    {
+      "id": "verify",
+      "text": "Then it verifies, independently. Every reachable store is rescanned. Zero residual copies. Two candidates still await review, and the receipt says so. It records counts, scope, and limitations, never the confidential text. The verdict is deliberately modest: verified within configured scope, not a claim of universal erasure."
+    },
+    {
+      "id": "secret",
+      "text": "Secrets get the same care. Give Redacto a leaked API key, and it finds every copy, even inside nested tool-call arguments, metadata fields, or a record's ID. When the key sits inside a long, useful handbook, Redacto doesn't delete the handbook. It redacts just the key. The value itself is never stored, only keyed fingerprints."
+    },
+    {
+      "id": "guard",
+      "text": "Revocation also has to stick. Redacto leaves a tombstone of keyed fingerprints behind. If the agent writes the document back, the exact copy is blocked at ingestion, and lookalike paraphrases are quarantined for a person to judge."
+    },
+    {
+      "id": "mcp",
+      "text": "All of this ships as an MCP server, over standard input and output, or HTTP with a bearer token. Eight tools, read-only by default, with no approve tool exposed to the agent. Two hundred and fifty-five automated tests pass, and a real MCP client completes the full journey end to end."
+    },
+    {
+      "id": "close",
+      "text": "Redacto. Find every trace, remove only what the evidence supports, and tell the truth about what's left."
+    }
+  ]
+}

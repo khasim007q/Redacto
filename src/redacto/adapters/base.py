@@ -106,6 +106,7 @@ class Capabilities:
     can_redact: bool = False
     can_invalidate: bool = False
     can_verify: bool = True
+    can_regenerate: bool = False
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -116,6 +117,7 @@ class Capabilities:
             "redact": self.can_redact,
             "invalidate": self.can_invalidate,
             "verify": self.can_verify,
+            "regenerate": self.can_regenerate,
             "notes": list(self.notes),
         }
 
@@ -176,6 +178,22 @@ class StoreAdapter(ABC):
         """
         raise AdapterError(
             f"{self.adapter_id}: redaction is not supported", code="unsupported_operation"
+        )
+
+    def replace_content(
+        self,
+        locator: dict[str, str],
+        content: str,
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        """Replace a record's payload with regenerated text, keeping its identity.
+
+        The record's content must still match the plan-time fingerprint.
+        """
+        raise AdapterError(
+            f"{self.adapter_id}: regeneration is not supported", code="unsupported_operation"
         )
 
     def invalidate_derived(
