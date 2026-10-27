@@ -25,6 +25,7 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
             partial_match=bool(candidate.get("partial_match")),
             content_overlap=float(candidate.get("match_ratio", 1.0)),
             redactable=bool(candidate.get("redact_spans")),
+            regenerable=bool(candidate.get("regen_sources")),
         )
         risk = classify.collateral_risk(
             action, base_risk, float(candidate.get("match_ratio", 1.0))
@@ -59,6 +60,12 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
                     if action == classify.REDACT_SPAN
                     else []
                 ),
+                # Allowed source record ids a regenerated derivative is rebuilt from.
+                "regen_sources": (
+                    list(candidate.get("regen_sources") or [])
+                    if action == classify.REGENERATE
+                    else []
+                ),
             }
         )
     return items
@@ -89,6 +96,7 @@ def compute_plan_hash(
                 "expected_fingerprint": item.get("expected_fingerprint"),
                 "fingerprint_key_version": item.get("fingerprint_key_version"),
                 "redact_spans": item.get("redact_spans") or [],
+                "regen_sources": item.get("regen_sources") or [],
             }
             for item in sorted(items, key=lambda i: i["item_id"])
         ],

@@ -205,6 +205,7 @@ class SqliteMemoryAdapter(StoreAdapter):
             can_scan=True,
             can_delete=True,
             can_redact=True,
+            can_regenerate=True,
             can_invalidate=True,
             can_verify=True,
             notes=[
@@ -343,6 +344,38 @@ class SqliteMemoryAdapter(StoreAdapter):
             raise
         except sqlite3.Error as exc:
             raise AdapterError(f"sqlite redact failed: {exc}", code="redact_failed") from exc
+        self._checkpoint()
+
+    def replace_content(
+        self,
+        locator: dict[str, str],
+        content: str,
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        table = locator.get("table")
+        if table not in self._tables:
+            raise AdapterError("unapproved table", code="out_of_scope")
+        record_id = locator.get("id")
+        if not record_id:
+            raise AdapterError("sqlite locator requires 'id'", code="invalid_locator")
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+                if row is None:
+                    raise AdapterError("record no longer exists", code="not_found")
+                current = self._row_to_record(table, row, self._columns[table]).content
+                if expected_fingerprint and fingerprint(current, key or self._key) != expected_fingerprint:
+                    raise AdapterError(
+                        "record content changed since planning", code="content_changed"
+                    )
+                conn.execute(f"UPDATE {table} SET content = ? WHERE id = ?", (content, record_id))
+        except AdapterError:
+            raise
+        except sqlite3.Error as exc:
+            raise AdapterError(f"sqlite rewrite failed: {exc}", code="write_failed") from exc
         self._checkpoint()
 
     def invalidate_derived(

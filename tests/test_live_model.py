@@ -43,3 +43,40 @@ def test_live_model_never_changes_the_destructive_plan(tmp_path):
     assert _approved(assessed) == _approved(baseline)
     never_touch = {"mem:mem-unrelated-eng", "cache:cache-unrelated-1", "log:evt-unrelated", "vec:chunk-0003"}
     assert not never_touch & set(_approved(assessed))
+
+
+def test_live_model_regenerates_a_summary_without_the_revoked_source(tmp_path):
+    from conftest import approve_and_apply
+
+    settings = replace(
+        seeded_settings(tmp_path),
+        model_provider="openai_compatible",
+        model_base_url=URL,
+        model_name=NAME,
+        model_timeout_seconds=float(os.environ.get("REDACTO_LIVE_MODEL_TIMEOUT", "180")),
+        regenerate_derivatives=True,
+    )
+    minutes = (
+        "# Board minutes, October\n\nThe board approved the new office lease in Austin and "
+        "hired two support engineers. The quarterly offsite moves to November.\n"
+    )
+    (settings.workspace_root / "board-minutes.md").write_text(minutes, encoding="utf-8")
+    engine = Engine(settings)
+    engine.scan(target_id="fs:board-minutes.md", use_model=False)
+    engine.record_lineage(
+        source_ids=["fs:board-minutes.md"], output_id="fs:generated-summary.md",
+        relation="SUMMARIZED_FROM", evidence_type="instrumented", evidence_ref="live-test",
+    )
+    plan = engine.plan(target_id=SOURCE_ID, use_model=False)
+    item = next(i for i in plan["items"] if i["record_id"] == "fs:generated-summary.md")
+    assert item["proposed_action"] == "REGENERATE_FROM_ALLOWED_SOURCES"
+    applied = approve_and_apply(engine, plan)
+    result = next(r for r in applied["results"] if r.get("record_id") == "fs:generated-summary.md")
+    # Either the model's rewrite passed the leak check and was written, or it was
+    # refused and the original was left alone. Never a silent leak.
+    receipt = engine.verify(request_id=applied["request_id"])
+    if result["result"] == "success":
+        assert receipt["counts"]["residual_matches"] == 0
+    else:
+        assert result["error_code"] in {"regenerate_leak", "regenerate_failed"}
+        assert receipt["status"] == "PARTIAL"

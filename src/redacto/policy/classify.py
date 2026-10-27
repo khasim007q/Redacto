@@ -54,6 +54,7 @@ def propose_action(
     partial_match: bool = False,
     content_overlap: float = 1.0,
     redactable: bool = False,
+    regenerable: bool = False,
 ) -> tuple[str, bool, str]:
     """Return (action, approved_for_plan, collateral_risk).
 
@@ -68,6 +69,12 @@ def propose_action(
         return REVIEW_REQUIRED, False, "high"
     if evidence_class not in {DIRECT_MATCH, CONFIRMED_DESCENDANT}:
         return REVIEW_REQUIRED, False, "high"
+
+    # A derivative that also has sources which are not being revoked can be
+    # rewritten from those sources instead of being lost. Only offered when the
+    # engine found such sources and the store can rewrite the record in place.
+    if regenerable and evidence_class == CONFIRMED_DESCENDANT and capabilities.get("regenerate"):
+        return REGENERATE, True, "medium"
 
     # A substring match inside a larger, useful record is not a safe automatic
     # delete: hold it for review so the reviewer sees the collateral damage.
@@ -197,4 +204,5 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "expected_fingerprint": item.get("expected_fingerprint"),
         "fingerprint_key_version": item.get("fingerprint_key_version"),
         "redact_spans": item.get("redact_spans") or [],
+        "regen_sources": item.get("regen_sources") or [],
     }
