@@ -39,7 +39,7 @@ def test_uncertain_classes_are_never_approved():
 def test_plan_builds_items_and_impact(engine):
     plan = engine.plan(target_id=SOURCE_ID)
     impact = plan["estimated_impact"]
-    assert impact == {"delete": 5, "invalidate": 2, "review": 2, "preserve": 4, "unreachable": 0}
+    assert impact == {"delete": 5, "redact": 0, "regenerate": 0, "invalidate": 2, "review": 2, "preserve": 4, "unreachable": 0}
     assert plan["approval_required"] is True
     assert all(
         item["approved"] is False

@@ -108,6 +108,8 @@ def compute_plan_hash(
 def estimated_impact(items: Sequence[dict[str, Any]]) -> dict[str, int]:
     impact = {
         "delete": 0,
+        "redact": 0,
+        "regenerate": 0,
         "invalidate": 0,
         "review": 0,
         "preserve": 0,
@@ -117,6 +119,10 @@ def estimated_impact(items: Sequence[dict[str, Any]]) -> dict[str, int]:
         action = item["proposed_action"]
         if action == classify.DELETE_RECORD:
             impact["delete"] += 1
+        elif action == classify.REDACT_SPAN:
+            impact["redact"] += 1
+        elif action == classify.REGENERATE:
+            impact["regenerate"] += 1
         elif action in {classify.INVALIDATE_INDEX, classify.INVALIDATE_CACHE}:
             impact["invalidate"] += 1
         elif action == classify.REVIEW_REQUIRED:
