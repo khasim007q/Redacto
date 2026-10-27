@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from pydantic import BaseModel, Field
@@ -23,6 +24,26 @@ class AdapterError(RuntimeError):
         self.retryable = retryable
 
 
+def rewrite_temp_prefix(path: Path) -> str:
+    """Prefix for the temp file a store rewrite writes before `os.replace`."""
+    return f".{path.name}.redacto-"
+
+
+def leftover_rewrite_temps(path: Path) -> list[Path]:
+    """Temp copies of `path` left behind by an interrupted rewrite.
+
+    Each holds the whole store as it was before the delete, secrets included.
+    `tmp*.tmp` is the name older Redacto versions used.
+    """
+    parent = path.parent
+    try:
+        found = set(parent.glob(rewrite_temp_prefix(path) + "*.tmp"))
+        found.update(parent.glob("tmp*.tmp"))
+    except OSError:
+        return []
+    return sorted(p for p in found if p.is_file())
+
+
 class Record(BaseModel):
     """A scannable unit in a store. Content is transient and never persisted."""
 
@@ -31,6 +52,11 @@ class Record(BaseModel):
     store_id: str
     locator: dict[str, str] = Field(default_factory=dict)
     content: str = ""
+    # Primary payload text used for match-ratio sizing, or None when the whole
+    # `content` is the payload (files). Structured stores put metadata fields and
+    # keys into `content` so they are scanned, but they must not inflate the
+    # denominator when deciding how much of a record a match covers.
+    core_content: str | None = None
     sensitivity: list[str] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
 
@@ -117,6 +143,10 @@ class StoreAdapter(ABC):
     @abstractmethod
     def verify_absent(self, fingerprint: str) -> tuple[bool, list[str]]:
         """Return (absent_confirmed, limitations) using only supported methods."""
+
+    def leftover_temp_files(self) -> list[Path]:
+        """Uncontrolled copies of this store on disk (for example crashed rewrites)."""
+        return []
 
     def health(self) -> dict[str, object]:
         """Cheap reachability probe used by redacto_status; never leaks content."""

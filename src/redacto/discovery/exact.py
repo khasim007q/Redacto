@@ -76,9 +76,19 @@ class ExactMatcher:
         if self._include_identity and record.locator == self._target_locator:
             return ExactMatch("locator", "Same adapter locator as the target.", length, length)
         loose = normalize_loose(record.content)
-        if self._target_loose and loose == self._target_loose:
+        # Whole-copy equality is checked against the record's primary text, because
+        # `content` also carries metadata fields that do not change the document.
+        core = record.core_content if record.core_content is not None else record.content
+        loose_core = normalize_loose(core)
+        if self._target_loose and (
+            loose_core == self._target_loose or loose == self._target_loose
+        ):
+            core_len = len(core)
             return ExactMatch(
-                "normalized_content", "Normalized whole-content copy of the target.", length, length
+                "normalized_content",
+                "Normalized whole-content copy of the target.",
+                core_len,
+                core_len,
             )
         if self._target_kind in {"secret", "fact"}:
             for variant in self._variants:
@@ -99,6 +109,15 @@ class ExactMatcher:
                     length,
                 )
         return None
+
+    def value_in(self, text: str) -> bool:
+        """True when a fact/secret value occurs in `text` (normalized or compact)."""
+        loose = normalize_loose(text)
+        if any(normalize_loose(variant) in loose for variant in self._variants):
+            return True
+        if self._target_kind == "secret" and self._compact:
+            return self._compact in _COMPACT_SEPARATORS.sub("", text).casefold()
+        return False
 
 
 def extract_entities(text: str) -> set[str]:

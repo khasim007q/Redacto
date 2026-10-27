@@ -39,11 +39,16 @@ def issue_approval(
         "APPROVED",
         "EXECUTING",
         "FAILED",
+        "VERIFYING",
+        "PARTIAL",
     }:
         raise ValueError("plan_not_approvable")
     ref = approval_ref.strip()
     if not (MIN_APPROVAL_REF_LEN <= len(ref) <= MAX_APPROVAL_REF_LEN):
-        raise ValueError("invalid_approval_ref")
+        raise ValueError(
+            f"invalid_approval_ref: must be {MIN_APPROVAL_REF_LEN}-{MAX_APPROVAL_REF_LEN} "
+            "characters after trimming"
+        )
 
     token = secrets.token_urlsafe(32)
     approval_id, expires_at = repo.create_approval(

@@ -48,11 +48,11 @@ from redacto.status import collect_status
 TARGET_KINDS = {"source", "fact", "secret"}
 MODES = {"source_revocation", "fact_revocation"}
 TERMINAL_PLAN_STATES = {
-    # EXECUTING and FAILED are deliberately recoverable: a crashed or failed apply
-    # can be re-approved, and per-action keys make retries safe.
+    # EXECUTING, FAILED and PARTIAL are deliberately recoverable: a crashed, failed
+    # or partially failed apply can be re-approved and retried. VERIFYING means the
+    # apply already completed and is waiting for verification.
     "VERIFYING",
     "VERIFIED_WITHIN_SCOPE",
-    "PARTIAL",
     "NEEDS_REVIEW",
     "CANCELLED",
 }
@@ -147,13 +147,34 @@ class Engine:
 
     def _require_record(self, record_id: str) -> dict[str, Any]:
         record = self.repo.get_record(record_id)
-        if record is None:
-            raise RedactoError(
-                "unknown_record",
-                "The target record is not in the configured provenance graph.",
-                {"record_id": record_id},
-            )
-        return record
+        if record is not None:
+            return record
+        # A brand-new workspace has no graph yet. Discover the target across the
+        # configured stores so `scan`/`plan` work without a separate ingest step.
+        discovered = self._discover_record(record_id)
+        if discovered is not None:
+            return discovered
+        raise RedactoError(
+            "unknown_record",
+            "The target record is not in the configured provenance graph and was not "
+            "found in any configured store. Check the store paths and the target id.",
+            {"record_id": record_id, "known_example": "fs:acquisition-plan.md"},
+        )
+
+    def _discover_record(self, record_id: str) -> dict[str, Any] | None:
+        for slot in self.adapters().values():
+            if slot.adapter is None:
+                continue
+            try:
+                records = list(slot.adapter.list_records(limit=self.settings.max_scan_records))
+            except AdapterError:
+                continue
+            capabilities = self._record_capabilities(slot.adapter_id, slot)
+            for candidate in records:
+                if candidate.record_id == record_id:
+                    self._upsert_scanned(candidate, capabilities)
+                    return self.repo.get_record(record_id)
+        return None
 
     def _scope_stores(self, stores: Sequence[str] | None) -> list[str]:
         configured = list(self.adapters().keys())
@@ -398,10 +419,10 @@ class Engine:
             raise RedactoError("invalid_target_kind", f"target_kind must be one of {sorted(TARGET_KINDS)}")
         if not 1 <= depth <= 5:
             raise RedactoError("invalid_depth", "depth must be between 1 and 5")
-        record = self._require_record(target_id)
-        scope_stores = self._scope_stores(stores)
         # Fail with the key-ring reason before any adapter reports target_unreachable.
         guard = self.guard()
+        scope_stores = self._scope_stores(stores)
+        record = self._require_record(target_id)
         target_content = self._target_content(record, target_kind, target_text)
         embedder = self.embedder()
         target_embedding = (
@@ -526,8 +547,10 @@ class Engine:
                 # not re-admitted as a fresh candidate.
                 continue
             capabilities = self._record_capabilities(scanned_record.store_id, slots[scanned_record.store_id])
-            size = len(scanned_record.content.encode("utf-8"))
-            ratio = overlap_ratio(target_content, scanned_record.content)
+            core = scanned_record.core_content
+            sizing_text = core or scanned_record.content
+            size = len(sizing_text.encode("utf-8"))
+            ratio = overlap_ratio(target_content, sizing_text)
             common = {
                 "content_overlap": ratio,
                 "size_bytes": size,
@@ -539,9 +562,19 @@ class Engine:
             }
             match = matcher.match(scanned_record)
             if match is not None:
-                size = len(scanned_record.content.encode("utf-8"))
+                size = len(sizing_text.encode("utf-8"))
                 if match.kind in {"record_id", "locator", "normalized_content"}:
                     matched, ratio = size, 1.0
+                elif core is not None:
+                    # Structured record: size against the payload that a delete would
+                    # destroy. A value found outside the payload (a nested argument,
+                    # a metadata field, a key) adds only itself to that payload.
+                    matched = match.matched_chars
+                    size = len(core.encode("utf-8"))
+                    if not matcher.value_in(core):
+                        size += matched
+                    matched = min(matched, size)
+                    ratio = (matched / size) if size else 0.0
                 else:
                     matched = min(match.matched_chars or size, size)
                     ratio = (matched / size) if size else 0.0
@@ -569,8 +602,8 @@ class Engine:
             if record_id in descendant_by_id:
                 node = descendant_by_id[record_id]
                 last_edge = node.via[-1] if node.via else {}
-                size = len(scanned_record.content.encode("utf-8"))
-                ratio = overlap_ratio(target_content, scanned_record.content)
+                size = len(sizing_text.encode("utf-8"))
+                ratio = overlap_ratio(target_content, sizing_text)
                 candidates[record_id] = self._candidate(
                     record_id=record_id,
                     store_id=scanned_record.store_id,
@@ -1821,7 +1854,7 @@ class Engine:
     # --------------------------------------------------------------- approve
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
-        recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED"})
+        recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED", "PARTIAL"})
         # A lease can be left behind in any state, including before EXECUTING.
         # Refuse while its owner is alive; clear it when the owner is gone.
         lease = self.repo.plan_execution_lease(plan_id)
@@ -1874,7 +1907,11 @@ class Engine:
 
         plan = self.repo.get_plan(plan_id)
         if plan is None:
-            raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
+            raise RedactoError(
+                "unknown_plan",
+                f"No such plan in the graph database at {self.settings.db_path}.",
+                {"plan_id": plan_id, "db_path": str(self.settings.db_path)},
+            )
         # A plan that already applied its actionable items can still have unresolved
         # review items (for example a small secret inside a large handbook). Refusing
         # review here would strand that revocation forever.
@@ -1963,7 +2000,11 @@ class Engine:
     def cancel_plan(self, *, plan_id: str, reason: str = "") -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
         if plan is None:
-            raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
+            raise RedactoError(
+                "unknown_plan",
+                f"No such plan in the graph database at {self.settings.db_path}.",
+                {"plan_id": plan_id, "db_path": str(self.settings.db_path)},
+            )
         if plan["state"] == "CANCELLED":
             return {"ok": True, "plan_id": plan_id, "state": "CANCELLED", "already_cancelled": True}
         if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED"}:
@@ -2033,7 +2074,7 @@ class Engine:
         if (
             not simulate
             and plan is not None
-            and plan["state"] in {"APPROVED", "EXECUTING", "FAILED"}
+            and plan["state"] in {"APPROVED", "EXECUTING", "FAILED", "PARTIAL"}
         ):
             # Validate the token before taking the lease, so a forged token can never
             # block a legitimate apply.
@@ -2094,7 +2135,11 @@ class Engine:
     ) -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
         if plan is None:
-            raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
+            raise RedactoError(
+                "unknown_plan",
+                f"No such plan in the graph database at {self.settings.db_path}.",
+                {"plan_id": plan_id, "db_path": str(self.settings.db_path)},
+            )
         if plan["state"] == "CANCELLED":
             raise RedactoError(
                 "plan_cancelled",
@@ -2372,6 +2417,15 @@ class Engine:
                         "content_changed" if exc.code == "content_changed" else "failed",
                     )
                     counts["failed"] += 1
+                    hint = ""
+                    lowered = str(exc).lower()
+                    if any(
+                        word in lowered
+                        for word in ("locked", "in use", "being used", "busy", "winerror 32")
+                    ):
+                        hint = " (store is locked or in use; close the writer and retry)"
+                    elif "readonly" in lowered or "read-only" in lowered or "permission" in lowered:
+                        hint = " (store is read-only or not writable)"
                     results.append(
                         {
                             "item_id": item["item_id"],
@@ -2380,7 +2434,7 @@ class Engine:
                             "operation": action,
                             "result": "failed",
                             "error_code": exc.code,
-                            "message": str(exc),
+                            "message": str(exc) + hint,
                         }
                     )
                 continue
@@ -2528,6 +2582,7 @@ class Engine:
         slots = self.adapters()
         store_results: list[dict[str, Any]] = []
         residual_total = 0
+        seen_temp_files: set[str] = set()
 
         for store in verify_stores:
             slot = slots.get(store)
@@ -2606,6 +2661,16 @@ class Engine:
                         record.content, target_fingerprint, normalized_len, verify_key
                     ):
                         residuals.append(record.record_id)
+            # A temp copy left by an interrupted rewrite holds the store as it was
+            # before the delete. It is not a record, so it cannot be rescanned like
+            # one, and absence is never claimed while it exists.
+            leftover_temps = [
+                path
+                for path in slot.adapter.leftover_temp_files()
+                if str(path) not in seen_temp_files
+            ]
+            seen_temp_files.update(str(path) for path in leftover_temps)
+            residuals.extend(f"tempfile:{path.name}" for path in leftover_temps)
             residual_total += len(residuals)
             outcome = "verified" if not residuals else "residual"
             if key_unavailable or truncated:
@@ -2624,6 +2689,12 @@ class Engine:
                 limitations.append(
                     f"Record cap reached ({limit}); some records were not rescanned and "
                     "absence is not claimed for them."
+                )
+            if leftover_temps:
+                limitations.append(
+                    "Leftover temp copies of this store from an interrupted rewrite may hold "
+                    "the revoked content; delete them and verify again: "
+                    + ", ".join(str(path) for path in leftover_temps)
                 )
             if key_unavailable:
                 limitations.append(

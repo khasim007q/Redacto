@@ -637,7 +637,7 @@ class Repository:
             row = conn.execute(
                 """SELECT * FROM approvals
                    WHERE plan_id = ? AND plan_version = ? AND approval_ref = ?
-                   ORDER BY created_at DESC LIMIT 1""",
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
                 (plan_id, plan_version, approval_ref),
             ).fetchone()
         return _row(row)

@@ -179,7 +179,9 @@ def test_sqlite_adapter_verifies_fingerprint_atomically(tmp_path):
             key="k",
         )
     assert excinfo.value.code == "content_changed"
-    assert adapter.read_record({"table": "memories", "id": "mem-summary-paraphrase"}).content == "changed"
+    current = adapter.read_record({"table": "memories", "id": "mem-summary-paraphrase"})
+    assert "changed" in current.content
+    assert current.core_content == "changed"
 
 
 def test_filesystem_adapter_verifies_fingerprint(tmp_path):

@@ -14,7 +14,14 @@ import tempfile
 from pathlib import Path
 from typing import Iterable
 
-from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
+from redacto.adapters.base import (
+    AdapterError,
+    Capabilities,
+    Record,
+    StoreAdapter,
+    leftover_rewrite_temps,
+    rewrite_temp_prefix,
+)
 from redacto.discovery.normalization import fingerprint
 
 
@@ -71,7 +78,11 @@ class JsonlLogAdapter(StoreAdapter):
         # Stable across line shifts and independent of the line number.
         return "sha-" + fingerprint(line, self._key)[:24]
 
-    _IDENTITY_KEYS = {
+    # Values that are Redacto's own bookkeeping, never user content.
+    _INTERNAL_KEYS = {"_line_index", "_event_id", "_malformed"}
+    # Event metadata. Scanned for secrets in `_content`, but excluded from the
+    # primary text used for match-ratio sizing.
+    _METADATA_KEYS = {
         "event_id",
         "id",
         "kind",
@@ -79,34 +90,94 @@ class JsonlLogAdapter(StoreAdapter):
         "timestamp",
         "created_at",
         "sensitivity",
-        "_line_index",
-        "_event_id",
-        "_malformed",
     }
+    MAX_WALK_DEPTH = 64
 
     @classmethod
     def _content(cls, payload: dict) -> str:
-        """Every string value in the event, including nested tool-call arguments.
+        """Every key and string value in the event, at any depth.
 
-        Identity/metadata keys are skipped so a record id cannot masquerade as
-        content, but arguments, payloads and nested objects are all scanned.
+        Dict *keys* are included, so `args: {"id": "<secret>"}` is visible. Identity
+        fields such as `event_id`, `kind`, `ts` and `sensitivity` are included too: a
+        secret stored in one of them is still a secret on disk. Only Redacto's own
+        private markers are skipped.
         """
         parts: list[str] = []
+        seen: set[int] = set()
 
         def walk(value, depth: int = 0) -> None:
-            if depth > 8:
+            if depth > cls.MAX_WALK_DEPTH:
                 return
             if isinstance(value, str):
                 if value:
                     parts.append(value)
-            elif isinstance(value, dict):
+                return
+            if isinstance(value, (dict, list)):
+                marker = id(value)
+                if marker in seen:
+                    return
+                seen.add(marker)
+            if isinstance(value, dict):
                 for key, item in value.items():
-                    if key in cls._IDENTITY_KEYS:
+                    key_text = str(key)
+                    if key_text in cls._INTERNAL_KEYS:
+                        continue
+                    if key_text:
+                        parts.append(key_text)
+                    walk(item, depth + 1)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, depth + 1)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                parts.append(str(value))
+
+        walk(payload)
+        return "\n".join(parts)
+
+    @classmethod
+    def _primary_text(cls, payload: dict) -> str:
+        """The event's payload text: string values only, no keys, no bookkeeping.
+
+        Used for match-ratio sizing. Keys such as `arguments` or `headers` are
+        excluded so they do not inflate the denominator. When the event has a
+        canonical content field, that field is the primary text.
+        """
+        canonical = [
+            str(payload.get(key))
+            for key in ("content", "text", "message", "output")
+            if isinstance(payload.get(key), str) and payload.get(key)
+        ]
+        if canonical:
+            return "\n".join(canonical)
+        parts: list[str] = []
+        seen: set[int] = set()
+
+        def walk(value, depth: int = 0) -> None:
+            if depth > cls.MAX_WALK_DEPTH:
+                return
+            if isinstance(value, str):
+                if value:
+                    parts.append(value)
+                return
+            if isinstance(value, (dict, list)):
+                marker = id(value)
+                if marker in seen:
+                    return
+                seen.add(marker)
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if str(key) in cls._INTERNAL_KEYS:
+                        continue
+                    # Event metadata is only metadata at the top level; a nested
+                    # `args.id` is a tool-call argument, i.e. payload.
+                    if depth == 0 and str(key) in cls._METADATA_KEYS:
                         continue
                     walk(item, depth + 1)
             elif isinstance(value, list):
                 for item in value:
                     walk(item, depth + 1)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                parts.append(str(value))
 
         walk(payload)
         return "\n".join(parts)
@@ -119,6 +190,7 @@ class JsonlLogAdapter(StoreAdapter):
             store_id=self.store_id,
             locator={"event_id": event_id, "line": str(payload["_line_index"])},
             content=self._content(payload),
+            core_content=self._primary_text(payload),
             sensitivity=[str(payload.get("sensitivity"))] if payload.get("sensitivity") else ["unknown"],
             metadata={"kind": str(payload.get("kind", ""))},
         )
@@ -233,15 +305,26 @@ class JsonlLogAdapter(StoreAdapter):
         )
 
     def _atomic_write(self, content: str) -> None:
+        tmp: str | None = None
         try:
             mode = stat.S_IMODE(self._path.stat().st_mode)
-            fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
+            fd, tmp = tempfile.mkstemp(
+                dir=str(self._path.parent), prefix=rewrite_temp_prefix(self._path), suffix=".tmp"
+            )
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
             os.chmod(tmp, mode)
             os.replace(tmp, self._path)
+            tmp = None
         except OSError as exc:
             raise AdapterError(f"jsonl delete failed: {exc}", code="delete_failed") from exc
+        finally:
+            # A failed replace must not leave a temp copy of the log (secrets included).
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def write_record(self, record: Record) -> None:
         event_id = record.locator.get("event_id")
@@ -261,6 +344,9 @@ class JsonlLogAdapter(StoreAdapter):
                 handle.write(prefix + json.dumps(payload, ensure_ascii=False) + "\n")
         except OSError as exc:
             raise AdapterError(f"jsonl write failed: {exc}", code="write_failed") from exc
+
+    def leftover_temp_files(self) -> list[Path]:
+        return leftover_rewrite_temps(self._path)
 
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = 0
