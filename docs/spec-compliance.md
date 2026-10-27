@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **197 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **233 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule

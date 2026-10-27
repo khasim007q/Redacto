@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 197 automated tests pass (`pytest`).
+- 233 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -37,8 +37,14 @@ is **off by default**; with no provider configured its candidates are unassessed
 - Secret verification rescans every reachable store for the value itself, not the anchor,
   using separator-insensitive windowed matching, so `STRIPE_KEY=...`, `key:...`,
   `?token=...` and a value glued to other text are all detected.
-- Logs and vector chunks are scanned across every string field, including nested tool-call
-  arguments and chunk metadata.
+- Every field is scanned: JSONL events (all keys and values at any depth, including
+  nested tool-call arguments), vector chunks (`text`, `content`, `page_content`, nested
+  metadata, any other field) and every column of the approved SQLite tables.
+- A whole-document copy carrying extra metadata (a chunk with `metadata.source`, a
+  `read_file` event) is a `DIRECT_MATCH`, not a review item.
+- A revoked value sitting in a record id, locator, sensitivity label or `created_at` is
+  replaced by an opaque alias, so it never appears in plans, results, receipts or the
+  graph DB.
 - Verification is scoped and enforced by code, not by wording in a prompt.
 - Plans show blast radius (record bytes, match share, collateral risk). A substring
   match inside a larger record is held for review instead of auto-deleted, and a
@@ -53,7 +59,7 @@ is **off by default**; with no provider configured its candidates are unassessed
 uv venv --python 3.12 .venv
 uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 
-# 2. Seed the synthetic workspace + provenance graph
+# 2. Seed the synthetic workspace + provenance graph (refuses to overwrite real data)
 .venv\Scripts\python.exe -m redacto seed
 
 # 3. Test suite
@@ -63,7 +69,34 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 .venv\Scripts\python.exe -m redacto demo
 ```
 
-The demo writes `var/demo_receipt.json` and `var/demo_receipt.md`.
+On Linux/macOS use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
+
+The demo runs in a fresh temp workspace and never touches your configured stores
+(`--use-configured` opts in). It writes `var/demo_receipt.json` and `var/demo_receipt.md`.
+
+`seed` refuses with `seed_would_destroy_data` when the workspace holds files it did not
+create, the memory store has extra tables, or the graph has tombstones or revocation
+history. `seed --force` overrides that. It writes the memory store to
+`REDACTO_SQLITE_PATH` and `expected_results.json` next to the graph DB.
+
+Settings come from `REDACTO_*` environment variables. A `.env` file in the working
+directory (copy `.env.example`) is read at startup; real environment variables win.
+
+### Using your own workspace
+
+No seed or ingest step is needed: point the `REDACTO_*` paths at your stores and plan
+against a record id (`fs:<relative path>`, `mem:<id>`, `cache:<id>`, `log:<event_id>`,
+`vec:<chunk id>`). An id that is not in the graph yet is looked up in the stores.
+
+| Store | Format Redacto reads |
+|---|---|
+| Filesystem | `.md` / `.txt` files under `REDACTO_WORKSPACE_ROOT` |
+| SQLite | tables `memories` and/or `response_cache`, each with an `id` column; every column is scanned. Other tables are listed in `status` as unscanned. |
+| JSONL log | one JSON object per line; `event_id` is the id (a keyed line hash when absent) |
+| Vector fixture | `{"chunks": [{"id": ..., "text": ..., "metadata": {...}}, ...]}` |
+
+Review items are approved with `review-item` before or after apply; an approved item
+bumps the plan version, so approve the plan again and re-run apply.
 
 ### Other commands
 
@@ -75,7 +108,8 @@ python -m redacto plan   --target-id "fs:acquisition-plan.md"
 python -m redacto approve --plan-id <PLAN_ID> --ref "operator approval"
 python -m redacto review-item --plan-id <PLAN_ID> --item-id <ITEM_ID> --decision approved|rejected --reviewer "reviewer-id"
 python -m redacto cancel --plan-id <PLAN_ID> --reason "operator stopped"
-python -m redacto apply  --plan-id <PLAN_ID> --version 1 --ref "operator approval" --token <TOKEN> [--dry-run]
+python -m redacto apply  --plan-id <PLAN_ID> --version 1 --ref "operator approval" --token <TOKEN> [--dry-run | --no-dry-run]
+# without a flag, apply follows REDACTO_DRY_RUN, exactly like MCP redacto_apply
 python -m redacto verify --request-id <REQUEST_ID> --out var\receipt.json --markdown var\receipt.md
 python -m redacto tombstones                       # active tombstones, no content
 python -m redacto ingest                           # re-run the guard over configured stores
@@ -260,8 +294,10 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Failures are never reported as success: adapter errors produce per-record failures
   and a `PARTIAL` result.
 - Approval consumption is atomic: one token cannot authorize two concurrent applies.
-- A crashed or failed apply is recoverable: re-approving an `EXECUTING`/`FAILED` plan
-  issues a new token; completed actions are skipped and failed actions are retried.
+- A crashed, failed or partially failed apply is recoverable: re-approving an
+  `EXECUTING`/`FAILED`/`PARTIAL` plan issues a new token; completed actions are skipped and
+  failed actions are retried. A failure caused by a locked or read-only store says so,
+  so on Windows you can close the agent holding the log open and re-approve.
   A cancelled plan cannot be applied. Apply holds an exclusive lease so concurrent
   recovery tokens cannot both report the same work.
 - Plan item reviews are audited; approving one bumps the plan version and invalidates
@@ -286,7 +322,10 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Record-cap truncation is reported in scan coverage and verification; absence is not
   claimed for unscanned records.
 - SQLite deletes set `PRAGMA secure_delete=ON` and attempt a WAL truncate checkpoint.
-  Files are unlinked, not overwritten, and JSONL/vector rewrites keep the original mode.
+  Files are unlinked, not overwritten, and JSONL/vector rewrites keep the original mode
+  and LF line endings. A rewrite that fails removes its temp file. Leftover temp copies
+  (`.<store>.redacto-*.tmp`, or `tmp*.tmp` from older versions) are listed by `status` and
+  counted as residuals by `verify` until you delete them.
 - Files under a configured root with other extensions are not scanned; `redacto_status`
   reports them per adapter so the gap is visible.
 - Tombstones retain keyed HMAC fingerprints, derived anchors and an embedding vector.
@@ -309,7 +348,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-197 passed in 70.61s
+233 passed in 61s (Windows 11, Python 3.12)
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
