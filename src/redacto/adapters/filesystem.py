@@ -120,9 +120,14 @@ class FilesystemAdapter(StoreAdapter):
                 current = path.stat()
             except OSError as exc:
                 raise AdapterError(f"filesystem stat failed: {exc}", code="read_failed") from exc
+            # Both identity and stamp must match. The inode alone is not enough:
+            # an in-place edit keeps the inode and changes the content.
             same_file = (current.st_dev, current.st_ino) == (stats.st_dev, stats.st_ino)
-            same_stamp = (current.st_size, current.st_mtime_ns) == (stats.st_size, stats.st_mtime_ns)
-            if not (same_file or same_stamp):
+            same_stamp = (current.st_size, current.st_mtime_ns) == (
+                stats.st_size,
+                stats.st_mtime_ns,
+            )
+            if not (same_file and same_stamp):
                 raise AdapterError(
                     "record was replaced during apply", code="content_changed"
                 )

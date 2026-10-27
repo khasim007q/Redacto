@@ -189,8 +189,48 @@ class JsonlLogAdapter(StoreAdapter):
                 raise AdapterError(
                     "record content changed since planning", code="content_changed"
                 )
-        remaining = [line for index, line in enumerate(raw_lines) if index != target]
-        self._atomic_write("\n".join(remaining) + ("\n" if remaining else ""))
+        self._remove_line(event_id, preferred_line=target, key=key or self._key)
+
+    def _remove_line(
+        self, event_id: str, *, preferred_line: int | None, key: str
+    ) -> None:
+        """Remove one event without dropping lines appended concurrently.
+
+        The file is read, edited and re-checked before replacing. If another writer
+        appended (or rewrote) in between, the edit is recomputed from the new
+        content instead of overwriting it with a stale snapshot.
+        """
+        for _attempt in range(5):
+            original = self._path.read_text(encoding="utf-8")
+            raw_lines = original.splitlines()
+            matches: list[int] = []
+            for index, line in enumerate(raw_lines):
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                    if not isinstance(payload, dict):
+                        payload = {"_malformed": True, "content": line}
+                except json.JSONDecodeError:
+                    payload = {"_malformed": True, "content": line}
+                if self._event_id(payload, index, line) == event_id:
+                    matches.append(index)
+            if not matches:
+                raise AdapterError("record no longer exists", code="not_found")
+            target = preferred_line if preferred_line in matches else matches[0]
+            remaining = [line for index, line in enumerate(raw_lines) if index != target]
+            new_content = "\n".join(remaining) + ("\n" if remaining else "")
+
+            current = self._path.read_text(encoding="utf-8")
+            if current != original:
+                continue  # someone else changed the file; recompute from fresh state
+            self._atomic_write(new_content)
+            return
+        raise AdapterError(
+            "jsonl log kept changing during delete; no line was removed",
+            code="delete_conflict",
+            retryable=True,
+        )
 
     def _atomic_write(self, content: str) -> None:
         try:

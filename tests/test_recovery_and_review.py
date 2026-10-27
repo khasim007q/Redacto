@@ -368,10 +368,34 @@ def _backdate_lease(engine, plan_id: str, seconds: int) -> None:
         conn.close()
 
 
-def test_recovery_approval_clears_a_stale_execution_lease(engine):
+def test_a_slow_live_apply_never_loses_its_lease(engine):
     plan = engine.plan(target_id=SOURCE_ID)
     token = engine.repo.claim_plan_execution(plan["plan_id"])
     assert token
+    engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
+    # Two hours old, but the owning process (this one) is alive: not stale.
+    _backdate_lease(engine, plan["plan_id"], 7200)
+    with pytest.raises(RedactoError) as excinfo:
+        engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
+    assert excinfo.value.code == "apply_in_progress"
+    assert engine.repo.plan_execution_lease(plan["plan_id"]) is not None
+
+
+def test_recovery_clears_a_lease_whose_owner_host_is_unknown_and_old(engine):
+    import socket
+
+    plan = engine.plan(target_id=SOURCE_ID)
+    token = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert token
+    conn = __import__("sqlite3").connect(engine.settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE revocation_plans SET execution_host = ? WHERE plan_id = ?",
+            ("another-host-" + socket.gethostname(), plan["plan_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     engine.repo.set_plan_state(plan["plan_id"], "EXECUTING")
     _backdate_lease(engine, plan["plan_id"], 7200)
     recovery = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="recovery")
@@ -460,6 +484,34 @@ def test_forged_token_never_takes_the_lease(engine):
         plan_id=plan["plan_id"],
         plan_version=plan["plan_version"],
         approval_ref="real",
+        confirmation_token=approval["confirmation_token"],
+    )
+    assert applied["counts"]["succeeded"] == 7
+
+
+def test_stuck_lease_before_executing_is_cleared_by_approval(engine):
+    """A process can die after taking the lease but before EXECUTING."""
+    plan = engine.plan(target_id=SOURCE_ID)
+    token = engine.repo.claim_plan_execution(plan["plan_id"])
+    assert token
+    conn = __import__("sqlite3").connect(engine.settings.db_path)
+    try:
+        conn.execute(
+            "UPDATE revocation_plans SET execution_pid = ? WHERE plan_id = ?",
+            (999_999, plan["plan_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Plan is still READY_FOR_APPROVAL, not EXECUTING.
+    assert engine.repo.get_plan(plan["plan_id"])["state"] == "READY_FOR_APPROVAL"
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="stuck-recovery")
+    assert approval["ok"] is True
+    assert engine.repo.plan_execution_lease(plan["plan_id"]) is None
+    applied = engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=plan["plan_version"],
+        approval_ref="stuck-recovery",
         confirmation_token=approval["confirmation_token"],
     )
     assert applied["counts"]["succeeded"] == 7

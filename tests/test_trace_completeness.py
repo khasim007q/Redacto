@@ -254,3 +254,55 @@ def test_secret_verify_catches_a_reintroduced_secret_even_when_planned_records_a
     assert verified["status"] == "PARTIAL"
     filesystem = next(s for s in verified["stores"] if s["store_id"] == "filesystem")
     assert "fs:notes.md" in filesystem["residual_record_ids"]
+
+
+def test_small_secret_mention_waits_for_review_then_verifies_clean(tmp_path):
+    """A 40-byte key inside a 5 KB handbook must not auto-delete the handbook.
+
+    The record is held for review; verify honestly reports PARTIAL until a
+    reviewer approves the item, after which verification is clean.
+    """
+    settings = seeded_settings(tmp_path)
+    handbook = settings.workspace_root / "handbook.md"
+    handbook.write_text(
+        "# Handbook\n\nRotate keys quarterly.\n\n"
+        + "\n".join(f"- Step {i}: check the dashboard." for i in range(120))
+        + f"\n\nOps note: STRIPE_KEY={SECRET}\n",
+        encoding="utf-8",
+    )
+    engine = Engine(settings)
+    plan = engine.plan(
+        target_id=SOURCE_ID, target_kind="secret", target_text=SECRET, mode="fact_revocation"
+    )
+    item = next(i for i in plan["items"] if i["record_id"] == "fs:handbook.md")
+    assert item["evidence_class"] == "DIRECT_MATCH"
+    assert item["proposed_action"] == "REVIEW_REQUIRED"
+    assert item["approved"] is False
+    assert item["match_ratio"] < 0.5
+
+    applied = approve_and_apply(engine, plan)
+    assert handbook.exists()
+    first = engine.verify(request_id=applied["request_id"])
+    assert first["status"] == "PARTIAL"
+    filesystem = next(s for s in first["stores"] if s["store_id"] == "filesystem")
+    assert "fs:handbook.md" in filesystem["residual_record_ids"]
+
+    review = engine.review_plan_item(
+        plan_id=plan["plan_id"],
+        item_id=item["item_id"],
+        decision="approved",
+        reviewer="reviewer-1",
+        note="handbook is 99% unrelated; approve the whole-record delete",
+    )
+    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref="after-review")
+    assert approval["plan_version"] == review["plan_version"]
+    engine.apply(
+        plan_id=plan["plan_id"],
+        plan_version=review["plan_version"],
+        approval_ref="after-review",
+        confirmation_token=approval["confirmation_token"],
+    )
+    final = engine.verify(request_id=applied["request_id"])
+    assert final["counts"]["residual_matches"] == 0
+    assert final["status"] in {"VERIFIED_WITHIN_SCOPE", "NEEDS_REVIEW"}
+    assert not handbook.exists()

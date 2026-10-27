@@ -13,14 +13,13 @@ from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
 from redacto.discovery.embeddings import build_embedder, cosine
 from redacto.discovery.exact import ExactMatcher, shares_entity
-from redacto.discovery.normalization import fingerprint
+from redacto.discovery.normalization import fingerprint, normalize_loose
 from redacto.discovery.relationship_assessor import (
     CandidateContext,
     RelationshipAssessor,
     build_assessor,
     minimize_snippet,
 )
-import errno
 import os
 import socket
 from datetime import datetime, timezone
@@ -42,6 +41,7 @@ from redacto.ingestion import (
     summarize_guard_findings,
 )
 from redacto.policy import authorization, classify
+from redacto.process import pid_alive
 from redacto.policy.plan import build_plan_items, compute_plan_hash, estimated_impact
 from redacto.status import collect_status
 
@@ -69,6 +69,30 @@ GLOBAL_VERIFICATION_LIMITATIONS = [
     "SQLite deletes overwrite rows and attempt a WAL truncate checkpoint; another open writer can delay physical removal.",
     "Files are unlinked rather than overwritten, and files with other extensions under a configured root are not scanned.",
 ]
+
+
+# Shortest normalized value that can be verified by windowed hashing without
+# producing false matches from ordinary words.
+MIN_VERIFIABLE_VALUE_LEN = 8
+
+
+def contains_normalized(
+    content: str, target_fingerprint: str, normalized_len: int, key: str
+) -> bool:
+    """Whether the record contains the revoked value, separator-insensitively.
+
+    The plaintext value is never stored, so verification slides a window of the
+    value's normalized length over the record's normalized text and hashes each
+    window. This catches `STRIPE_KEY=sk-...`, `key:sk-...`, `?token=sk-...` and a
+    value glued to other text, which a whole-token comparison misses.
+    """
+    normalized = normalize_loose(content)
+    if normalized_len <= 0 or len(normalized) < normalized_len:
+        return False
+    for start in range(len(normalized) - normalized_len + 1):
+        if fingerprint(normalized[start : start + normalized_len], key) == target_fingerprint:
+            return True
+    return False
 
 
 def _statement_for(
@@ -1200,6 +1224,11 @@ class Engine:
             target_key_version=self.settings.hmac_key_version,
             target_embedding=material.embedding,
             target_embedding_model=material.embedding_model or None,
+            target_normalized_len=(
+                len(normalize_loose(target_content))
+                if target_kind in {"fact", "secret"}
+                else None
+            ),
         )
         version = self.repo.next_plan_version(request_id)
         plan_hash = compute_plan_hash(
@@ -1793,17 +1822,19 @@ class Engine:
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
         recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED"})
-        if recovery:
-            # Never steal a live execution lease. Only clear it when the owner is
-            # provably gone (dead PID on this host) or the lease is older than the TTL.
-            lease = self.repo.plan_execution_lease(plan_id)
-            if lease is not None and not self._lease_is_stale(lease):
+        # A lease can be left behind in any state, including before EXECUTING.
+        # Refuse while its owner is alive; clear it when the owner is gone.
+        lease = self.repo.plan_execution_lease(plan_id)
+        if lease is not None:
+            if not self._lease_is_stale(lease):
                 raise RedactoError(
                     "apply_in_progress",
                     "This plan is still executing; recovery approval is refused.",
                     {"plan_id": plan_id, "pid": lease.get("execution_pid")},
                 )
             self.repo.clear_plan_execution(plan_id)
+            # Clearing a stale lease is itself a recovery action.
+            recovery = True
         try:
             issued = authorization.issue_approval(
                 self.repo, plan_id=plan_id, approval_ref=approval_ref, ttl_seconds=ttl_seconds
@@ -1844,7 +1875,16 @@ class Engine:
         plan = self.repo.get_plan(plan_id)
         if plan is None:
             raise RedactoError("unknown_plan", "No such plan.", {"plan_id": plan_id})
-        if plan["state"] not in {"READY_FOR_APPROVAL", "APPROVED"}:
+        # A plan that already applied its actionable items can still have unresolved
+        # review items (for example a small secret inside a large handbook). Refusing
+        # review here would strand that revocation forever.
+        if plan["state"] not in {
+            "READY_FOR_APPROVAL",
+            "APPROVED",
+            "VERIFYING",
+            "PARTIAL",
+            "NEEDS_REVIEW",
+        }:
             raise RedactoError(
                 "plan_not_reviewable",
                 "This plan can no longer accept item reviews.",
@@ -1943,23 +1983,21 @@ class Engine:
         }
 
     # ----------------------------------------------------------------- apply
+    # Only used when the lease owner is on another host, where PID liveness
+    # cannot be checked. A live local apply is never stolen, however long it runs.
     EXECUTION_LEASE_SECONDS = 900
 
     def _lease_is_stale(self, lease: dict[str, Any]) -> bool:
-        """A lease is stale when its owner is gone or it has outlived the TTL."""
+        """Whether a lease may be taken over.
+
+        - Same host: the owner PID decides. A live PID is never stale, no matter how
+          old the lease is, so a slow apply cannot lose its lease.
+        - Different host: PID liveness is unknowable, so the TTL decides.
+        """
         pid = lease.get("execution_pid")
         host = lease.get("execution_host")
         if host == socket.gethostname() and pid:
-            try:
-                os.kill(int(pid), 0)
-            except ProcessLookupError:
-                return True
-            except OSError as exc:
-                # Windows reports a dead PID as WinError 87, POSIX as ESRCH.
-                if getattr(exc, "winerror", None) == 87 or exc.errno == errno.ESRCH:
-                    return True
-            except ValueError:
-                pass
+            return not pid_alive(int(pid))
         started = lease.get("execution_started_at")
         if not started:
             return True
@@ -1968,6 +2006,16 @@ class Engine:
         except ValueError:
             return True
         return age.total_seconds() > self.EXECUTION_LEASE_SECONDS
+
+    def _release_stale_lease(self, plan_id: str) -> None:
+        """Clear a lease whose owner is gone, whatever the plan state.
+
+        Covers the stuck case where the process died after claiming the lease but
+        before the plan moved to EXECUTING.
+        """
+        lease = self.repo.plan_execution_lease(plan_id)
+        if lease is not None and self._lease_is_stale(lease):
+            self.repo.clear_plan_execution(plan_id)
 
     def apply(
         self,
@@ -2002,6 +2050,8 @@ class Engine:
                     f"Apply rejected: {token_reason}.",
                     {"reason": token_reason},
                 )
+            # A dead owner's lease must not block the plan forever.
+            self._release_stale_lease(plan_id)
             execution_token = self.repo.claim_plan_execution(plan_id)
             if execution_token is None:
                 raise RedactoError(
@@ -2460,6 +2510,7 @@ class Engine:
             if request["target_kind"] in {"fact", "secret"}
             else set()
         )
+        normalized_len = request.get("target_normalized_len")
         target_key_version = (
             request.get("target_key_version")
             or (target_record or {}).get("fingerprint_key_version")
@@ -2542,6 +2593,18 @@ class Engine:
                         for token_value in token_set(record.content)
                     }
                     if secret_tokens.issubset(record_tokens):
+                        residuals.append(record.record_id)
+                        continue
+                if (
+                    target_fingerprint
+                    and verify_key
+                    and request["target_kind"] in {"fact", "secret"}
+                    and normalized_len
+                    and normalized_len >= MIN_VERIFIABLE_VALUE_LEN
+                ):
+                    if contains_normalized(
+                        record.content, target_fingerprint, normalized_len, verify_key
+                    ):
                         residuals.append(record.record_id)
             residual_total += len(residuals)
             outcome = "verified" if not residuals else "residual"

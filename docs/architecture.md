@@ -217,16 +217,25 @@ sequenceDiagram
   reporting the same work; recovery approval clears a stale lease.
 - **TOCTOU guard**: each plan item stores the record's keyed content fingerprint at plan
   time. The verify-and-mutate happens inside the adapter: SQLite runs the check and delete
-  under `BEGIN IMMEDIATE`, the filesystem adapter re-reads and re-stats before unlinking,
-  and JSONL/vector rewrites re-read before replacing. A mismatch fails with
-  `content_changed`; a missing fingerprint or key version fails `content_unverifiable`.
-- **Execution lease ownership**: the lease stores the token, PID, host and start time. A
-  recovery approval refuses while the owner process is alive and clears the lease when the
-  PID is gone or the lease exceeds 15 minutes. The approval token is validated before the
-  lease is claimed.
+  under `BEGIN IMMEDIATE`, the filesystem adapter re-reads the file and requires both the
+  identity and the size/mtime stamp to match before unlinking, and JSONL/vector rewrites
+  re-read before replacing. A mismatch fails with `content_changed`; a missing fingerprint
+  or key version fails `content_unverifiable`.
+- **Concurrent log writers**: the JSONL delete re-reads the file immediately before
+  replacing it and recomputes from the new content if anything changed, so a concurrently
+  appended line survives. If the file never settles the delete fails with
+  `delete_conflict` rather than silently dropping lines.
+- **Execution lease ownership**: the lease stores the token, PID, host and start time.
+  Liveness uses `OpenProcess` on Windows (never `os.kill(pid, 0)`, which means Ctrl+C
+  there) and `os.kill(pid, 0)` on POSIX. A live local owner is never stolen; a dead owner
+  is cleared in any plan state, including before EXECUTING; the 15-minute TTL applies only
+  to a lease from an unknown host. The approval token is validated before the lease is
+  claimed.
 - **Fact/secret targeting**: the anchor record is a lookup handle only. Identity matching
   is disabled for fact/secret targets, so only records containing the value are actionable.
-  Verification rescans every reachable store for the value's tokens.
+  Verification rescans every reachable store for the value's tokens and, because the
+  plaintext is never stored, slides a window of the value's normalized length over each
+  normalized record to catch `KEY=value`, `key:value`, `?token=value` and glued forms.
 - **Storage hygiene**: SQLite sets `PRAGMA secure_delete=ON` and attempts a WAL truncate
   checkpoint after deletes; JSONL/vector rewrites preserve the original file mode; the
   filesystem adapter reports unscanned file types so the gap is visible.

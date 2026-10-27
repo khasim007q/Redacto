@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **178 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **197 passed**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -361,6 +361,21 @@ Fixed after the "does it remove every trace" audit:
 - verify-and-delete is atomic per adapter (SQLite write lock, filesystem re-read/re-stat);
 - execution leases record owner PID/host, refuse live-owner recovery, and validate the
   token before claiming the lease.
+
+## Fifth review follow-up (Windows CI and lease/verify audit)
+
+- Liveness no longer calls `os.kill(pid, 0)` on Windows (it means Ctrl+C there);
+  `OpenProcess` + `GetExitCodeProcess` is used instead.
+- A lease left by a process that died before EXECUTING is cleared by approval or apply.
+- A live local apply is never stolen by the TTL; the TTL applies only to unknown hosts.
+- The filesystem fingerprint check requires both identity and size/mtime, so in-place
+  edits are refused.
+- The JSONL rewrite re-reads before replacing, so concurrently appended lines survive; an
+  unsettled file raises `delete_conflict`.
+- Secret verification uses separator-insensitive windowed matching, so `KEY=secret`,
+  `key:secret`, `?token=secret` and glued secrets are detected.
+- `review-item` is accepted after apply, so a small secret mention held for review can be
+  resolved instead of stranding the revocation.
 
 ## Remaining deviations worth fixing next
 

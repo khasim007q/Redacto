@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 178 automated tests pass (`pytest`).
+- 197 automated tests pass (`pytest`).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -34,7 +34,9 @@ is **off by default**; with no provider configured its candidates are unassessed
   embeddings never prove lineage and never block on their own.
 - Secret/fact revocation deletes only records that contain the value; the anchor record is
   a lookup handle and is preserved unless it holds the value.
-- Secret verification rescans every reachable store for the value itself, not the anchor.
+- Secret verification rescans every reachable store for the value itself, not the anchor,
+  using separator-insensitive windowed matching, so `STRIPE_KEY=...`, `key:...`,
+  `?token=...` and a value glued to other text are all detected.
 - Logs and vector chunks are scanned across every string field, including nested tool-call
   arguments and chunk metadata.
 - Verification is scoped and enforced by code, not by wording in a prompt.
@@ -265,16 +267,22 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Plan item reviews are audited; approving one bumps the plan version and invalidates
   the old token.
 - Apply takes an exclusive execution lease, so two recovery tokens used at once cannot
-  both report the same work. The lease records the owning PID/host; a recovery approval
-  refuses while the owner is alive and clears the lease only when the owner is gone or the
-  lease exceeds 15 minutes. The token is validated before the lease is taken, so a forged
-  token cannot block a real apply.
+  both report the same work. The lease records the owning PID/host. Liveness uses
+  `OpenProcess` on Windows (never `os.kill(pid, 0)`, which means Ctrl+C there) and
+  `os.kill(pid, 0)` on POSIX. A live local owner is never stolen, however old the lease;
+  a dead owner or a lease from an unknown host older than 15 minutes is cleared, in any
+  plan state. The token is validated before the lease is taken, so a forged token cannot
+  block a real apply.
 - Each plan item stores its plan-time content fingerprint. Adapters verify it as part of the
   mutation: SQLite does the check and delete under one write lock, the filesystem adapter
-  re-reads and re-stats the file before unlinking, and file-backed stores re-read before
-  rewriting. A mismatch fails with `content_changed`.
+  re-reads the file and requires both the identity and the size/mtime stamp to match
+  before unlinking (an in-place edit keeps the inode), and file-backed stores re-read
+  before rewriting. A mismatch fails with `content_changed`.
 - JSONL event identity is stable even without `event_id` (keyed line hash), and
-  malformed lines are matched by that identity rather than a shifted line number.
+  malformed lines are matched by that identity rather than a shifted line number. A log
+  rewrite re-reads the file before replacing it, so a line appended during the rewrite is
+  preserved; if the file never settles the delete fails with `delete_conflict` instead of
+  dropping data.
 - Record-cap truncation is reported in scan coverage and verification; absence is not
   claimed for unscanned records.
 - SQLite deletes set `PRAGMA secure_delete=ON` and attempt a WAL truncate checkpoint.
@@ -301,7 +309,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-178 passed in 90.61s
+197 passed in 70.61s
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
@@ -347,6 +355,10 @@ These are fixture-level engineering targets, not production accuracy claims.
 - **Distinctive amounts/dates:** a record that shares a numeric amount or date with the
   target (score >= 4 on weighted anchors) is `SUSPECTED_DERIVATIVE` for review, so a
   reworded price+closing-date note is never labelled harmless.
+- **Small mentions go to review:** a short secret inside a large record is held for review
+  rather than deleting the whole file. Verification honestly reports `PARTIAL` until a
+  reviewer resolves it with `review-item`, and `review-item` is accepted even after the
+  plan has applied its other items.
 - **Still missing:** precise `REDACT_SPAN` editing, regeneration and a timed undo/trash
   window. Those are documented as remaining work, not silently claimed.
 
@@ -445,7 +457,7 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 
 ```text
 src/redacto/
-  config.py  fixtures.py  engine.py  status.py  receipts.py  errors.py  cli.py
+  config.py  fixtures.py  engine.py  status.py  receipts.py  errors.py  cli.py  process.py
   graph/       schema.py repository.py traversal.py
   discovery/   normalization.py exact.py relationship_assessor.py embeddings.py
   ingestion.py  (tombstone guard, quarantine decisions, fail-closed keys)
@@ -464,6 +476,7 @@ tests/         test_graph.py test_discovery.py test_policy.py test_execution.py
                test_tombstones.py test_quarantine.py test_key_rotation.py test_embeddings.py
                test_evaluation.py test_jsonl.py test_hardening_collateral.py
                test_recovery_and_review.py test_packaging.py test_trace_completeness.py
+               test_windows_and_lease.py
 docs/          architecture.md threat-model.md demo-script.md key-rotation.md
                spec-compliance.md
 ```

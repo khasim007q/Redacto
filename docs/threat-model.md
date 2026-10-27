@@ -84,6 +84,13 @@ destructive or leaking component**.
 | T55 | A rewrite silently changes file permissions | Atomic rewrites restore the original mode | `test_jsonl_rewrite_preserves_file_mode`, `test_vector_rewrite_preserves_file_mode` |
 | T56 | Unscanned file types create invisible gaps | Status reports unscanned files per adapter; scan documents the gap | `test_status_reports_unscanned_files` |
 | T57 | Model snippets leak spelled-out amounts | Snippets mask digit and spelled-out number words | `test_snippet_masks_spelled_out_amounts` |
+| T58 | The lease liveness probe interrupts the host on Windows | `OpenProcess`/`GetExitCodeProcess` on Windows; `os.kill(pid, 0)` only on POSIX | `test_liveness_does_not_use_os_kill_on_windows`, `test_posix_path_uses_os_kill` |
+| T59 | A process dies after taking the lease but before EXECUTING, stranding the plan | Approval and apply clear a dead owner's lease in any plan state | `test_plan_stuck_before_executing_is_recoverable`, `test_stuck_lease_before_executing_is_cleared_by_approval` |
+| T60 | A slow live apply loses its lease to the TTL | A live local owner is never stale; the TTL applies only to unknown hosts | `test_a_slow_live_apply_never_loses_its_lease` |
+| T61 | An in-place file edit passes the fingerprint check | Both file identity and size/mtime must match, and content is re-hashed | `test_in_place_edit_with_same_inode_is_refused` |
+| T62 | A log line appended during a rewrite is lost | The rewrite re-reads before replacing; an unsettled file raises `delete_conflict` | `test_line_appended_during_rewrite_is_not_lost`, `test_delete_conflict_is_reported_when_the_file_never_settles` |
+| T63 | Verify misses `KEY=secret`, `key:secret`, `?token=secret` or a glued secret | Verification uses separator-insensitive windowed matching over the normalized record | `test_verify_flags_config_style_secret`, `test_contains_normalized_matches_config_style_forms` |
+| T64 | A small secret mention is stranded after apply | `review-item` is accepted on VERIFYING/PARTIAL/NEEDS_REVIEW plans | `test_small_secret_mention_waits_for_review_then_verifies_clean` |
 
 ## Residual risks (accepted, disclosed)
 

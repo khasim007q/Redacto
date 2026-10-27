@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS revocation_requests (
     target_label_redacted TEXT,
     target_key_version INTEGER,
     target_embedding_json TEXT NOT NULL DEFAULT '[]',
-    target_embedding_model TEXT
+    target_embedding_model TEXT,
+    target_normalized_len INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS revocation_plans (

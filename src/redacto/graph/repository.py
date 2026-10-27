@@ -75,6 +75,7 @@ class Repository:
             "target_key_version": "INTEGER",
             "target_embedding_json": "TEXT NOT NULL DEFAULT '[]'",
             "target_embedding_model": "TEXT",
+            "target_normalized_len": "INTEGER",
             "target_fingerprint": "TEXT",
             "target_shingles_json": "TEXT NOT NULL DEFAULT '[]'",
             "target_anchors_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -326,6 +327,7 @@ class Repository:
         target_key_version: int | None = None,
         target_embedding: Sequence[float] = (),
         target_embedding_model: str | None = None,
+        target_normalized_len: int | None = None,
     ) -> str:
         request_id = new_id("req")
         with self._connect() as conn:
@@ -334,8 +336,8 @@ class Repository:
                    (request_id, target_id, target_kind, mode, scope_json, policy_json, state,
                     created_at, target_fingerprint, target_shingles_json, target_anchors_json,
                     target_tokens_json, target_label_redacted, target_key_version,
-                    target_embedding_json, target_embedding_model)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    target_embedding_json, target_embedding_model, target_normalized_len)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request_id,
                     target_id,
@@ -353,6 +355,7 @@ class Repository:
                     target_key_version,
                     _json(list(target_embedding)),
                     target_embedding_model,
+                    target_normalized_len,
                 ),
             )
             conn.commit()
