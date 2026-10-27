@@ -134,6 +134,32 @@ python -m redacto clean-temps [--delete]           # temp copies left by an inte
 python -m redacto serve  --transport stdio   # or: --transport http
 ```
 
+## Compatibility
+
+**MCP clients.** Redacto speaks standard MCP over stdio and Streamable HTTP, so any MCP
+client can use it, whatever language the client is written in: Claude Code, Claude
+Desktop, the Python and TypeScript MCP SDKs, and other MCP-capable agents. Tested here:
+the Python MCP SDK client (stdio and HTTP) and Claude Code.
+
+**Your project's language does not matter.** Redacto does not read source code. It reads
+the context an agent keeps, wherever the project lives:
+
+| Scanned | Not scanned |
+|---|---|
+| `.md`, `.txt`, `.rst` files under `REDACTO_WORKSPACE_ROOT` | Source files (`.py`, `.js`, `.go`, ...), `.env`, `.json` and other suffixes. `status` lists them so the gap is visible |
+| SQLite `memories` / `response_cache` tables (other tables read-only) | Other databases (Postgres, MySQL, ...) |
+| A JSONL log, a JSON vector fixture, Chroma collections, Redis keys | Other vector stores and caches |
+
+So a Python backend, a Node app or a Go service all work the same way: point the
+`REDACTO_*` paths at the agent's notes, memory DB, logs and index for that project.
+Redacto itself runs on Python 3.12+ and is installed from this repo, not into the
+project it protects.
+
+**Natural language.** Exact and normalized matching is Unicode-aware, so copies and
+secrets are found in any language. Paraphrase signals (capitalised anchors, 5-word
+shingles) are tuned for English and other space-separated languages; for Chinese or
+Japanese text, expect paraphrases to be missed more often.
+
 ## MCP tools
 
 | Tool | Destructive? | Purpose |
