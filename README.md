@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 272 automated tests pass (`pytest`); two opt-in live-model tests are skipped by default.
+- 281 automated tests pass (`pytest`); two opt-in live-model tests are skipped by default.
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -576,11 +576,12 @@ Demo (`python -m redacto demo`) on the seeded fixture:
   rewrite resembling the revoked target is refused, not that the rewrite is good.
 - The Chroma adapter checks content and deletes in two calls (Chroma has no
   transactions); it re-reads right before the delete and confirms the item is gone.
-- The plan flags collateral risk but does not automatically regenerate a descendant
-  from its other parents (option 6 in the review).
+- Regenerating a descendant from its other parents is opt-in (`REDACTO_REGENERATE=true`)
+  and needs a configured model; without one the plan warns and deletes instead.
 - Two revocation modes exist in code; both are tested. Fact/secret revocation deletes
-  records containing the value (the anchor is preserved), and verification searches for
-  the value's tokens; the value is never stored, so a value embedded inside a longer token
+  records containing the value (the anchor is preserved), and verification and the
+  re-ingestion guard look for the value itself with a keyed sliding window. The value is
+  never stored; values shorter than 8 normalized characters fall back to token matching,
   and reworded traces are not proven absent.
 - Receipt integrity is evidence metadata, not proof of physical overwrite.
 

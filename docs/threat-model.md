@@ -99,8 +99,10 @@ destructive or leaking component**.
 - **Paraphrase detection is incomplete.** Verification matches planned record IDs and
   the keyed whole-target fingerprint; a reworded remnant in an unlinked store may
   survive and is not detectable by this method.
-- **Secret verification is token-based.** The value is never stored, so a value embedded
-  inside a longer token, and reworded traces, are not proven absent.
+- **Secret matching is exact, not semantic.** The value is never stored; verification and
+  the re-ingestion guard hash a sliding window of its normalized length, which catches it
+  inside longer text. Values shorter than 8 normalized characters fall back to token
+  matching, and reworded traces are not proven absent.
 - **Physical removal is best effort.** Files are unlinked, and SQLite secure-delete plus a
   WAL checkpoint can be delayed by another open writer.
 - **Unscanned file types.** Only configured extensions under a root are scanned; status

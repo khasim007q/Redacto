@@ -26,6 +26,10 @@ from redacto.adapters.base import (
 from redacto.discovery.normalization import fingerprint
 
 
+
+class _LogChanged(Exception):
+    """The log was rewritten (not just appended to) while an edit was prepared."""
+
 class JsonlLogAdapter(StoreAdapter):
     adapter_id = "jsonl_logs"
     store_id = "jsonl_logs"
@@ -351,7 +355,10 @@ class JsonlLogAdapter(StoreAdapter):
             current = self._path.read_text(encoding="utf-8")
             if current != original:
                 continue  # someone else changed the file; recompute from fresh state
-            self._atomic_write(new_content)
+            try:
+                self._atomic_write(new_content, expected_original=original)
+            except _LogChanged:
+                continue
             return
         raise AdapterError(
             "jsonl log kept changing during delete; no line was removed",
@@ -359,7 +366,14 @@ class JsonlLogAdapter(StoreAdapter):
             retryable=True,
         )
 
-    def _atomic_write(self, content: str) -> None:
+    def _atomic_write(self, content: str, *, expected_original: str | None = None) -> None:
+        """Replace the log with `content`.
+
+        With `expected_original`, lines another writer appended after that snapshot
+        are carried over into the new file right before the replace, so a concurrent
+        append is not lost. Any other change raises `_LogChanged` so the caller can
+        recompute the edit.
+        """
         tmp: str | None = None
         try:
             mode = stat.S_IMODE(self._path.stat().st_mode)
@@ -368,6 +382,15 @@ class JsonlLogAdapter(StoreAdapter):
             )
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
+                if expected_original is not None:
+                    current = self._path.read_text(encoding="utf-8")
+                    if current != expected_original:
+                        if not current.startswith(expected_original):
+                            raise _LogChanged()
+                        appended = current[len(expected_original) :]
+                        if content and not content.endswith("\n") and not appended.startswith("\n"):
+                            handle.write("\n")
+                        handle.write(appended)
             os.chmod(tmp, mode)
             os.replace(tmp, self._path)
             tmp = None

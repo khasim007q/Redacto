@@ -35,7 +35,9 @@ from redacto.ingestion import (
     token_set,
     ALLOWED,
     BLOCKED,
+    MIN_VERIFIABLE_VALUE_LEN,
     QUARANTINED,
+    contains_normalized,
     contains_verbatim_passage,
     overlap_ratio,
     TombstoneGuard,
@@ -72,30 +74,6 @@ GLOBAL_VERIFICATION_LIMITATIONS = [
     "SQLite deletes overwrite rows and attempt a WAL truncate checkpoint; another open writer can delay physical removal.",
     "Files are unlinked rather than overwritten, and files with other extensions under a configured root are not scanned.",
 ]
-
-
-# Shortest normalized value that can be verified by windowed hashing without
-# producing false matches from ordinary words.
-MIN_VERIFIABLE_VALUE_LEN = 8
-
-
-def contains_normalized(
-    content: str, target_fingerprint: str, normalized_len: int, key: str
-) -> bool:
-    """Whether the record contains the revoked value, separator-insensitively.
-
-    The plaintext value is never stored, so verification slides a window of the
-    value's normalized length over the record's normalized text and hashes each
-    window. This catches `STRIPE_KEY=sk-...`, `key:sk-...`, `?token=sk-...` and a
-    value glued to other text, which a whole-token comparison misses.
-    """
-    normalized = normalize_loose(content)
-    if normalized_len <= 0 or len(normalized) < normalized_len:
-        return False
-    for start in range(len(normalized) - normalized_len + 1):
-        if fingerprint(normalized[start : start + normalized_len], key) == target_fingerprint:
-            return True
-    return False
 
 
 def _statement_for(
@@ -1588,6 +1566,15 @@ class Engine:
             )
         if any(item["proposed_action"] == classify.REVIEW_REQUIRED for item in items):
             warnings.append("Some candidates require human review and are excluded from execution.")
+        if (
+            self.settings.regenerate_derivatives
+            and target_kind == "source"
+            and self.regenerator().model_id == "none"
+        ):
+            warnings.append(
+                "REDACTO_REGENERATE is on but no model is configured (REDACTO_MODEL_*), so "
+                "derivatives are deleted instead of regenerated."
+            )
 
         return {
             "ok": True,
@@ -1686,6 +1673,7 @@ class Engine:
             key_version=request.get("target_key_version") or self.settings.hmac_key_version,
             embedding=request.get("target_embedding", []),
             embedding_model=request.get("target_embedding_model"),
+            normalized_len=request.get("target_normalized_len"),
         )
         self.repo.set_tombstone_status(tombstone_id, "active")
         return self.repo.get_tombstone(tombstone_id)
@@ -2183,7 +2171,10 @@ class Engine:
                 self.repo, plan_id=plan_id, approval_ref=approval_ref, ttl_seconds=ttl_seconds
             )
         except ValueError as exc:
-            raise RedactoError(str(exc), f"Approval could not be issued: {exc}") from exc
+            # The text before the first colon is the machine-readable code; anything
+            # after it is detail for the human message.
+            code = str(exc).split(":", 1)[0].strip()
+            raise RedactoError(code, f"Approval could not be issued: {exc}") from exc
         result = {"ok": True, **issued, "recovery": recovery}
         if recovery:
             result["note"] = (
@@ -3065,9 +3056,10 @@ class Engine:
             ]
             if request["target_kind"] in {"fact", "secret"}:
                 limitations.append(
-                    "Fact/secret verification rescans every reachable store for the value's "
-                    "distinctive tokens. The value is never stored, so a value embedded inside "
-                    "a longer token and reworded traces are not proven absent."
+                    "Fact/secret verification hashes a sliding window of the value's normalized "
+                    "length over every reachable record, so separators and surrounding text do "
+                    "not hide it. Values shorter than 8 normalized characters fall back to token "
+                    "matching, and reworded traces are not proven absent."
                 )
             if truncated:
                 limitations.append(
@@ -3113,6 +3105,16 @@ class Engine:
             )
 
         succeeded = sum(1 for a in real_actions if a["result"] == "success")
+        # A redacted or regenerated record still exists without the revoked value, so
+        # it is reported separately rather than as removed.
+        redacted = sum(
+            1 for a in real_actions
+            if a["result"] == "success" and a["operation"] == classify.REDACT_SPAN
+        )
+        regenerated = sum(
+            1 for a in real_actions
+            if a["result"] == "success" and a["operation"] == classify.REGENERATE
+        )
         already_absent = sum(1 for a in real_actions if a["result"] == "already_absent")
         failed = sum(1 for a in real_actions if a["result"] == "failed")
         dry_run_actions = sum(1 for a in actions if a["result"] == "dry_run")
@@ -3184,7 +3186,9 @@ class Engine:
             "target_kind": request["target_kind"],
             "status": status,
             "counts": {
-                "records_removed": succeeded,
+                "records_removed": succeeded - redacted - regenerated,
+                "records_redacted": redacted,
+                "records_regenerated": regenerated,
                 "already_absent": already_absent,
                 "failed": failed,
                 "review_pending": review_pending,

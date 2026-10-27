@@ -129,6 +129,8 @@ class Repository:
             conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_json TEXT NOT NULL DEFAULT '[]'")
         if "embedding_model" not in tombstone_columns:
             conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_model TEXT")
+        if "normalized_len" not in tombstone_columns:
+            conn.execute("ALTER TABLE tombstones ADD COLUMN normalized_len INTEGER")
 
     # ---------------------------------------------------------------- records
     def upsert_record(
@@ -886,6 +888,7 @@ class Repository:
         key_version: int = 1,
         embedding: Sequence[float] = (),
         embedding_model: str | None = None,
+        normalized_len: int | None = None,
     ) -> str:
         tombstone_id = new_id("tomb")
         with self._connect() as conn:
@@ -894,8 +897,8 @@ class Repository:
                    (tombstone_id, request_id, target_id, target_kind, label_redacted, fingerprint,
                     shingles_json, anchors_json, tokens_json, related_record_ids_json,
                     related_fingerprints_json, embedding_json, embedding_model,
-                    scope_json, policy_json, status, key_version, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    scope_json, policy_json, status, key_version, normalized_len, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     tombstone_id,
                     request_id,
@@ -914,6 +917,7 @@ class Repository:
                     _json(policy),
                     status,
                     key_version,
+                    normalized_len,
                     now_iso(),
                 ),
             )
