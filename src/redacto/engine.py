@@ -146,6 +146,50 @@ class Engine:
     def status(self, *, transport: str = "stdio") -> dict[str, Any]:
         return collect_status(self.settings, transport=transport)
 
+    # A rewrite in flight holds its temp file for well under this long.
+    TEMP_MIN_AGE_SECONDS = 60
+
+    def clean_leftover_temps(self, *, delete: bool = False) -> dict[str, Any]:
+        """List, and with `delete` remove, temp copies left by interrupted rewrites.
+
+        An application action (CLI only): the files may hold revoked content, and
+        verify counts them as residuals until they are gone. A file younger than
+        a minute may belong to a rewrite still running and is never touched.
+        """
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cutoff = datetime.now(timezone.utc).timestamp() - self.TEMP_MIN_AGE_SECONDS
+        for store, slot in self.adapters().items():
+            if slot.adapter is None:
+                continue
+            for path in slot.adapter.leftover_temp_files():
+                if str(path) in seen:
+                    continue
+                seen.add(str(path))
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                entry: dict[str, Any] = {"store_id": store, "path": str(path)}
+                if mtime > cutoff:
+                    entry["result"] = "skipped_recent"
+                elif not delete:
+                    entry["result"] = "found"
+                else:
+                    try:
+                        path.unlink()
+                        entry["result"] = "deleted"
+                    except OSError as exc:
+                        entry["result"] = "failed"
+                        entry["error"] = str(exc)
+                found.append(entry)
+        return {
+            "ok": True,
+            "deleted": delete,
+            "files": found,
+            "note": "Run verify again afterwards; leftover copies count as residuals until removed.",
+        }
+
     def _require_record(self, record_id: str) -> dict[str, Any]:
         record = self.repo.get_record(record_id)
         if record is not None:

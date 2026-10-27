@@ -14,6 +14,9 @@ from redacto.errors import RedactoError
 
 READ_ONLY = ToolAnnotations(read_only_hint=True)
 DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True)
+# Verify never touches a store, but it writes a receipt and activates the tombstones
+# that block re-ingestion, so it is not read-only.
+RECORDS_RECEIPT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
 
 
 def _guard(callable_fn) -> dict[str, Any]:
@@ -46,7 +49,8 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
         "redacto",
         version="0.1.0",
         instructions=(
-            "Provenance-aware revocation. scan/trace/plan/verify are read-only. apply is "
+            "Provenance-aware revocation. scan/trace/plan never modify a store; verify only "
+            "writes a receipt and activates tombstones. apply is "
             "destructive and requires an approved plan version plus an application-issued "
             "confirmation token; the agent cannot approve a plan. Never claim universal "
             "erasure: report VERIFIED_WITHIN_SCOPE, PARTIAL, NEEDS_REVIEW and FAILED honestly, "
@@ -175,7 +179,7 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
             )
         )
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(annotations=RECORDS_RECEIPT)
     def redacto_verify(
         request_id: str | None = None,
         receipt_id: str | None = None,

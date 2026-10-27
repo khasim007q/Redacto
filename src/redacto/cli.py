@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -46,6 +47,32 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _target_text(args: argparse.Namespace) -> str | None:
+    """The fact/secret value, read from stdin or an env var, never from argv.
+
+    Taking the value as a plain argument would leave it in shell history and in
+    process listings.
+    """
+    if getattr(args, "kind", "source") == "source":
+        if getattr(args, "text_stdin", False) or getattr(args, "text_env", None):
+            raise RedactoError("invalid_target_text", "--text-stdin/--text-env need --kind fact|secret.")
+        return None
+    if getattr(args, "text_env", None):
+        value = os.environ.get(args.text_env, "")
+    elif getattr(args, "text_stdin", False):
+        value = sys.stdin.read()
+    else:
+        raise RedactoError(
+            "missing_target_text",
+            "A fact/secret target needs its value: pipe it with --text-stdin or name an env var "
+            "with --text-env.",
+        )
+    value = value.strip()
+    if not value:
+        raise RedactoError("missing_target_text", "The fact/secret value is empty.")
+    return value
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     engine = _engine()
     _print(
@@ -57,6 +84,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 stores=_stores(args.stores),
                 depth=args.depth,
                 use_model=not args.no_model,
+                target_text=_target_text(args),
             ),
         }
     )
@@ -71,12 +99,15 @@ def cmd_trace(args: argparse.Namespace) -> int:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     engine = _engine()
+    mode = args.mode or ("source_revocation" if args.kind == "source" else "fact_revocation")
     result = engine.plan(
         target_id=args.target_id,
-        mode=args.mode,
+        mode=mode,
+        target_kind=args.kind,
         stores=_stores(args.stores),
         depth=args.depth,
         use_model=not args.no_model,
+        target_text=_target_text(args),
     )
     if args.out:
         Path(args.out).write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
@@ -195,6 +226,12 @@ def cmd_calibrate_embeddings(args: argparse.Namespace) -> int:
 def cmd_keyring(args: argparse.Namespace) -> int:
     engine = _engine()
     _print(engine.keyring_report(retire_version=args.retire))
+    return 0
+
+
+def cmd_clean_temps(args: argparse.Namespace) -> int:
+    engine = _engine()
+    _print(engine.clean_leftover_temps(delete=args.delete))
     return 0
 
 
@@ -359,6 +396,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_target_text_args(parser: argparse.ArgumentParser) -> None:
+    text = parser.add_mutually_exclusive_group()
+    text.add_argument(
+        "--text-stdin",
+        action="store_true",
+        help="read the fact/secret value from stdin (kept out of shell history)",
+    )
+    text.add_argument("--text-env", metavar="VAR", help="read the fact/secret value from this env var")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="redacto", description="Provenance-aware revocation engine")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -378,6 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--stores")
     scan.add_argument("--depth", type=int, default=3)
     scan.add_argument("--no-model", action="store_true")
+    _add_target_text_args(scan)
     scan.set_defaults(func=cmd_scan)
 
     trace = sub.add_parser("trace", help="explain lineage and candidates (read-only)")
@@ -387,7 +435,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = sub.add_parser("plan", help="create a draft revocation plan (non-destructive)")
     plan.add_argument("--target-id", required=True)
-    plan.add_argument("--mode", default="source_revocation", choices=["source_revocation", "fact_revocation"])
+    plan.add_argument("--kind", default="source", choices=["source", "fact", "secret"])
+    plan.add_argument(
+        "--mode",
+        choices=["source_revocation", "fact_revocation"],
+        help="default: source_revocation for --kind source, otherwise fact_revocation",
+    )
+    _add_target_text_args(plan)
     plan.add_argument("--stores")
     plan.add_argument("--depth", type=int, default=3)
     plan.add_argument("--no-model", action="store_true")
@@ -463,6 +517,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibrate.add_argument("--thresholds", help="comma-separated cosine thresholds")
     calibrate.set_defaults(func=cmd_calibrate_embeddings)
+
+    clean = sub.add_parser(
+        "clean-temps", help="list (or --delete) temp copies left by interrupted store rewrites"
+    )
+    clean.add_argument("--delete", action="store_true", help="remove them (older than 60 seconds only)")
+    clean.set_defaults(func=cmd_clean_temps)
 
     keyring = sub.add_parser("keyring", help="audit HMAC key versions and rotation safety")
     keyring.add_argument("--retire", type=int)
