@@ -72,7 +72,8 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 On Linux/macOS use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
 
 The demo runs in a fresh temp workspace and never touches your configured stores
-(`--use-configured` opts in). It writes `var/demo_receipt.json` and `var/demo_receipt.md`.
+(`--use-configured` opts in). It writes `demo_receipt.json` and `demo_receipt.md` next to
+the demo's graph DB and prints the path (`var/` with `--use-configured`).
 
 `seed` refuses with `seed_would_destroy_data` when the workspace holds files it did not
 create, the memory store has extra tables, or the graph has tombstones or revocation
