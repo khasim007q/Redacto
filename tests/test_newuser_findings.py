@@ -325,3 +325,41 @@ def test_completed_apply_cannot_be_reapproved_before_verify(tmp_path):
     with pytest.raises(RedactoError) as excinfo:
         engine.approve_plan(plan_id=plan["plan_id"], approval_ref="again")
     assert excinfo.value.code == "plan_not_approvable"
+
+
+# ------------------------------------------- unapproved tables: read, never write
+def _chat_history(settings, body: str) -> None:
+    conn = sqlite3.connect(settings.sqlite_store_path)
+    conn.execute("CREATE TABLE chat_history (speaker TEXT, body TEXT)")
+    conn.execute("INSERT INTO chat_history VALUES ('agent', 'unrelated small talk')")
+    conn.execute("INSERT INTO chat_history VALUES ('agent', ?)", (body,))
+    conn.commit()
+    conn.close()
+
+
+def test_document_copy_in_an_unapproved_table_is_reported_not_touched(tmp_path):
+    settings = seeded_settings(tmp_path)
+    _chat_history(settings, "Here is the file you asked for:\n" + ACQUISITION_PLAN)
+    engine = Engine(settings)
+    plan = engine.plan(target_id=SOURCE_ID)
+    items = {item["record_id"]: item for item in plan["items"]}
+    hit = items["sqlx:chat_history:2"]
+    assert hit["proposed_action"] == "UNREACHABLE"
+    assert hit["approved"] is False
+    assert "sqlx:chat_history:1" not in items
+    applied = approve_and_apply(engine, plan)
+    receipt = engine.verify(request_id=applied["request_id"])
+    assert receipt["status"] == "PARTIAL"
+    sqlite_store = next(s for s in receipt["stores"] if s["store_id"] == "sqlite_memory")
+    assert "sqlx:chat_history:2" in sqlite_store["residual_record_ids"]
+    rows = sqlite3.connect(settings.sqlite_store_path).execute("SELECT COUNT(*) FROM chat_history").fetchone()
+    assert rows[0] == 2  # never modified
+
+
+def test_secret_in_an_unapproved_table_keeps_verify_honest(tmp_path):
+    settings = seeded_settings(tmp_path)
+    _chat_history(settings, f"the key is {SECRET}")
+    _, receipt = _secret_flow(settings)
+    assert receipt["status"] == "PARTIAL"
+    assert receipt["counts"]["residual_matches"] >= 1
+    assert SECRET not in json.dumps(receipt)

@@ -12,7 +12,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Sequence
 
 from redacto.adapters.base import (
     AdapterError,
@@ -20,6 +20,7 @@ from redacto.adapters.base import (
     Record,
     StoreAdapter,
     leftover_rewrite_temps,
+    redact_spans,
     rewrite_temp_prefix,
 )
 from redacto.discovery.normalization import fingerprint
@@ -43,7 +44,7 @@ class JsonlLogAdapter(StoreAdapter):
             adapter_id=self.adapter_id,
             can_scan=True,
             can_delete=True,
-            can_redact=False,
+            can_redact=True,
             can_invalidate=False,
             can_verify=True,
             notes=["Configured JSONL file only; delete rewrites the file atomically."],
@@ -261,12 +262,61 @@ class JsonlLogAdapter(StoreAdapter):
                 raise AdapterError(
                     "record content changed since planning", code="content_changed"
                 )
-        self._remove_line(event_id, preferred_line=target, key=key or self._key)
+        self._rewrite_line(event_id, preferred_line=target, transform=lambda line: None)
 
-    def _remove_line(
-        self, event_id: str, *, preferred_line: int | None, key: str
+    def redact_record(
+        self,
+        locator: dict[str, str],
+        spans: Sequence[dict],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
     ) -> None:
-        """Remove one event without dropping lines appended concurrently.
+        event_id = locator.get("event_id")
+        if not event_id:
+            raise AdapterError("jsonl locator requires 'event_id'", code="invalid_locator")
+        signing_key = key or self._key
+        preferred_line: int | None = None
+        if locator.get("line") is not None:
+            try:
+                preferred_line = int(locator["line"])
+            except (TypeError, ValueError):
+                preferred_line = None
+
+        def transform(line: str) -> str:
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    payload = {"_malformed": True, "content": line}
+            except json.JSONDecodeError:
+                payload = {"_malformed": True, "content": line}
+            if expected_fingerprint and (
+                fingerprint(self._content(payload), signing_key) != expected_fingerprint
+            ):
+                raise AdapterError("record content changed since planning", code="content_changed")
+            redacted, count = redact_spans(line, spans, signing_key)
+            if count == 0:
+                raise AdapterError("no planned span is present any more", code="not_found")
+            if not payload.get("_malformed"):
+                try:
+                    json.loads(redacted)
+                except json.JSONDecodeError as exc:
+                    raise AdapterError(
+                        "redaction would break the event's JSON", code="unsupported_operation"
+                    ) from exc
+            return redacted
+
+        self._rewrite_line(event_id, preferred_line=preferred_line, transform=transform)
+
+    def _rewrite_line(
+        self,
+        event_id: str,
+        *,
+        preferred_line: int | None,
+        transform: Callable[[str], str | None],
+    ) -> None:
+        """Replace (or with None, remove) one event without dropping lines
+        appended concurrently.
 
         The file is read, edited and re-checked before replacing. If another writer
         appended (or rewrote) in between, the edit is recomputed from the new
@@ -290,7 +340,12 @@ class JsonlLogAdapter(StoreAdapter):
             if not matches:
                 raise AdapterError("record no longer exists", code="not_found")
             target = preferred_line if preferred_line in matches else matches[0]
-            remaining = [line for index, line in enumerate(raw_lines) if index != target]
+            replacement = transform(raw_lines[target])
+            remaining = [
+                line if index != target else replacement
+                for index, line in enumerate(raw_lines)
+                if index != target or replacement is not None
+            ]
             new_content = "\n".join(remaining) + ("\n" if remaining else "")
 
             current = self._path.read_text(encoding="utf-8")

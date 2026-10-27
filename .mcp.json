@@ -11,12 +11,13 @@
         "redacto.mcp.stdio_server"
       ],
       "env": {
-        "REDACTO_WORKSPACE_ROOT": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace",
+        "REDACTO_WORKSPACE_ROOT": "${CLAUDE_PLUGIN_DATA}/workspace",
         "REDACTO_DB_PATH": "${CLAUDE_PLUGIN_DATA}/redacto.sqlite3",
-        "REDACTO_SQLITE_PATH": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace/agent_memory.sqlite3",
-        "REDACTO_JSONL_PATH": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace/agent_events.jsonl",
-        "REDACTO_VECTOR_PATH": "${CLAUDE_PLUGIN_ROOT}/fixtures/workspace/vector_chunks.json",
-        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv"
+        "REDACTO_SQLITE_PATH": "${CLAUDE_PLUGIN_DATA}/workspace/agent_memory.sqlite3",
+        "REDACTO_JSONL_PATH": "${CLAUDE_PLUGIN_DATA}/workspace/agent_events.jsonl",
+        "REDACTO_VECTOR_PATH": "${CLAUDE_PLUGIN_DATA}/workspace/vector_chunks.json",
+        "UV_PROJECT_ENVIRONMENT": "${CLAUDE_PLUGIN_DATA}/venv",
+        "REDACTO_DEMO_SEED_IF_MISSING": "true"
       }
     }
   }

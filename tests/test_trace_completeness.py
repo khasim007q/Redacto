@@ -258,12 +258,14 @@ def test_secret_verify_catches_a_reintroduced_secret_even_when_planned_records_a
     assert "fs:notes.md" in filesystem["residual_record_ids"]
 
 
-def test_small_secret_mention_waits_for_review_then_verifies_clean(tmp_path):
+def test_small_secret_mention_waits_for_review_then_verifies_clean(tmp_path, monkeypatch):
     """A 40-byte key inside a 5 KB handbook must not auto-delete the handbook.
 
     The record is held for review; verify honestly reports PARTIAL until a
     reviewer approves the item, after which verification is clean.
     """
+    # Redaction would handle this record; force the review path it falls back to.
+    monkeypatch.setattr(Engine, "REDACT_MAX_BYTES", 0)
     settings = seeded_settings(tmp_path)
     handbook = settings.workspace_root / "handbook.md"
     handbook.write_text(

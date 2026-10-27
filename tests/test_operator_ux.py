@@ -127,3 +127,87 @@ def test_dotenv_is_loaded_without_overriding_the_environment(tmp_path, monkeypat
     settings = load_settings()
     assert settings.safety_mode == "dry_run_only"
     assert settings.http_port == 8000
+
+
+# ----------------------------------------------------- CLI fact/secret targets
+CLI_SECRET = "sk-live-CLI-STDIN-0123456789abcdef"
+
+
+def _plan_cli(tmp_path, monkeypatch, *flags, stdin: str = "", env: dict | None = None):
+    import io
+    import json as _json
+
+    from redacto import cli
+
+    settings = seeded_settings(tmp_path)
+    leak = settings.workspace_root / "leak.txt"
+    leak.write_text(f"token={CLI_SECRET}\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    code = cli.main(["plan", "--target-id", SOURCE_ID, *flags])
+    return code, settings
+
+
+def test_cli_plans_a_secret_read_from_stdin(tmp_path, monkeypatch, capsys):
+    code, _ = _plan_cli(tmp_path, monkeypatch, "--kind", "secret", "--text-stdin", stdin=CLI_SECRET + "\n")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert '"fs:leak.txt"' in out
+    assert '"fact_revocation"' in out
+    assert CLI_SECRET not in out
+
+
+def test_cli_plans_a_secret_read_from_an_env_var(tmp_path, monkeypatch, capsys):
+    code, _ = _plan_cli(
+        tmp_path, monkeypatch, "--kind", "secret", "--text-env", "LEAKED", env={"LEAKED": CLI_SECRET}
+    )
+    out = capsys.readouterr().out
+    assert code == 0 and '"fs:leak.txt"' in out and CLI_SECRET not in out
+
+
+def test_cli_secret_without_a_value_is_refused(tmp_path, monkeypatch, capsys):
+    code, _ = _plan_cli(tmp_path, monkeypatch, "--kind", "secret")
+    assert code == 2
+    assert "missing_target_text" in capsys.readouterr().out
+
+
+def test_cli_has_no_plain_text_argument_for_secrets():
+    from redacto import cli
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["plan", "--target-id", "x", "--text", "value"])
+
+
+# --------------------------------------------------------------- clean-temps
+def test_clean_temps_lists_then_deletes_only_old_copies(tmp_path):
+    import os
+    import time
+
+    settings = seeded_settings(tmp_path)
+    old = settings.workspace_root / ".agent_events.jsonl.redacto-old.tmp"
+    new = settings.workspace_root / ".agent_events.jsonl.redacto-new.tmp"
+    old.write_text("stale copy", encoding="utf-8")
+    new.write_text("in-flight copy", encoding="utf-8")
+    past = time.time() - 3600
+    os.utime(old, (past, past))
+    engine = Engine(settings)
+    listed = {f["path"]: f["result"] for f in engine.clean_leftover_temps()["files"]}
+    assert listed == {str(old): "found", str(new): "skipped_recent"}
+    assert old.exists()
+    engine.clean_leftover_temps(delete=True)
+    assert not old.exists()
+    assert new.exists()
+
+
+def test_verify_tool_is_not_annotated_read_only():
+    import asyncio
+
+    from redacto.mcp.server import create_server
+
+    server = create_server(transport="test")
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    assert tools["redacto_verify"].annotations.read_only_hint is False
+    assert tools["redacto_verify"].annotations.destructive_hint is False
+    assert tools["redacto_apply"].annotations.destructive_hint is True

@@ -102,6 +102,7 @@ class Repository:
         for column, ddl in {
             "expected_fingerprint": "TEXT",
             "fingerprint_key_version": "INTEGER",
+            "redact_spans_json": "TEXT NOT NULL DEFAULT '[]'",
         }.items():
             if column not in item_columns:
                 conn.execute(f"ALTER TABLE revocation_plan_items ADD COLUMN {column} {ddl}")
@@ -452,8 +453,8 @@ class Repository:
                     """INSERT INTO revocation_plan_items
                        (item_id, plan_id, request_id, record_id, evidence_class, proposed_action,
                         reason_redacted, risk, approved, state, expected_fingerprint,
-                        fingerprint_key_version)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?)""",
+                        fingerprint_key_version, redact_spans_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?)""",
                     (
                         item["item_id"],
                         plan_id,
@@ -466,6 +467,7 @@ class Repository:
                         1 if item["approved"] else 0,
                         item.get("expected_fingerprint"),
                         item.get("fingerprint_key_version"),
+                        _json(item.get("redact_spans") or []),
                     ),
                 )
             conn.commit()
@@ -501,6 +503,7 @@ class Repository:
         items = [dict(row) for row in rows]
         for item in items:
             item["approved"] = bool(item["approved"])
+            item["redact_spans"] = _loads(item.pop("redact_spans_json", None) or "[]", [])
         return items
 
     def get_plan_item(self, item_id: str) -> dict[str, Any] | None:

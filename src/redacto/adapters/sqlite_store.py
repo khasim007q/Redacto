@@ -9,9 +9,9 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
-from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
+from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter, redact_spans
 from redacto.discovery.normalization import fingerprint
 
 # table -> (record_type, record_id prefix)
@@ -149,12 +149,62 @@ class SqliteMemoryAdapter(StoreAdapter):
             if conn is not None:
                 conn.close()
 
+    OUT_OF_SCOPE_PREFIX = "sqlx"
+
+    def out_of_scope_records(self, *, limit: int | None = None) -> list[Record]:
+        """Rows of unapproved tables, read-only, so a copy there is not silent."""
+        remaining = limit
+        records: list[Record] = []
+        try:
+            with self._connect() as conn:
+                names = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                    ).fetchall()
+                ]
+                for name in names:
+                    if name in APPROVED_TABLES:
+                        continue
+                    quoted = '"' + name.replace('"', '""') + '"'
+                    columns = [row[1] for row in conn.execute(f"PRAGMA table_info({quoted})")]
+                    sql = f"SELECT rowid, * FROM {quoted}"
+                    if remaining is not None:
+                        sql += f" LIMIT {int(remaining)}"
+                    try:
+                        rows = conn.execute(sql).fetchall()
+                    except sqlite3.Error:
+                        continue  # WITHOUT ROWID or unreadable: listed by status only
+                    for row in rows:
+                        parts: list[str] = []
+                        for column, value in zip(columns, row[1:]):
+                            parts.append(str(column))
+                            if value is not None:
+                                parts.append(str(value))
+                        records.append(
+                            Record(
+                                record_id=f"{self.OUT_OF_SCOPE_PREFIX}:{name}:{row[0]}",
+                                record_type="unapproved_row",
+                                store_id=self.store_id,
+                                locator={"table": name, "rowid": str(row[0])},
+                                content="\n".join(parts),
+                            )
+                        )
+                    if remaining is not None:
+                        remaining -= len(rows)
+                        if remaining <= 0:
+                            break
+        except sqlite3.Error:
+            return records
+        return records
+
     def capabilities(self) -> Capabilities:
         return Capabilities(
             adapter_id=self.adapter_id,
             can_scan=True,
             can_delete=True,
-            can_redact=False,
+            can_redact=True,
             can_invalidate=True,
             can_verify=True,
             notes=[
@@ -244,6 +294,55 @@ class SqliteMemoryAdapter(StoreAdapter):
             raise
         except sqlite3.Error as exc:
             raise AdapterError(f"sqlite delete failed: {exc}", code="delete_failed") from exc
+        self._checkpoint()
+
+    def redact_record(
+        self,
+        locator: dict[str, str],
+        spans: Sequence[dict],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        table = locator.get("table")
+        if table not in self._tables:
+            raise AdapterError("unapproved table", code="out_of_scope")
+        record_id = locator.get("id")
+        if not record_id:
+            raise AdapterError("sqlite locator requires 'id'", code="invalid_locator")
+        columns = self._columns[table]
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+                if row is None:
+                    raise AdapterError("record no longer exists", code="not_found")
+                if expected_fingerprint and (
+                    fingerprint(self._row_to_record(table, row, columns).content, key or self._key)
+                    != expected_fingerprint
+                ):
+                    raise AdapterError(
+                        "record content changed since planning", code="content_changed"
+                    )
+                updates: dict[str, str] = {}
+                for column, value in zip(columns, row):
+                    # The id is the row's identity; a value there is aliased, not edited.
+                    if column == "id" or not isinstance(value, str):
+                        continue
+                    redacted, count = redact_spans(value, spans, key or self._key)
+                    if count:
+                        updates[column] = redacted
+                if not updates:
+                    raise AdapterError("no planned span is present any more", code="not_found")
+                assignments = ", ".join(f'"{column}" = ?' for column in updates)
+                conn.execute(
+                    f"UPDATE {table} SET {assignments} WHERE id = ?",
+                    (*updates.values(), record_id),
+                )
+        except AdapterError:
+            raise
+        except sqlite3.Error as exc:
+            raise AdapterError(f"sqlite redact failed: {exc}", code="redact_failed") from exc
         self._checkpoint()
 
     def invalidate_derived(

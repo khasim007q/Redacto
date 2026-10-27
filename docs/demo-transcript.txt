@@ -1,0 +1,75 @@
+Output of `python -m redacto demo` (Windows 11, Python 3.12, 2026-10-27).
+Temp paths are shortened to <temp>.
+
+== Redacto demo ==
+    Isolated demo workspace: <temp>\workspace
+[1] Seeded synthetic workspace: 18 records in <temp>\workspace
+    Target: fs:acquisition-plan.md (confidential acquisition plan)
+
+[2] Provenance graph
+    confirmed descendants: 5
+      - cache:cache-response-1 (depth 1, CACHED_AS)
+      - fs:generated-summary.md (depth 1, DERIVED_FROM)
+      - log:evt-summary-gen (depth 1, DERIVED_FROM)
+      - vec:chunk-0001 (depth 1, INDEXED_AS)
+      - mem:mem-summary-paraphrase (depth 2, DERIVED_FROM)
+      ~ weak exposure only: log:evt-read-1 (READ_FROM, not destructive)
+    candidate relationships: 6
+
+[3] Draft plan plan_ac41041b1ef8e507 (v1) state=READY_FOR_APPROVAL
+      DIRECT_MATCH           DELETE_RECORD      fs:acquisition-plan.md           [APPROVED-ITEM] risk=low    377B ~100% Deterministic match: Record is the revocation target.
+      DIRECT_MATCH           DELETE_RECORD      log:evt-dup-1                    [APPROVED-ITEM] risk=low    377B ~100% Deterministic match: Normalized whole-content copy of the target.
+      CONFIRMED_DESCENDANT   INVALIDATE_CACHE   cache:cache-response-1           [APPROVED-ITEM] risk=high   92B ~11% Confirmed CACHED_AS edge (instrumented) at depth 1.
+      CONFIRMED_DESCENDANT   DELETE_RECORD      fs:generated-summary.md          [APPROVED-ITEM] risk=high   260B ~27% Confirmed DERIVED_FROM edge (instrumented) at depth 1.
+      CONFIRMED_DESCENDANT   DELETE_RECORD      log:evt-summary-gen              [APPROVED-ITEM] risk=medium 82B ~71% Confirmed DERIVED_FROM edge (instrumented) at depth 1.
+      CONFIRMED_DESCENDANT   DELETE_RECORD      mem:mem-summary-paraphrase       [APPROVED-ITEM] risk=high   91B ~0% Confirmed DERIVED_FROM edge (instrumented) at depth 2.
+      CONFIRMED_DESCENDANT   INVALIDATE_INDEX   vec:chunk-0001                   [APPROVED-ITEM] risk=medium 90B ~100% Confirmed INDEXED_AS edge (instrumented) at depth 1.
+      SUSPECTED_DERIVATIVE   REVIEW_REQUIRED    mem:mem-candidate-paraphrase     [review/preserve] risk=high   67B ~0% Candidate relationship only; not authoritative. Paraphrases the confidential valuation figure with no recorded lineage.
+      SUSPECTED_DERIVATIVE   REVIEW_REQUIRED    vec:chunk-0002                   [review/preserve] risk=high   68B ~0% Candidate relationship only; not authoritative. Paraphrases the deal value with no recorded lineage.
+      RELATED_NONDISCLOSING  SKIP_PRESERVE      fs:eng-notes.md                  [review/preserve] risk=none   225B ~0% Related but no disclosure evidence; preserved by policy. Shares only a company name with the target.
+      RELATED_NONDISCLOSING  SKIP_PRESERVE      fs:sibling-public-mention.md     [review/preserve] risk=none   93B ~0% Related but no disclosure evidence; preserved by policy. Shares only a company name with the target.
+      RELATED_NONDISCLOSING  SKIP_PRESERVE      log:evt-instruction              [review/preserve] risk=none   95B ~0% Related but no disclosure evidence; preserved by policy. Contains an embedded instruction and a public company mention.
+      RELATED_NONDISCLOSING  SKIP_PRESERVE      mem:mem-sibling-public           [review/preserve] risk=none   62B ~0% Related but no disclosure evidence; preserved by policy. Public SDK mention; no target disclosure.
+    estimated impact: {'delete': 5, 'invalidate': 2, 'review': 2, 'preserve': 4, 'unreachable': 0}
+    ! Some candidates require human review and are excluded from execution.
+
+[4] Application issued approval appr_58ada55285378275 (token valid until 2026-10-27T02:56:15+00:00, single use)
+    dry run: {'succeeded': 0, 'already_absent': 0, 'failed': 0, 'dry_run': 7, 'blocked': 0} (no destructive operation performed)
+
+[5] Apply results: {'succeeded': 7, 'already_absent': 0, 'failed': 0, 'dry_run': 0, 'blocked': 0} state=VERIFYING
+      - vector_fixture: INVALIDATE_INDEX vec:chunk-0001 -> success
+      - sqlite_memory: INVALIDATE_CACHE cache:cache-response-1 -> success
+      - sqlite_memory: DELETE_RECORD mem:mem-summary-paraphrase -> success
+      - filesystem: DELETE_RECORD fs:acquisition-plan.md -> success
+      - filesystem: DELETE_RECORD fs:generated-summary.md -> success
+      - jsonl_logs: DELETE_RECORD log:evt-dup-1 -> success
+      - jsonl_logs: DELETE_RECORD log:evt-summary-gen -> success
+      ! review required (not deleted): vec:chunk-0002 (SUSPECTED_DERIVATIVE)
+      ! review required (not deleted): mem:mem-candidate-paraphrase (SUSPECTED_DERIVATIVE)
+
+[6] Verification: NEEDS_REVIEW (receipt rcpt_e5e20c876eb71938)
+      records_removed: 7
+      already_absent: 0
+      failed: 0
+      review_pending: 2
+      preserved: 4
+      residual_matches: 0
+      store filesystem: verified (residuals 0)
+      store sqlite_memory: verified (residuals 0)
+      store jsonl_logs: verified (residuals 0)
+      store vector_fixture: verified (residuals 0)
+
+[7] Receipt written to <temp>\demo_receipt.json and <temp>\demo_receipt.md
+    Verified within configured scope for approved actions; 2 candidate(s) still need human review and were preserved. Not a claim of universal erasure.
+    HTML report (stores, lineage, plan, timeline, receipt): <temp>\demo_report.html
+
+[8] Re-ingestion attack
+    guard counts: {'allowed': 5, 'blocked': 1, 'quarantined': 2, 'skipped': 0} (active tombstones: 1)
+      blocked      fs:acquisition-plan.md             same_target (score 1.0)
+      quarantined  mem:mem-candidate-paraphrase       anchor_overlap (score 0.1667)
+      quarantined  mem:mem-reintroduced-paraphrase    embedding_similarity (score 0.3089)
+    Restored exact copies are blocked; paraphrases are quarantined for review, not deleted.
+    Demo subset: 2 scenarios (1 blocked, 1 quarantined).
+    Full test matrix: 9 scenarios - 6 blocked, 2 quarantined, 1 allowed
+    (tests/test_tombstones.py + tests/test_embeddings.py).
+    Learn more: README.md and docs/demo-script.md

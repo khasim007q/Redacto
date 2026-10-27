@@ -12,8 +12,8 @@ from redacto.adapters.base import AdapterError, Record
 from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
 from redacto.discovery.embeddings import build_embedder, cosine
-from redacto.discovery.exact import ExactMatcher, shares_entity
-from redacto.discovery.normalization import fingerprint, normalize_loose
+from redacto.discovery.exact import MIN_SUBSTRING_LEN, ExactMatcher, shares_entity
+from redacto.discovery.normalization import fingerprint, normalize_loose, variants
 from redacto.discovery.relationship_assessor import (
     CandidateContext,
     RelationshipAssessor,
@@ -22,6 +22,7 @@ from redacto.discovery.relationship_assessor import (
 )
 import json
 import os
+import re
 import socket
 from datetime import datetime, timezone
 
@@ -145,6 +146,50 @@ class Engine:
 
     def status(self, *, transport: str = "stdio") -> dict[str, Any]:
         return collect_status(self.settings, transport=transport)
+
+    # A rewrite in flight holds its temp file for well under this long.
+    TEMP_MIN_AGE_SECONDS = 60
+
+    def clean_leftover_temps(self, *, delete: bool = False) -> dict[str, Any]:
+        """List, and with `delete` remove, temp copies left by interrupted rewrites.
+
+        An application action (CLI only): the files may hold revoked content, and
+        verify counts them as residuals until they are gone. A file younger than
+        a minute may belong to a rewrite still running and is never touched.
+        """
+        found: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cutoff = datetime.now(timezone.utc).timestamp() - self.TEMP_MIN_AGE_SECONDS
+        for store, slot in self.adapters().items():
+            if slot.adapter is None:
+                continue
+            for path in slot.adapter.leftover_temp_files():
+                if str(path) in seen:
+                    continue
+                seen.add(str(path))
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                entry: dict[str, Any] = {"store_id": store, "path": str(path)}
+                if mtime > cutoff:
+                    entry["result"] = "skipped_recent"
+                elif not delete:
+                    entry["result"] = "found"
+                else:
+                    try:
+                        path.unlink()
+                        entry["result"] = "deleted"
+                    except OSError as exc:
+                        entry["result"] = "failed"
+                        entry["error"] = str(exc)
+                found.append(entry)
+        return {
+            "ok": True,
+            "deleted": delete,
+            "files": found,
+            "note": "Run verify again afterwards; leftover copies count as residuals until removed.",
+        }
 
     def _require_record(self, record_id: str) -> dict[str, Any]:
         record = self.repo.get_record(record_id)
@@ -301,6 +346,41 @@ class Engine:
         identity = " ".join([record.record_id, *record.locator.values()])
         return any(fingerprint(value, key) in tokens for value in token_set(identity))
 
+    # Redaction hashes every window of a record at apply time; past this size the
+    # record goes to review instead.
+    REDACT_MAX_BYTES = 256_000
+
+    def _value_spans(self, target_text: str, content: str) -> list[dict[str, Any]]:
+        """Keyed fingerprints of the exact forms the value takes in `content`.
+
+        Only literal (case-insensitive) occurrences qualify; a spaced or otherwise
+        rewritten form cannot be cut out precisely and stays a review item.
+        """
+        if len(content.encode("utf-8")) > self.REDACT_MAX_BYTES:
+            return []
+        forms: set[str] = set()
+        for variant in variants(target_text):
+            value = variant.strip()
+            if len(value) < MIN_SUBSTRING_LEN:
+                continue
+            for found in re.finditer(re.escape(value), content, re.IGNORECASE):
+                forms.add(found.group(0))
+        key = self.settings.current_hmac_key
+        return [{"hmac": fingerprint(form, key), "length": len(form)} for form in sorted(forms)]
+
+    def _out_of_scope_hits(
+        self, adapter, matcher: ExactMatcher, target_kind: str, target_content: str
+    ) -> list[Record]:
+        hits: list[Record] = []
+        for record in adapter.out_of_scope_records(limit=self.settings.max_scan_records):
+            if self._record_is_oversized(record):
+                continue
+            if matcher.match(record) is not None or (
+                target_kind == "source" and contains_verbatim_passage(target_content, record.content)
+            ):
+                hits.append(record)
+        return hits
+
     def _resolve_locator(self, adapter, locator: dict[str, str]) -> dict[str, str]:
         """Map a keyed locator handle back to the store's real locator."""
         handle = locator.get(self.REDACTED_LOCATOR)
@@ -425,6 +505,7 @@ class Engine:
         partial_match: bool = False,
         expected_fingerprint: str | None = None,
         fingerprint_key_version: int | None = None,
+        redact_spans: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         action, approved, risk = classify.propose_action(
             record_type=record_type,
@@ -433,9 +514,11 @@ class Engine:
             unreachable=unreachable,
             partial_match=partial_match,
             content_overlap=content_overlap,
+            redactable=bool(redact_spans),
         )
         risk = classify.collateral_risk(action, risk, content_overlap)
         return {
+            "redact_spans": list(redact_spans or []),
             "record_id": record_id,
             "store_id": store_id,
             "record_type": record_type,
@@ -509,6 +592,7 @@ class Engine:
         guard_findings: list[dict[str, Any]] = []
         guarded_ids: set[str] = set()
         scanned: dict[str, Record] = {}
+        out_of_scope_hits: list[Record] = []
         coverage: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
         truncated_stores: list[str] = []
@@ -592,6 +676,9 @@ class Engine:
                     guarded_ids.add(scanned_record.record_id)
                     continue
                 self._upsert_scanned(scanned_record, caps)
+            out_of_scope_hits.extend(
+                self._out_of_scope_hits(slot.adapter, matcher, target_kind, target_content)
+            )
 
         if _collect_records is not None:
             _collect_records.update(scanned)
@@ -664,6 +751,11 @@ class Engine:
                     partial_match=match.is_partial,
                     expected_fingerprint=common["expected_fingerprint"],
                     fingerprint_key_version=common["fingerprint_key_version"],
+                    redact_spans=(
+                        self._value_spans(target_content, scanned_record.content)
+                        if fact_mode and match.is_partial
+                        else []
+                    ),
                 )
                 continue
             if record_id in descendant_by_id:
@@ -909,6 +1001,33 @@ class Engine:
                     unknown_reason="candidate record was not reachable during scan",
                 ),
                 relation=edge["relation_guess"],
+                unreachable=True,
+            )
+
+        for hit in out_of_scope_hits:
+            # Found in a table Redacto may read but never modify: shown as a gap.
+            self.repo.upsert_record(
+                record_id=hit.record_id,
+                record_type=hit.record_type,
+                store_id=hit.store_id,
+                locator=hit.locator,
+                fingerprint=fingerprint(hit.content, self.settings.current_hmac_key),
+                fingerprint_key_version=self.settings.hmac_key_version,
+                created_at=None,
+                sensitivity=["unknown"],
+                capabilities={"delete": False, "redact": False, "invalidate": False},
+                status="out_of_scope",
+            )
+            candidates[hit.record_id] = self._candidate(
+                record_id=hit.record_id,
+                store_id=hit.store_id,
+                record_type=hit.record_type,
+                capabilities={"delete": False, "redact": False, "invalidate": False},
+                evidence_class=classify.DIRECT_MATCH,
+                reason_redacted=(
+                    "Found in a table outside the approved scope; Redacto can read it "
+                    "but will not modify it. Remove it with the owning application."
+                ),
                 unreachable=True,
             )
 
@@ -2440,6 +2559,13 @@ class Engine:
                         expected_fingerprint=expected_fingerprint,
                         key=expected_key,
                     )
+                elif action == classify.REDACT_SPAN:
+                    slot.adapter.redact_record(
+                        self._resolve_locator(slot.adapter, record["locator"]),
+                        item.get("redact_spans") or [],
+                        expected_fingerprint=expected_fingerprint,
+                        key=expected_key,
+                    )
                 elif action in {classify.INVALIDATE_INDEX, classify.INVALIDATE_CACHE}:
                     slot.adapter.invalidate_derived(
                         self._resolve_locator(slot.adapter, record["locator"]),
@@ -2520,7 +2646,8 @@ class Engine:
                 idempotency_key=idempotency_key,
             )
             self.repo.set_item_state(item["item_id"], "done")
-            self.repo.mark_record_deleted(item["record_id"])
+            if action != classify.REDACT_SPAN:  # a redacted record stays, minus the value
+                self.repo.mark_record_deleted(item["record_id"])
             counts["succeeded"] += 1
             results.append(
                 {
@@ -2617,7 +2744,15 @@ class Engine:
         planned_removals = {
             item["record_id"]
             for item in items
-            if item["approved"] and item["proposed_action"] in classify.ACTIONABLE
+            if item["approved"]
+            and item["proposed_action"] in classify.ACTIONABLE
+            and item["proposed_action"] != classify.REDACT_SPAN
+        }
+        planned_out_of_scope = {
+            item["record_id"]
+            for item in items
+            if item["proposed_action"] == classify.UNREACHABLE
+            and (self.repo.get_record(item["record_id"]) or {}).get("status") == "out_of_scope"
         }
         target_record = self.repo.get_record(request["target_id"])
         if request["target_kind"] in {"fact", "secret"}:
@@ -2702,6 +2837,7 @@ class Engine:
             if truncated:
                 records = records[:limit]
             residuals: list[str] = []
+            out_of_scope_residuals: list[str] = []
             for record in records:
                 # A record whose id carried the value was planned under an alias;
                 # report it by that alias so the receipt never echoes the value.
@@ -2738,6 +2874,31 @@ class Engine:
                         record.content, target_fingerprint, normalized_len, verify_key
                     ):
                         residuals.append(shown)
+            # Rows of tables Redacto may read but never modify: a copy found there
+            # at plan time, or the value itself, is a residual the operator must
+            # remove with the owning application.
+            for record in slot.adapter.out_of_scope_records(limit=limit):
+                hit = record.record_id in planned_out_of_scope
+                if not hit and target_fingerprint and verify_key:
+                    hit = fingerprint(record.content, verify_key) == target_fingerprint
+                if not hit and secret_tokens and verify_key:
+                    hit = secret_tokens.issubset(
+                        {fingerprint(value, verify_key) for value in token_set(record.content)}
+                    )
+                if (
+                    not hit
+                    and target_fingerprint
+                    and verify_key
+                    and request["target_kind"] in {"fact", "secret"}
+                    and normalized_len
+                    and normalized_len >= MIN_VERIFIABLE_VALUE_LEN
+                ):
+                    hit = contains_normalized(
+                        record.content, target_fingerprint, normalized_len, verify_key
+                    )
+                if hit:
+                    residuals.append(record.record_id)
+                    out_of_scope_residuals.append(record.record_id)
             # A temp copy left by an interrupted rewrite holds the store as it was
             # before the delete. It is not a record, so it cannot be rescanned like
             # one, and absence is never claimed while it exists.
@@ -2766,6 +2927,11 @@ class Engine:
                 limitations.append(
                     f"Record cap reached ({limit}); some records were not rescanned and "
                     "absence is not claimed for them."
+                )
+            if out_of_scope_residuals:
+                limitations.append(
+                    "Copies remain in tables outside the approved scope, which Redacto reads "
+                    "but never modifies: " + ", ".join(out_of_scope_residuals)
                 )
             if leftover_temps:
                 limitations.append(

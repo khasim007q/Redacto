@@ -7,10 +7,19 @@ and traversal attempts fail closed.
 from __future__ import annotations
 
 import os
+import stat
+import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
-from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
+from redacto.adapters.base import (
+    AdapterError,
+    Capabilities,
+    Record,
+    StoreAdapter,
+    redact_spans,
+    rewrite_temp_prefix,
+)
 from redacto.discovery.normalization import fingerprint
 
 SCAN_SUFFIXES = {".md", ".txt", ".rst"}
@@ -34,10 +43,13 @@ class FilesystemAdapter(StoreAdapter):
             adapter_id=self.adapter_id,
             can_scan=True,
             can_delete=True,
-            can_redact=False,
+            can_redact=True,
             can_invalidate=False,
             can_verify=True,
-            notes=["Markdown/text files inside the configured root only."],
+            notes=[
+                "Markdown/text files inside the configured root only.",
+                "Redaction rewrites a UTF-8 file atomically with the value replaced.",
+            ],
         )
 
     def _safe_path(self, locator: dict[str, str]) -> Path:
@@ -135,6 +147,64 @@ class FilesystemAdapter(StoreAdapter):
             path.unlink()
         except OSError as exc:
             raise AdapterError(f"filesystem delete failed: {exc}", code="delete_failed") from exc
+
+    def redact_record(
+        self,
+        locator: dict[str, str],
+        spans: Sequence[dict],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        path = self._safe_path(locator)
+        if not path.exists():
+            raise AdapterError("record no longer exists", code="not_found")
+        if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES:
+            raise AdapterError("record is not an in-scope file", code="out_of_scope")
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+                stats = os.fstat(handle.fileno())
+        except OSError as exc:
+            raise AdapterError(f"filesystem read failed: {exc}", code="read_failed") from exc
+        try:
+            content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AdapterError(
+                "file is not UTF-8; it cannot be redacted safely", code="unsupported_operation"
+            ) from exc
+        if expected_fingerprint and fingerprint(content, key or self._key) != expected_fingerprint:
+            raise AdapterError("record content changed since planning", code="content_changed")
+        redacted, count = redact_spans(content, spans, key or self._key)
+        if count == 0:
+            raise AdapterError("no planned span is present any more", code="not_found")
+        tmp: str | None = None
+        try:
+            current = path.stat()
+            if (current.st_size, current.st_mtime_ns) != (stats.st_size, stats.st_mtime_ns):
+                raise AdapterError("record was replaced during apply", code="content_changed")
+            fd, tmp = tempfile.mkstemp(
+                dir=str(path.parent), prefix=rewrite_temp_prefix(path), suffix=".tmp"
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(redacted.encode("utf-8"))
+            os.chmod(tmp, stat.S_IMODE(stats.st_mode))
+            os.replace(tmp, path)
+            tmp = None
+        except OSError as exc:
+            raise AdapterError(f"filesystem redact failed: {exc}", code="redact_failed") from exc
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def leftover_temp_files(self) -> list[Path]:
+        try:
+            return sorted(p for p in self._root.rglob(".*.redacto-*.tmp") if p.is_file())
+        except OSError:
+            return []
 
     def unscanned_files(self, *, limit: int = 20) -> list[str]:
         """In-scope root files this adapter cannot scan, by extension."""

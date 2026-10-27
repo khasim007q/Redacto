@@ -53,6 +53,7 @@ def propose_action(
     unreachable: bool = False,
     partial_match: bool = False,
     content_overlap: float = 1.0,
+    redactable: bool = False,
 ) -> tuple[str, bool, str]:
     """Return (action, approved_for_plan, collateral_risk).
 
@@ -75,6 +76,10 @@ def propose_action(
         and evidence_class == DIRECT_MATCH
         and content_overlap < PARTIAL_DELETE_MIN_RATIO
     ):
+        # Removing only the value keeps the rest of the record, so it is safe
+        # to plan without review where the store can do it precisely.
+        if redactable and capabilities.get("redact"):
+            return REDACT_SPAN, True, "low"
         return REVIEW_REQUIRED, False, "high"
 
     risk = "low" if evidence_class == DIRECT_MATCH else "medium"
@@ -184,4 +189,5 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "collateral_note": item.get("collateral_note", ""),
         "expected_fingerprint": item.get("expected_fingerprint"),
         "fingerprint_key_version": item.get("fingerprint_key_version"),
+        "redact_spans": item.get("redact_spans") or [],
     }
