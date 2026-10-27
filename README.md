@@ -129,7 +129,7 @@ python -m redacto resolve-quarantine --id <ID> --decision approved|rejected \
 python -m redacto keyring                          # key versions + rotation safety
 python -m redacto calibrate-embeddings             # FP / missed-paraphrase metrics
 python -m redacto evaluate                         # metrics; run after `seed` on a pristine fixture
-python -m redacto report --request-id <REQUEST_ID> --out var\report.html   # read-only HTML report
+python -m redacto report [--request-id <REQUEST_ID>] [--out var\report.html]   # HTML report; default: latest request
 python -m redacto clean-temps [--delete]           # temp copies left by an interrupted rewrite
 python -m redacto serve  --transport stdio   # or: --transport http
 ```
