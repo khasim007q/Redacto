@@ -124,6 +124,22 @@ def collect_status(settings: Settings, *, transport: str) -> dict[str, object]:
             "capabilities": slot.adapter.capabilities().as_dict(),
             "health": slot.adapter.health(),
         }
+        if hasattr(slot.adapter, "unscanned_tables"):
+            tables = slot.adapter.unscanned_tables()
+            if tables:
+                entry["unscanned_tables"] = {
+                    "count": len(tables),
+                    "tables": tables,
+                    "note": "Tables in this store that are not approved and are never scanned.",
+                }
+        leftover = slot.adapter.leftover_temp_files()
+        if leftover:
+            entry["leftover_temp_files"] = {
+                "count": len(leftover),
+                "paths": [str(path) for path in leftover],
+                "note": "Copies left by an interrupted rewrite; they may hold revoked content. "
+                "Delete them once no apply is running.",
+            }
         if hasattr(slot.adapter, "unscanned_files"):
             unscanned = slot.adapter.unscanned_files()
             entry["unscanned_files"] = {

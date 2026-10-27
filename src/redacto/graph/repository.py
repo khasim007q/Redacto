@@ -202,6 +202,43 @@ class Repository:
             results.append(item)
         return results
 
+    def rename_record(self, old_id: str, new_id: str) -> None:
+        """Replace a record id everywhere it is referenced, overwriting the old bytes.
+
+        Used when a record id turns out to carry a revoked value: the graph must
+        not keep it.
+        """
+        references = (
+            ("lineage_edges", "source_id"),
+            ("lineage_edges", "target_id"),
+            ("candidate_edges", "source_id"),
+            ("candidate_edges", "target_id"),
+            ("revocation_plan_items", "record_id"),
+            ("ingestion_events", "record_id"),
+            ("quarantine", "record_id"),
+        )
+        with self._connect() as conn:
+            conn.execute("PRAGMA secure_delete=ON")
+            if conn.execute("SELECT 1 FROM records WHERE record_id = ?", (new_id,)).fetchone():
+                conn.execute("DELETE FROM records WHERE record_id = ?", (old_id,))
+            else:
+                # Every stored field of the old row may carry the value; the caller
+                # upserts the scrubbed record right after.
+                conn.execute(
+                    """UPDATE records SET record_id = ?, locator_json = '{}',
+                              sensitivity_json = '[]', created_at = NULL
+                       WHERE record_id = ?""",
+                    (new_id, old_id),
+                )
+            for table, column in references:
+                conn.execute(
+                    f"UPDATE OR IGNORE {table} SET {column} = ? WHERE {column} = ?",
+                    (new_id, old_id),
+                )
+                conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (old_id,))
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def mark_record_deleted(self, record_id: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE records SET status = 'deleted' WHERE record_id = ?", (record_id,))
@@ -637,7 +674,7 @@ class Repository:
             row = conn.execute(
                 """SELECT * FROM approvals
                    WHERE plan_id = ? AND plan_version = ? AND approval_ref = ?
-                   ORDER BY created_at DESC LIMIT 1""",
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
                 (plan_id, plan_version, approval_ref),
             ).fetchone()
         return _row(row)

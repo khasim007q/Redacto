@@ -152,8 +152,30 @@ def _load_keyring(default_key: str) -> tuple[dict[int, str], int, str | None]:
     return keys, current_version, None
 
 
+def _load_dotenv(path: Path) -> None:
+    """Load a simple KEY=VALUE .env without overriding real environment values."""
+    if not path.is_file():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if value and value[0] in {"'", '"'} and value[-1] == value[0]:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def load_settings() -> Settings:
     base = Path.cwd()
+    _load_dotenv(base / ".env")
     model_provider = os.environ.get("REDACTO_MODEL_PROVIDER", "none").strip().lower()
     hmac_keys, hmac_key_version, keyring_error = _load_keyring(
         os.environ.get("REDACTO_HMAC_KEY", "dev-only-synthetic-fixture-key")

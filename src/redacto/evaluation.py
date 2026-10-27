@@ -29,7 +29,7 @@ def _prf(tp: int, fp: int, fn: int) -> dict[str, Any]:
 
 
 def evaluate_fixture(engine: Engine) -> dict[str, Any]:
-    expected_path = engine.settings.workspace_root.parent / "expected_results.json"
+    expected_path = engine.settings.db_path.parent / "expected_results.json"
     if not expected_path.is_file():
         raise RedactoError(
             "fixture_missing",

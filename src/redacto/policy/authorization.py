@@ -32,18 +32,23 @@ def issue_approval(
     plan = repo.get_plan(plan_id)
     if plan is None:
         raise ValueError("plan_not_found")
-    # EXECUTING is recoverable: a crashed apply may be re-approved with a new
-    # single-use token. Per-action idempotency prevents duplicate work.
+    # EXECUTING, FAILED and PARTIAL are recoverable: they may be re-approved with a
+    # new single-use token. Per-action idempotency prevents duplicate work.
+    # VERIFYING is not: the apply completed, so a second apply has nothing to do.
     if plan["state"] not in {
         "READY_FOR_APPROVAL",
         "APPROVED",
         "EXECUTING",
         "FAILED",
+        "PARTIAL",
     }:
         raise ValueError("plan_not_approvable")
     ref = approval_ref.strip()
     if not (MIN_APPROVAL_REF_LEN <= len(ref) <= MAX_APPROVAL_REF_LEN):
-        raise ValueError("invalid_approval_ref")
+        raise ValueError(
+            f"invalid_approval_ref: must be {MIN_APPROVAL_REF_LEN}-{MAX_APPROVAL_REF_LEN} "
+            "characters after trimming"
+        )
 
     token = secrets.token_urlsafe(32)
     approval_id, expires_at = repo.create_approval(

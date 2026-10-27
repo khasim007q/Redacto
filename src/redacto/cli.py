@@ -35,7 +35,7 @@ def _engine() -> Engine:
 
 def cmd_seed(args: argparse.Namespace) -> int:
     settings = load_settings()
-    result = seed_workspace(settings)
+    result = seed_workspace(settings, force=getattr(args, "force", False))
     _print(result)
     return 0
 
@@ -112,6 +112,13 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def cmd_apply(args: argparse.Namespace) -> int:
     engine = _engine()
+    if args.dry_run is None:
+        # Same default as MCP redacto_apply: REDACTO_DRY_RUN decides.
+        print(
+            f"    dry_run not specified; using REDACTO_DRY_RUN default "
+            f"({engine.settings.dry_run}). Pass --no-dry-run for a real run.",
+            file=sys.stderr,
+        )
     _print(
         engine.apply(
             plan_id=args.plan_id,
@@ -210,10 +217,32 @@ def cmd_resolve_quarantine(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_demo(args: argparse.Namespace) -> int:
+def _demo_settings(args: argparse.Namespace):
+    """Run the demo in an isolated workspace unless asked to use the configured one."""
     settings = load_settings()
+    if getattr(args, "use_configured", False):
+        return settings
+    import tempfile
+    from dataclasses import replace
+
+    root = Path(tempfile.mkdtemp(prefix="redacto-demo-"))
+    workspace = root / "workspace"
+    return replace(
+        settings,
+        workspace_root=workspace,
+        db_path=root / "redacto.sqlite3",
+        sqlite_store_path=workspace / "agent_memory.sqlite3",
+        jsonl_log_path=workspace / "agent_events.jsonl",
+        vector_fixture_path=workspace / "vector_chunks.json",
+    )
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    settings = _demo_settings(args)
     var = settings.db_path.parent
     print("== Redacto demo ==")
+    if not getattr(args, "use_configured", False):
+        print(f"    Isolated demo workspace: {settings.workspace_root}")
     seed = seed_workspace(settings)
     print(f"[1] Seeded synthetic workspace: {seed['records_seeded']} records in {seed['workspace_root']}")
     print(f"    Target: {SOURCE_ID} (confidential acquisition plan)")
@@ -334,7 +363,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="redacto", description="Provenance-aware revocation engine")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("seed", help="create the synthetic fixture workspace and graph").set_defaults(func=cmd_seed)
+    seed = sub.add_parser("seed", help="create the synthetic fixture workspace and graph")
+    seed.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite a workspace that looks like real data (destructive)",
+    )
+    seed.set_defaults(func=cmd_seed)
     sub.add_parser("status", help="adapter health and configured scope").set_defaults(func=cmd_status)
 
     scan = sub.add_parser("scan", help="discover candidates (read-only)")
@@ -385,7 +420,21 @@ def build_parser() -> argparse.ArgumentParser:
     apply_cmd.add_argument("--version", type=int, required=True)
     apply_cmd.add_argument("--ref", required=True)
     apply_cmd.add_argument("--token", required=True)
-    apply_cmd.add_argument("--dry-run", action="store_true")
+    apply_mode = apply_cmd.add_mutually_exclusive_group()
+    apply_mode.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=None,
+        help="simulate only (default: REDACTO_DRY_RUN)",
+    )
+    apply_mode.add_argument(
+        "--no-dry-run",
+        "--execute",
+        dest="dry_run",
+        action="store_false",
+        help="delete for real even when REDACTO_DRY_RUN=true",
+    )
     apply_cmd.set_defaults(func=cmd_apply)
 
     verify = sub.add_parser("verify", help="rescan and write a scoped receipt")
@@ -431,6 +480,11 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.set_defaults(func=cmd_resolve_quarantine)
 
     demo = sub.add_parser("demo", help="run the 90-120 second end-to-end storyboard")
+    demo.add_argument(
+        "--use-configured",
+        action="store_true",
+        help="run against the REDACTO_* workspace instead of an isolated temp workspace",
+    )
     demo.set_defaults(func=cmd_demo)
 
     serve = sub.add_parser("serve", help="run the MCP server")

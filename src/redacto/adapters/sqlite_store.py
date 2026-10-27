@@ -44,6 +44,44 @@ class SqliteMemoryAdapter(StoreAdapter):
                 "sqlite store must expose the approved 'memories' table", code="invalid_schema"
             )
         self._tables = present
+        try:
+            with self._connect() as conn:
+                self._columns = {
+                    table: [
+                        row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    ]
+                    for table in present
+                }
+        except sqlite3.Error as exc:
+            raise AdapterError(f"sqlite store unreadable: {exc}", code="store_unreadable") from exc
+
+    _IDENTITY_PREFIXES = ("mem", "cache")
+
+    def _row_to_record(self, table: str, row: tuple, columns: list[str]) -> Record:
+        values = dict(zip(columns, row))
+        record_id = values.get("id")
+        # Every column is content: a secret in `tags`, `sensitivity` or `created_at`
+        # is still on disk. Column names are included so a secret used as a column
+        # name is not invisible either.
+        parts: list[str] = []
+        for column in columns:
+            parts.append(str(column))
+            value = values.get(column)
+            if value is not None:
+                parts.append(str(value))
+        content = "\n".join(parts)
+        sensitivity_raw = str(values.get("sensitivity") or "")
+        sensitivity_list = [s for s in sensitivity_raw.split(",") if s]
+        return Record(
+            record_id=f"{self._prefix(table)}:{record_id}",
+            record_type=self._tables[table],
+            store_id=self.store_id,
+            locator={"table": table, "id": str(record_id)},
+            content=content,
+            core_content=str(values.get("content") or ""),
+            sensitivity=sensitivity_list or ["unknown"],
+            metadata={"created_at": str(values.get("created_at") or "")},
+        )
 
     @contextmanager
     def _connect(self):
@@ -84,6 +122,33 @@ class SqliteMemoryAdapter(StoreAdapter):
             found[table] = record_type
         return found
 
+    def unscanned_tables(self) -> list[dict[str, object]]:
+        """Tables in this store that are not approved for scan or delete."""
+        import sqlite3 as _sqlite3
+
+        conn = None
+        try:
+            conn = _sqlite3.connect(self._path, timeout=5)
+            names = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            result: list[dict[str, object]] = []
+            for name in sorted(set(names) - set(APPROVED_TABLES)):
+                columns = [
+                    row[1] for row in conn.execute(f"PRAGMA table_info({name})").fetchall()
+                ]
+                result.append({"table": name, "columns": columns})
+            return result
+        except _sqlite3.Error:
+            return []
+        finally:
+            if conn is not None:
+                conn.close()
+
     def capabilities(self) -> Capabilities:
         return Capabilities(
             adapter_id=self.adapter_id,
@@ -102,23 +167,10 @@ class SqliteMemoryAdapter(StoreAdapter):
     def _prefix(table: str) -> str:
         return APPROVED_TABLES[table][1]
 
-    def _row_to_record(self, table: str, row: tuple) -> Record:
-        record_id, content, created_at, sensitivity = row
-        sensitivity_list = [s for s in (sensitivity or "").split(",") if s]
-        return Record(
-            record_id=f"{self._prefix(table)}:{record_id}",
-            record_type=self._tables[table],
-            store_id=self.store_id,
-            locator={"table": table, "id": str(record_id)},
-            content=content or "",
-            sensitivity=sensitivity_list or ["unknown"],
-            metadata={"created_at": created_at or ""},
-        )
-
     def list_records(self, *, limit: int | None = None) -> Iterable[Record]:
         remaining = limit
         for table in sorted(self._tables):
-            sql = f"SELECT id, content, created_at, sensitivity FROM {table} ORDER BY id"
+            sql = f"SELECT * FROM {table} ORDER BY id"
             if remaining is not None:
                 sql += f" LIMIT {int(remaining)}"
             try:
@@ -126,8 +178,9 @@ class SqliteMemoryAdapter(StoreAdapter):
                     rows = conn.execute(sql).fetchall()
             except sqlite3.Error as exc:
                 raise AdapterError(f"sqlite scan failed: {exc}", code="scan_failed") from exc
+            columns = self._columns[table]
             for row in rows:
-                yield self._row_to_record(table, row)
+                yield self._row_to_record(table, row, columns)
                 if remaining is not None:
                     remaining -= 1
                     if remaining <= 0:
@@ -143,14 +196,13 @@ class SqliteMemoryAdapter(StoreAdapter):
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    f"SELECT id, content, created_at, sensitivity FROM {table} WHERE id = ?",
-                    (record_id,),
+                    f"SELECT * FROM {table} WHERE id = ?", (record_id,)
                 ).fetchone()
         except sqlite3.Error as exc:
             raise AdapterError(f"sqlite read failed: {exc}", code="read_failed") from exc
         if row is None:
             raise AdapterError("record no longer exists", code="not_found")
-        return self._row_to_record(table, row)
+        return self._row_to_record(table, row, self._columns[table])
 
     def delete_record(
         self,
@@ -171,12 +223,16 @@ class SqliteMemoryAdapter(StoreAdapter):
                 # with another writer.
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    f"SELECT content FROM {table} WHERE id = ?", (record_id,)
+                    f"SELECT * FROM {table} WHERE id = ?", (record_id,)
                 ).fetchone()
                 if row is None:
                     raise AdapterError("record no longer exists", code="not_found")
                 if expected_fingerprint and (
-                    fingerprint(row[0] or "", key or self._key) != expected_fingerprint
+                    fingerprint(
+                        self._row_to_record(table, row, self._columns[table]).content,
+                        key or self._key,
+                    )
+                    != expected_fingerprint
                 ):
                     raise AdapterError(
                         "record content changed since planning", code="content_changed"

@@ -13,7 +13,14 @@ import tempfile
 from pathlib import Path
 from typing import Iterable
 
-from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
+from redacto.adapters.base import (
+    AdapterError,
+    Capabilities,
+    Record,
+    StoreAdapter,
+    leftover_rewrite_temps,
+    rewrite_temp_prefix,
+)
 from redacto.discovery.normalization import fingerprint
 
 
@@ -53,29 +60,95 @@ class VectorFixtureAdapter(StoreAdapter):
         return chunks
 
     def _save(self, chunks: list[dict]) -> None:
+        tmp: str | None = None
         try:
             mode = stat.S_IMODE(self._path.stat().st_mode)
-            fd, tmp = tempfile.mkstemp(dir=str(self._path.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd, tmp = tempfile.mkstemp(
+                dir=str(self._path.parent), prefix=rewrite_temp_prefix(self._path), suffix=".tmp"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 json.dump({"chunks": chunks}, handle, indent=2)
                 handle.write("\n")
             os.chmod(tmp, mode)
             os.replace(tmp, self._path)
+            tmp = None
         except OSError as exc:
             raise AdapterError(f"vector fixture write failed: {exc}", code="delete_failed") from exc
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
-    @staticmethod
-    def _content(chunk: dict) -> str:
-        """Chunk text plus every string value in its metadata."""
-        parts = [str(chunk.get("text") or chunk.get("chunk") or "")]
-        metadata = chunk.get("metadata") or {}
-        if isinstance(metadata, dict):
-            for value in metadata.values():
-                if isinstance(value, str) and value:
+    _INTERNAL_KEYS = {"id", "chunk_id"}
+    MAX_WALK_DEPTH = 64
+
+    @classmethod
+    def _content(cls, chunk: dict) -> str:
+        """Every field and nested string in the chunk, including metadata.
+
+        Covers `text`, `chunk`, `content`, `page_content` and any other field a
+        producer uses, plus metadata keys and values at any depth.
+        """
+        parts: list[str] = []
+        seen: set[int] = set()
+
+        def walk(value, depth: int = 0) -> None:
+            if depth > cls.MAX_WALK_DEPTH:
+                return
+            if isinstance(value, str):
+                if value:
                     parts.append(value)
-                elif isinstance(value, list):
-                    parts.extend(str(item) for item in value if isinstance(item, str) and item)
-        return "\n".join(part for part in parts if part)
+                return
+            if isinstance(value, (dict, list)):
+                marker = id(value)
+                if marker in seen:
+                    return
+                seen.add(marker)
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    key_text = str(key)
+                    if key_text in cls._INTERNAL_KEYS:
+                        continue
+                    if key_text:
+                        parts.append(key_text)
+                    walk(item, depth + 1)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, depth + 1)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                parts.append(str(value))
+
+        walk(chunk)
+        return "\n".join(parts)
+
+    @classmethod
+    def _primary_text(cls, chunk: dict) -> str:
+        for key in ("text", "chunk", "content", "page_content"):
+            value = chunk.get(key)
+            if isinstance(value, str) and value:
+                return value
+        # No primary text field: fall back to metadata values without their keys.
+        parts: list[str] = []
+
+        def walk(value, depth: int = 0) -> None:
+            if depth > cls.MAX_WALK_DEPTH:
+                return
+            if isinstance(value, str):
+                if value:
+                    parts.append(value)
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    if str(key) in cls._INTERNAL_KEYS:
+                        continue
+                    walk(item, depth + 1)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item, depth + 1)
+
+        walk(chunk)
+        return "\n".join(parts)
 
     def _to_record(self, chunk: dict) -> Record:
         chunk_id = str(chunk.get("id") or chunk.get("chunk_id"))
@@ -85,6 +158,7 @@ class VectorFixtureAdapter(StoreAdapter):
             store_id=self.store_id,
             locator={"id": chunk_id},
             content=self._content(chunk),
+            core_content=self._primary_text(chunk),
             sensitivity=[str(chunk.get("sensitivity"))] if chunk.get("sensitivity") else ["unknown"],
             metadata={k: str(v) for k, v in (chunk.get("metadata") or {}).items()},
         )
@@ -154,6 +228,9 @@ class VectorFixtureAdapter(StoreAdapter):
             }
         )
         self._save(chunks)
+
+    def leftover_temp_files(self) -> list[Path]:
+        return leftover_rewrite_temps(self._path)
 
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = 0

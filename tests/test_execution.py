@@ -194,7 +194,11 @@ def test_seed_reseeds_cleanly(tmp_path):
     engine = Engine(settings)
     plan = engine.plan(target_id=SOURCE_ID)
     approve_and_apply(engine, plan)
-    seed_workspace(settings)
+    # A workspace with revocation history must not be reset silently.
+    with pytest.raises(RedactoError) as excinfo:
+        seed_workspace(settings)
+    assert excinfo.value.code == "seed_would_destroy_data"
+    seed_workspace(settings, force=True)
     assert (settings.workspace_root / "acquisition-plan.md").exists()
     assert Engine(settings).trace(source_id=SOURCE_ID)["confirmed_descendants"]
     assert Path(settings.db_path).exists()
