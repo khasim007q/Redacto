@@ -50,7 +50,9 @@ def test_crashed_executing_plan_can_be_reapproved_and_resumed(tmp_path):
     assert result["plan_state"] == "VERIFYING"
 
 
-def test_review_item_approval_requires_a_new_plan_version_and_token(tmp_path):
+def test_review_item_approval_requires_a_new_plan_version_and_token(tmp_path, monkeypatch):
+    # Redaction would handle this record; force the review path it falls back to.
+    monkeypatch.setattr(Engine, "REDACT_MAX_BYTES", 0)
     settings = seeded_settings(tmp_path)
     handbook = settings.workspace_root / "team-handbook.md"
     handbook.write_text(
@@ -94,7 +96,9 @@ def test_review_item_approval_requires_a_new_plan_version_and_token(tmp_path):
     assert not handbook.exists()
 
 
-def test_review_item_rejection_keeps_the_item_unapproved(tmp_path):
+def test_review_item_rejection_keeps_the_item_unapproved(tmp_path, monkeypatch):
+    # Redaction would handle this record; force the review path it falls back to.
+    monkeypatch.setattr(Engine, "REDACT_MAX_BYTES", 0)
     settings = seeded_settings(tmp_path)
     handbook = settings.workspace_root / "team-handbook.md"
     handbook.write_text("# Handbook\n\nMeridian Capital note.\n\n" + RUNBOOK, encoding="utf-8")
@@ -195,7 +199,9 @@ def test_unexpected_exception_marks_the_plan_failed(engine, monkeypatch):
     assert engine.repo.get_plan(plan["plan_id"])["state"] == "FAILED"
 
 
-def test_reviewing_an_item_invalidates_the_prior_approval(tmp_path):
+def test_reviewing_an_item_invalidates_the_prior_approval(tmp_path, monkeypatch):
+    # Redaction would handle this record; force the review path it falls back to.
+    monkeypatch.setattr(Engine, "REDACT_MAX_BYTES", 0)
     settings = seeded_settings(tmp_path)
     handbook = settings.workspace_root / "team-handbook.md"
     handbook.write_text("# Handbook\n\nMeridian Capital note.\n\n" + RUNBOOK, encoding="utf-8")

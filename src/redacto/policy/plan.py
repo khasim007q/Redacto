@@ -24,10 +24,13 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
             unreachable=bool(candidate.get("unreachable")),
             partial_match=bool(candidate.get("partial_match")),
             content_overlap=float(candidate.get("match_ratio", 1.0)),
+            redactable=bool(candidate.get("redact_spans")),
         )
         risk = classify.collateral_risk(
             action, base_risk, float(candidate.get("match_ratio", 1.0))
         )
+        if action == classify.REDACT_SPAN:
+            risk = "low"  # only the value goes; the rest of the record stays
         items.append(
             {
                 "item_id": new_id("item"),
@@ -50,6 +53,12 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
                 "match_kind": candidate.get("match_kind"),
                 "partial_match": bool(candidate.get("partial_match")),
                 "collateral_note": candidate.get("collateral_note", ""),
+                # Keyed fingerprints + lengths of the value's exact forms, never the value.
+                "redact_spans": (
+                    list(candidate.get("redact_spans") or [])
+                    if action == classify.REDACT_SPAN
+                    else []
+                ),
             }
         )
     return items
@@ -79,6 +88,7 @@ def compute_plan_hash(
                 "approved": bool(item["approved"]),
                 "expected_fingerprint": item.get("expected_fingerprint"),
                 "fingerprint_key_version": item.get("fingerprint_key_version"),
+                "redact_spans": item.get("redact_spans") or [],
             }
             for item in sorted(items, key=lambda i: i["item_id"])
         ],

@@ -12,8 +12,8 @@ from redacto.adapters.base import AdapterError, Record
 from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
 from redacto.discovery.embeddings import build_embedder, cosine
-from redacto.discovery.exact import ExactMatcher, shares_entity
-from redacto.discovery.normalization import fingerprint, normalize_loose
+from redacto.discovery.exact import MIN_SUBSTRING_LEN, ExactMatcher, shares_entity
+from redacto.discovery.normalization import fingerprint, normalize_loose, variants
 from redacto.discovery.relationship_assessor import (
     CandidateContext,
     RelationshipAssessor,
@@ -22,6 +22,7 @@ from redacto.discovery.relationship_assessor import (
 )
 import json
 import os
+import re
 import socket
 from datetime import datetime, timezone
 
@@ -345,6 +346,28 @@ class Engine:
         identity = " ".join([record.record_id, *record.locator.values()])
         return any(fingerprint(value, key) in tokens for value in token_set(identity))
 
+    # Redaction hashes every window of a record at apply time; past this size the
+    # record goes to review instead.
+    REDACT_MAX_BYTES = 256_000
+
+    def _value_spans(self, target_text: str, content: str) -> list[dict[str, Any]]:
+        """Keyed fingerprints of the exact forms the value takes in `content`.
+
+        Only literal (case-insensitive) occurrences qualify; a spaced or otherwise
+        rewritten form cannot be cut out precisely and stays a review item.
+        """
+        if len(content.encode("utf-8")) > self.REDACT_MAX_BYTES:
+            return []
+        forms: set[str] = set()
+        for variant in variants(target_text):
+            value = variant.strip()
+            if len(value) < MIN_SUBSTRING_LEN:
+                continue
+            for found in re.finditer(re.escape(value), content, re.IGNORECASE):
+                forms.add(found.group(0))
+        key = self.settings.current_hmac_key
+        return [{"hmac": fingerprint(form, key), "length": len(form)} for form in sorted(forms)]
+
     def _out_of_scope_hits(
         self, adapter, matcher: ExactMatcher, target_kind: str, target_content: str
     ) -> list[Record]:
@@ -482,6 +505,7 @@ class Engine:
         partial_match: bool = False,
         expected_fingerprint: str | None = None,
         fingerprint_key_version: int | None = None,
+        redact_spans: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         action, approved, risk = classify.propose_action(
             record_type=record_type,
@@ -490,9 +514,11 @@ class Engine:
             unreachable=unreachable,
             partial_match=partial_match,
             content_overlap=content_overlap,
+            redactable=bool(redact_spans),
         )
         risk = classify.collateral_risk(action, risk, content_overlap)
         return {
+            "redact_spans": list(redact_spans or []),
             "record_id": record_id,
             "store_id": store_id,
             "record_type": record_type,
@@ -725,6 +751,11 @@ class Engine:
                     partial_match=match.is_partial,
                     expected_fingerprint=common["expected_fingerprint"],
                     fingerprint_key_version=common["fingerprint_key_version"],
+                    redact_spans=(
+                        self._value_spans(target_content, scanned_record.content)
+                        if fact_mode and match.is_partial
+                        else []
+                    ),
                 )
                 continue
             if record_id in descendant_by_id:
@@ -2528,6 +2559,13 @@ class Engine:
                         expected_fingerprint=expected_fingerprint,
                         key=expected_key,
                     )
+                elif action == classify.REDACT_SPAN:
+                    slot.adapter.redact_record(
+                        self._resolve_locator(slot.adapter, record["locator"]),
+                        item.get("redact_spans") or [],
+                        expected_fingerprint=expected_fingerprint,
+                        key=expected_key,
+                    )
                 elif action in {classify.INVALIDATE_INDEX, classify.INVALIDATE_CACHE}:
                     slot.adapter.invalidate_derived(
                         self._resolve_locator(slot.adapter, record["locator"]),
@@ -2608,7 +2646,8 @@ class Engine:
                 idempotency_key=idempotency_key,
             )
             self.repo.set_item_state(item["item_id"], "done")
-            self.repo.mark_record_deleted(item["record_id"])
+            if action != classify.REDACT_SPAN:  # a redacted record stays, minus the value
+                self.repo.mark_record_deleted(item["record_id"])
             counts["succeeded"] += 1
             results.append(
                 {
@@ -2705,7 +2744,9 @@ class Engine:
         planned_removals = {
             item["record_id"]
             for item in items
-            if item["approved"] and item["proposed_action"] in classify.ACTIONABLE
+            if item["approved"]
+            and item["proposed_action"] in classify.ACTIONABLE
+            and item["proposed_action"] != classify.REDACT_SPAN
         }
         planned_out_of_scope = {
             item["record_id"]

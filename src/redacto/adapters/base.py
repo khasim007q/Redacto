@@ -44,6 +44,43 @@ def leftover_rewrite_temps(path: Path) -> list[Path]:
     return sorted(p for p in found if p.is_file())
 
 
+REDACTION_MARK = "[REDACTED]"
+
+
+def redact_spans(text: str, spans: Sequence[dict], key: str) -> tuple[str, int]:
+    """Replace every window of `text` whose keyed fingerprint matches a span.
+
+    A span is {"hmac": ..., "length": n}: the plan never holds the value itself,
+    so the exact substrings are found again by hashing each window of that
+    length. Longer spans are replaced first.
+    """
+    from redacto.discovery.normalization import fingerprint
+
+    by_length: dict[int, set[str]] = {}
+    for span in spans:
+        length = int(span["length"])
+        if length > 0:
+            by_length.setdefault(length, set()).add(str(span["hmac"]))
+    count = 0
+    for length in sorted(by_length, reverse=True):
+        targets = by_length[length]
+        pieces: list[str] = []
+        start = 0
+        index = 0
+        while index <= len(text) - length:
+            if fingerprint(text[index : index + length], key) in targets:
+                pieces.append(text[start:index])
+                pieces.append(REDACTION_MARK)
+                index += length
+                start = index
+                count += 1
+            else:
+                index += 1
+        pieces.append(text[start:])
+        text = "".join(pieces)
+    return text, count
+
+
 class Record(BaseModel):
     """A scannable unit in a store. Content is transient and never persisted."""
 
@@ -124,7 +161,19 @@ class StoreAdapter(ABC):
             f"{self.adapter_id}: writing records is not supported", code="unsupported_operation"
         )
 
-    def redact_record(self, locator: dict[str, str], spans: Sequence[str]) -> None:
+    def redact_record(
+        self,
+        locator: dict[str, str],
+        spans: Sequence[dict],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        """Replace the planned spans with REDACTION_MARK, keeping the rest.
+
+        Like delete_record, the record's content must still match the plan-time
+        fingerprint, and a redaction that finds no span raises not_found.
+        """
         raise AdapterError(
             f"{self.adapter_id}: redaction is not supported", code="unsupported_operation"
         )

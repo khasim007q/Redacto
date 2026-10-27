@@ -9,9 +9,9 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
-from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
+from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter, redact_spans
 from redacto.discovery.normalization import fingerprint
 
 # table -> (record_type, record_id prefix)
@@ -204,7 +204,7 @@ class SqliteMemoryAdapter(StoreAdapter):
             adapter_id=self.adapter_id,
             can_scan=True,
             can_delete=True,
-            can_redact=False,
+            can_redact=True,
             can_invalidate=True,
             can_verify=True,
             notes=[
@@ -294,6 +294,55 @@ class SqliteMemoryAdapter(StoreAdapter):
             raise
         except sqlite3.Error as exc:
             raise AdapterError(f"sqlite delete failed: {exc}", code="delete_failed") from exc
+        self._checkpoint()
+
+    def redact_record(
+        self,
+        locator: dict[str, str],
+        spans: Sequence[dict],
+        *,
+        expected_fingerprint: str | None = None,
+        key: str | None = None,
+    ) -> None:
+        table = locator.get("table")
+        if table not in self._tables:
+            raise AdapterError("unapproved table", code="out_of_scope")
+        record_id = locator.get("id")
+        if not record_id:
+            raise AdapterError("sqlite locator requires 'id'", code="invalid_locator")
+        columns = self._columns[table]
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+                if row is None:
+                    raise AdapterError("record no longer exists", code="not_found")
+                if expected_fingerprint and (
+                    fingerprint(self._row_to_record(table, row, columns).content, key or self._key)
+                    != expected_fingerprint
+                ):
+                    raise AdapterError(
+                        "record content changed since planning", code="content_changed"
+                    )
+                updates: dict[str, str] = {}
+                for column, value in zip(columns, row):
+                    # The id is the row's identity; a value there is aliased, not edited.
+                    if column == "id" or not isinstance(value, str):
+                        continue
+                    redacted, count = redact_spans(value, spans, key or self._key)
+                    if count:
+                        updates[column] = redacted
+                if not updates:
+                    raise AdapterError("no planned span is present any more", code="not_found")
+                assignments = ", ".join(f'"{column}" = ?' for column in updates)
+                conn.execute(
+                    f"UPDATE {table} SET {assignments} WHERE id = ?",
+                    (*updates.values(), record_id),
+                )
+        except AdapterError:
+            raise
+        except sqlite3.Error as exc:
+            raise AdapterError(f"sqlite redact failed: {exc}", code="redact_failed") from exc
         self._checkpoint()
 
     def invalidate_derived(
