@@ -109,7 +109,8 @@ class VectorFixtureAdapter(StoreAdapter):
             if isinstance(value, dict):
                 for key, item in value.items():
                     key_text = str(key)
-                    if key_text in cls._INTERNAL_KEYS:
+                    # The chunk's own id is identity; a nested "id" is content.
+                    if depth == 0 and key_text in cls._INTERNAL_KEYS:
                         continue
                     if key_text:
                         parts.append(key_text)

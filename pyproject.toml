@@ -16,9 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+chroma = ["chromadb>=0.5"]
+redis = ["redis>=5"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "fakeredis>=2.20",
 ]
 
 [project.scripts]

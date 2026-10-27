@@ -80,6 +80,13 @@ def propose_action(
         # to plan without review where the store can do it precisely.
         if redactable and capabilities.get("redact"):
             return REDACT_SPAN, True, "low"
+        # An index entry or cached response is derived data the system rebuilds:
+        # invalidating it loses nothing that cannot be regenerated, while an
+        # embedding or cached answer keeps the value even if its text is edited.
+        if record_type == "index_entry" and capabilities.get("invalidate"):
+            return INVALIDATE_INDEX, True, "medium"
+        if record_type == "cache_entry" and capabilities.get("invalidate"):
+            return INVALIDATE_CACHE, True, "medium"
         return REVIEW_REQUIRED, False, "high"
 
     risk = "low" if evidence_class == DIRECT_MATCH else "medium"

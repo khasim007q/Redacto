@@ -25,6 +25,10 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_list(name: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in os.environ.get(name, "").split(",") if part.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable settings resolved once at process start."""
@@ -52,6 +56,13 @@ class Settings:
     http_token: str | None
     keyring_error: str | None = None
     extra: dict[str, str] = field(default_factory=dict)
+    # Optional real stores. Each is only in scope when explicitly configured.
+    chroma_path: Path | None = None
+    chroma_collections: tuple[str, ...] = ()
+    redis_url: str | None = None
+    redis_key_patterns: tuple[str, ...] = ()
+    # Opt-in: rebuild confirmed derivatives from their remaining allowed sources.
+    regenerate_derivatives: bool = False
 
     @property
     def current_hmac_key(self) -> str:
@@ -106,6 +117,18 @@ class Settings:
             "embedding_provider": self.embedding_provider,
             "embedding_candidate_threshold": self.embedding_candidate_threshold,
             "embedding_quarantine_threshold": self.embedding_quarantine_threshold,
+            "chroma": (
+                {"path": str(self.chroma_path), "collections": list(self.chroma_collections)}
+                if self.chroma_path
+                else None
+            ),
+            # The URL may carry a password, so only its presence is reported.
+            "redis": (
+                {"configured": True, "key_patterns": list(self.redis_key_patterns)}
+                if self.redis_url
+                else None
+            ),
+            "regenerate_derivatives": self.regenerate_derivatives,
         }
 
 
@@ -213,4 +236,13 @@ def load_settings() -> Settings:
         http_port=int(os.environ.get("REDACTO_HTTP_PORT", "8765")),
         http_token=os.environ.get("REDACTO_HTTP_TOKEN") or None,
         keyring_error=keyring_error,
+        chroma_path=(
+            Path(os.environ["REDACTO_CHROMA_PATH"]).expanduser().resolve()
+            if os.environ.get("REDACTO_CHROMA_PATH")
+            else None
+        ),
+        chroma_collections=_env_list("REDACTO_CHROMA_COLLECTIONS"),
+        redis_url=os.environ.get("REDACTO_REDIS_URL") or None,
+        redis_key_patterns=_env_list("REDACTO_REDIS_KEY_PATTERNS"),
+        regenerate_derivatives=_env_bool("REDACTO_REGENERATE", False),
     )

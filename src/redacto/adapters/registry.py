@@ -39,6 +39,25 @@ def build_adapters(settings: Settings) -> dict[str, AdapterSlot]:
     _add("sqlite_memory", lambda: SqliteMemoryAdapter(settings.sqlite_store_path, settings.current_hmac_key))
     _add("jsonl_logs", lambda: JsonlLogAdapter(settings.jsonl_log_path, settings.current_hmac_key))
     _add("vector_fixture", lambda: VectorFixtureAdapter(settings.vector_fixture_path, settings.current_hmac_key))
+    # Real stores join the scope only when explicitly configured.
+    if settings.chroma_path:
+        from redacto.adapters.chroma_store import ChromaAdapter
+
+        _add(
+            "chroma",
+            lambda: ChromaAdapter(
+                settings.chroma_path, settings.chroma_collections, settings.current_hmac_key
+            ),
+        )
+    if settings.redis_url:
+        from redacto.adapters.redis_cache import RedisCacheAdapter
+
+        _add(
+            "redis_cache",
+            lambda: RedisCacheAdapter(
+                settings.redis_url, settings.redis_key_patterns, settings.current_hmac_key
+            ),
+        )
     return slots
 
 
