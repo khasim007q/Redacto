@@ -12,6 +12,7 @@ from pathlib import Path
 
 from redacto.adapters.registry import build_adapters
 from redacto.config import Settings
+from redacto.errors import RedactoError
 from redacto.discovery.normalization import fingerprint
 from redacto.graph.repository import Repository
 
@@ -223,14 +224,14 @@ CONFIDENTIAL_IDS = {
 }
 
 
-def _write_workspace(root: Path) -> None:
+def _write_workspace(root: Path, sqlite_path: Path | None = None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     (root / "acquisition-plan.md").write_text(ACQUISITION_PLAN, encoding="utf-8")
     (root / "generated-summary.md").write_text(GENERATED_SUMMARY, encoding="utf-8")
     (root / "eng-notes.md").write_text(ENGINEERING_NOTES, encoding="utf-8")
     (root / "sibling-public-mention.md").write_text(SIBLING_PUBLIC, encoding="utf-8")
 
-    db_path = root / "agent_memory.sqlite3"
+    db_path = sqlite_path or (root / "agent_memory.sqlite3")
     if db_path.exists():
         db_path.unlink()
     conn = sqlite3.connect(db_path)
@@ -280,9 +281,96 @@ def _reset_db(path: Path) -> None:
             candidate.unlink()
 
 
-def seed_workspace(settings: Settings) -> dict[str, object]:
-    """Create fixtures + graph. Idempotent: resets the graph and rewrites files."""
-    _write_workspace(settings.workspace_root)
+FIXTURE_FILES = {
+    "acquisition-plan.md",
+    "generated-summary.md",
+    "eng-notes.md",
+    "sibling-public-mention.md",
+    "agent_memory.sqlite3",
+    "agent_events.jsonl",
+    "vector_chunks.json",
+}
+
+
+def _destructive_changes(settings: Settings) -> list[str]:
+    """Reasons seeding would destroy data the user may care about."""
+    reasons: list[str] = []
+    root = settings.workspace_root
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.name not in FIXTURE_FILES:
+                reasons.append(f"unrecognised file in workspace: {path.relative_to(root).as_posix()}")
+            elif path.name.endswith((".md", ".jsonl", ".json")) and path.name not in {
+                "acquisition-plan.md",
+                "generated-summary.md",
+                "eng-notes.md",
+                "sibling-public-mention.md",
+                "agent_events.jsonl",
+                "vector_chunks.json",
+            }:
+                reasons.append(f"unexpected file: {path.name}")
+    # An existing store with extra tables or rows is a real workspace.
+    if settings.sqlite_store_path.is_file():
+        import sqlite3
+
+        conn = None
+        try:
+            conn = sqlite3.connect(settings.sqlite_store_path)
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        except sqlite3.Error:
+            tables = set()
+        finally:
+            if conn is not None:
+                conn.close()
+        extra = tables - {"memories", "response_cache"}
+        if extra:
+            reasons.append("sqlite store has unapproved tables: " + ", ".join(sorted(extra)))
+    # An existing graph with revocations must not be reset silently.
+    if settings.db_path.is_file():
+        import sqlite3
+
+        conn = None
+        try:
+            conn = sqlite3.connect(settings.db_path)
+            tombstones = conn.execute(
+                "SELECT COUNT(*) FROM tombstones WHERE status = 'active'"
+            ).fetchone()[0]
+            requests = conn.execute(
+                "SELECT COUNT(*) FROM revocation_requests"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            tombstones, requests = 0, 0
+        finally:
+            if conn is not None:
+                conn.close()
+        if tombstones:
+            reasons.append(f"graph has {tombstones} active tombstone(s)")
+        if requests:
+            reasons.append(f"graph has {requests} revocation request(s)")
+    return reasons
+
+
+def seed_workspace(settings: Settings, *, force: bool = False) -> dict[str, object]:
+    """Create fixtures + graph.
+
+    Refuses to overwrite a workspace that looks like real user data (extra files,
+    extra tables, or an existing revocation history) unless `force` is set.
+    """
+    reasons = _destructive_changes(settings)
+    if reasons and not force:
+        raise RedactoError(
+            "seed_would_destroy_data",
+            "Refusing to seed: this would overwrite existing data. Use --force to override.",
+            {"reasons": reasons, "workspace_root": str(settings.workspace_root)},
+        )
+    _write_workspace(settings.workspace_root, settings.sqlite_store_path)
     _reset_db(settings.db_path)
     repo = Repository(settings.db_path)
 
@@ -379,7 +467,9 @@ def seed_workspace(settings: Settings) -> dict[str, object]:
             "positives_min_score": 0.31,
         },
     }
-    (settings.workspace_root.parent / "expected_results.json").write_text(
+    expected_path = settings.db_path.parent / "expected_results.json"
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_path.write_text(
         json.dumps(expected, indent=2) + "\n", encoding="utf-8"
     )
     return {
