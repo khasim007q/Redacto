@@ -144,6 +144,14 @@ class StoreAdapter(ABC):
     def verify_absent(self, fingerprint: str) -> tuple[bool, list[str]]:
         """Return (absent_confirmed, limitations) using only supported methods."""
 
+    def out_of_scope_records(self, *, limit: int | None = None) -> list["Record"]:
+        """Records this store holds outside its approved scope, read-only.
+
+        They are searched so a copy there is reported, but Redacto never modifies
+        them.
+        """
+        return []
+
     def leftover_temp_files(self) -> list[Path]:
         """Uncontrolled copies of this store on disk (for example crashed rewrites)."""
         return []

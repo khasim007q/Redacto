@@ -345,6 +345,19 @@ class Engine:
         identity = " ".join([record.record_id, *record.locator.values()])
         return any(fingerprint(value, key) in tokens for value in token_set(identity))
 
+    def _out_of_scope_hits(
+        self, adapter, matcher: ExactMatcher, target_kind: str, target_content: str
+    ) -> list[Record]:
+        hits: list[Record] = []
+        for record in adapter.out_of_scope_records(limit=self.settings.max_scan_records):
+            if self._record_is_oversized(record):
+                continue
+            if matcher.match(record) is not None or (
+                target_kind == "source" and contains_verbatim_passage(target_content, record.content)
+            ):
+                hits.append(record)
+        return hits
+
     def _resolve_locator(self, adapter, locator: dict[str, str]) -> dict[str, str]:
         """Map a keyed locator handle back to the store's real locator."""
         handle = locator.get(self.REDACTED_LOCATOR)
@@ -553,6 +566,7 @@ class Engine:
         guard_findings: list[dict[str, Any]] = []
         guarded_ids: set[str] = set()
         scanned: dict[str, Record] = {}
+        out_of_scope_hits: list[Record] = []
         coverage: list[dict[str, Any]] = []
         unreachable: list[dict[str, Any]] = []
         truncated_stores: list[str] = []
@@ -636,6 +650,9 @@ class Engine:
                     guarded_ids.add(scanned_record.record_id)
                     continue
                 self._upsert_scanned(scanned_record, caps)
+            out_of_scope_hits.extend(
+                self._out_of_scope_hits(slot.adapter, matcher, target_kind, target_content)
+            )
 
         if _collect_records is not None:
             _collect_records.update(scanned)
@@ -953,6 +970,33 @@ class Engine:
                     unknown_reason="candidate record was not reachable during scan",
                 ),
                 relation=edge["relation_guess"],
+                unreachable=True,
+            )
+
+        for hit in out_of_scope_hits:
+            # Found in a table Redacto may read but never modify: shown as a gap.
+            self.repo.upsert_record(
+                record_id=hit.record_id,
+                record_type=hit.record_type,
+                store_id=hit.store_id,
+                locator=hit.locator,
+                fingerprint=fingerprint(hit.content, self.settings.current_hmac_key),
+                fingerprint_key_version=self.settings.hmac_key_version,
+                created_at=None,
+                sensitivity=["unknown"],
+                capabilities={"delete": False, "redact": False, "invalidate": False},
+                status="out_of_scope",
+            )
+            candidates[hit.record_id] = self._candidate(
+                record_id=hit.record_id,
+                store_id=hit.store_id,
+                record_type=hit.record_type,
+                capabilities={"delete": False, "redact": False, "invalidate": False},
+                evidence_class=classify.DIRECT_MATCH,
+                reason_redacted=(
+                    "Found in a table outside the approved scope; Redacto can read it "
+                    "but will not modify it. Remove it with the owning application."
+                ),
                 unreachable=True,
             )
 
@@ -2663,6 +2707,12 @@ class Engine:
             for item in items
             if item["approved"] and item["proposed_action"] in classify.ACTIONABLE
         }
+        planned_out_of_scope = {
+            item["record_id"]
+            for item in items
+            if item["proposed_action"] == classify.UNREACHABLE
+            and (self.repo.get_record(item["record_id"]) or {}).get("status") == "out_of_scope"
+        }
         target_record = self.repo.get_record(request["target_id"])
         if request["target_kind"] in {"fact", "secret"}:
             # Verify the value itself. The anchor record is only a lookup handle and
@@ -2746,6 +2796,7 @@ class Engine:
             if truncated:
                 records = records[:limit]
             residuals: list[str] = []
+            out_of_scope_residuals: list[str] = []
             for record in records:
                 # A record whose id carried the value was planned under an alias;
                 # report it by that alias so the receipt never echoes the value.
@@ -2782,6 +2833,31 @@ class Engine:
                         record.content, target_fingerprint, normalized_len, verify_key
                     ):
                         residuals.append(shown)
+            # Rows of tables Redacto may read but never modify: a copy found there
+            # at plan time, or the value itself, is a residual the operator must
+            # remove with the owning application.
+            for record in slot.adapter.out_of_scope_records(limit=limit):
+                hit = record.record_id in planned_out_of_scope
+                if not hit and target_fingerprint and verify_key:
+                    hit = fingerprint(record.content, verify_key) == target_fingerprint
+                if not hit and secret_tokens and verify_key:
+                    hit = secret_tokens.issubset(
+                        {fingerprint(value, verify_key) for value in token_set(record.content)}
+                    )
+                if (
+                    not hit
+                    and target_fingerprint
+                    and verify_key
+                    and request["target_kind"] in {"fact", "secret"}
+                    and normalized_len
+                    and normalized_len >= MIN_VERIFIABLE_VALUE_LEN
+                ):
+                    hit = contains_normalized(
+                        record.content, target_fingerprint, normalized_len, verify_key
+                    )
+                if hit:
+                    residuals.append(record.record_id)
+                    out_of_scope_residuals.append(record.record_id)
             # A temp copy left by an interrupted rewrite holds the store as it was
             # before the delete. It is not a record, so it cannot be rescanned like
             # one, and absence is never claimed while it exists.
@@ -2810,6 +2886,11 @@ class Engine:
                 limitations.append(
                     f"Record cap reached ({limit}); some records were not rescanned and "
                     "absence is not claimed for them."
+                )
+            if out_of_scope_residuals:
+                limitations.append(
+                    "Copies remain in tables outside the approved scope, which Redacto reads "
+                    "but never modifies: " + ", ".join(out_of_scope_residuals)
                 )
             if leftover_temps:
                 limitations.append(
