@@ -229,6 +229,17 @@ def cmd_keyring(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_report(args: argparse.Namespace) -> int:
+    from redacto.report import build_report
+
+    html = build_report(_engine(), request_id=args.request_id)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    _print({"ok": True, "report": str(out)})
+    return 0
+
+
 def cmd_clean_temps(args: argparse.Namespace) -> int:
     engine = _engine()
     _print(engine.clean_leftover_temps(delete=args.delete))
@@ -351,6 +362,12 @@ def cmd_demo(args: argparse.Namespace) -> int:
     (var / "demo_receipt.md").write_text(to_markdown(summary), encoding="utf-8")
     print(f"\n[7] Receipt written to {var / 'demo_receipt.json'} and {var / 'demo_receipt.md'}")
     print(f"    {summary['statement']}")
+    from redacto.report import build_report
+
+    (var / "demo_report.html").write_text(
+        build_report(engine, request_id=applied["request_id"]), encoding="utf-8"
+    )
+    print(f"    HTML report (stores, lineage, plan, timeline, receipt): {var / 'demo_report.html'}")
 
     print("\n[8] Re-ingestion attack")
     restored = settings.workspace_root / "acquisition-plan.md"
@@ -517,6 +534,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibrate.add_argument("--thresholds", help="comma-separated cosine thresholds")
     calibrate.set_defaults(func=cmd_calibrate_embeddings)
+
+    report = sub.add_parser(
+        "report", help="write a read-only HTML report: stores, lineage, plan, timeline, receipt"
+    )
+    report.add_argument("--request-id", required=True)
+    report.add_argument("--out", default="var/report.html")
+    report.set_defaults(func=cmd_report)
 
     clean = sub.add_parser(
         "clean-temps", help="list (or --delete) temp copies left by interrupted store rewrites"
