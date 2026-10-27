@@ -22,7 +22,7 @@ quarantine resolution). Local embedding similarity is on by default for paraphra
 candidates. External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 233 automated tests pass (`pytest`).
+- 255 automated tests pass (`pytest`); one opt-in live-model test is skipped by default.
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -33,7 +33,9 @@ is **off by default**; with no provider configured its candidates are unassessed
 - Local embedding similarity generates paraphrase candidates and risk scores. It is advisory:
   embeddings never prove lineage and never block on their own.
 - Secret/fact revocation deletes only records that contain the value; the anchor record is
-  a lookup handle and is preserved unless it holds the value.
+  a lookup handle and is preserved unless it holds the value. When the value is a small part
+  of a useful file, memory row or log event, the plan redacts just the value (`REDACT_SPAN`)
+  instead of deleting the record.
 - Secret verification rescans every reachable store for the value itself, not the anchor,
   using separator-insensitive windowed matching, so `STRIPE_KEY=...`, `key:...`,
   `?token=...` and a value glued to other text are all detected.
@@ -72,7 +74,8 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 On Linux/macOS use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
 
 The demo runs in a fresh temp workspace and never touches your configured stores
-(`--use-configured` opts in). It writes `demo_receipt.json` and `demo_receipt.md` next to
+(`--use-configured` opts in). A full run is in [docs/demo-transcript.txt](docs/demo-transcript.txt);
+it also writes `demo_report.html`, the read-only report described below. It writes `demo_receipt.json` and `demo_receipt.md` next to
 the demo's graph DB and prints the path (`var/` with `--use-configured`).
 
 `seed` refuses with `seed_would_destroy_data` when the workspace holds files it did not
@@ -92,7 +95,7 @@ against a record id (`fs:<relative path>`, `mem:<id>`, `cache:<id>`, `log:<event
 | Store | Format Redacto reads |
 |---|---|
 | Filesystem | `.md` / `.txt` files under `REDACTO_WORKSPACE_ROOT` |
-| SQLite | tables `memories` and/or `response_cache`, each with an `id` column; every column is scanned. Other tables are listed in `status` as unscanned. |
+| SQLite | tables `memories` and/or `response_cache`, each with an `id` column; every column is scanned. Other tables are searched read-only: a copy there is an `UNREACHABLE` plan item and a residual in the receipt, never modified. |
 | JSONL log | one JSON object per line; `event_id` is the id (a keyed line hash when absent) |
 | Vector fixture | `{"chunks": [{"id": ..., "text": ..., "metadata": {...}}, ...]}` |
 
@@ -106,6 +109,8 @@ python -m redacto status
 python -m redacto trace  --source-id "fs:acquisition-plan.md"
 python -m redacto scan   --target-id "fs:acquisition-plan.md"
 python -m redacto plan   --target-id "fs:acquisition-plan.md"
+# fact/secret: the value comes from stdin or an env var, never the command line
+python -m redacto plan   --target-id "fs:eng-notes.md" --kind secret --text-env LEAKED_KEY
 python -m redacto approve --plan-id <PLAN_ID> --ref "operator approval"
 python -m redacto review-item --plan-id <PLAN_ID> --item-id <ITEM_ID> --decision approved|rejected --reviewer "reviewer-id"
 python -m redacto cancel --plan-id <PLAN_ID> --reason "operator stopped"
@@ -120,6 +125,8 @@ python -m redacto resolve-quarantine --id <ID> --decision approved|rejected \
 python -m redacto keyring                          # key versions + rotation safety
 python -m redacto calibrate-embeddings             # FP / missed-paraphrase metrics
 python -m redacto evaluate                         # metrics; run after `seed` on a pristine fixture
+python -m redacto report --request-id <REQUEST_ID> --out var\report.html   # read-only HTML report
+python -m redacto clean-temps [--delete]           # temp copies left by an interrupted rewrite
 python -m redacto serve  --transport stdio   # or: --transport http
 ```
 
@@ -173,8 +180,10 @@ The repo also ships a Claude Code style plugin layout: `.claude-plugin/plugin.js
 plus `.mcp.json`. The MCP entry uses `${CLAUDE_PLUGIN_ROOT}` for every store path and
 `uv run --project`, so it does not depend on the shell's working directory. `uv` must
 be installed. `cwd` is deliberately absent: it is not a supported stdio MCP field.
-The graph database is written under `${CLAUDE_PLUGIN_DATA}`, not the read-only plugin
-root; point `REDACTO_WORKSPACE_ROOT` at your own data for real use.
+The graph database and every store live under `${CLAUDE_PLUGIN_DATA}`, never in the
+plugin's shipped fixtures, so an apply cannot edit files inside the plugin. On first
+launch the demo workspace is seeded there (`REDACTO_DEMO_SEED_IF_MISSING=true`); point the
+`REDACTO_*` store paths at your own data for real use.
 This layout is **not verified against Alan's plugin format**; for Alan, register the
 connector manually with the stdio or HTTP configuration above.
 
@@ -223,6 +232,17 @@ Tool logic is transport-independent, so both entry points share the same engine.
   assessment requires an explicitly configured OpenAI-compatible endpoint or local
   Ollama; otherwise the deterministic path runs and candidates stay unassessed.
 
+## Report and model evaluation
+
+`redacto report --request-id <id>` writes one self-contained HTML page: store health,
+a lineage drawing (confirmed, exposure-only and candidate edges in distinct styles), the plan
+preview with filters, the execution timeline and the receipt. It holds ids, counts and
+redacted reasons only.
+
+Model-assisted discovery was run against a local Ollama `llama3` (8B): 6/6 schema-valid
+answers and no change to any approved action. It flagged one unrelated note for review.
+Details and the opt-in live test are in [docs/model-evaluation.md](docs/model-evaluation.md).
+
 ## Architecture
 
 Short version: one engine, two transports, four scoped adapters, one SQLite graph.
@@ -255,9 +275,11 @@ Full diagrams (component flow, ER model, revocation sequence) are in
 - **Item review**: `review-item` is an application action. Approving rewrites the item
   to a concrete adapter action and bumps the plan version, so a fresh token is needed.
   Rejecting leaves the item unapproved. Both decisions are audited.
-- **Action vocabulary**: `DELETE_RECORD`, `INVALIDATE_INDEX`, `INVALIDATE_CACHE`,
-  `REVIEW_REQUIRED`, `SKIP_PRESERVE`, `UNREACHABLE` are exercised. `REDACT_SPAN` and
-  `REGENERATE_FROM_ALLOWED_SOURCES` are defined but unsupported by current adapters.
+- **Action vocabulary**: `DELETE_RECORD`, `REDACT_SPAN`, `INVALIDATE_INDEX`,
+  `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE`, `UNREACHABLE` are exercised.
+  `REDACT_SPAN` is supported by the filesystem, SQLite and JSONL adapters; vector chunks are
+  invalidated instead, because their embedding would outlive a text edit.
+  `REGENERATE_FROM_ALLOWED_SOURCES` is defined but unsupported.
 - **Node types**: stored records map to `MEMORY`, `LOG_RECORD`, `INDEX_ENTRY`,
   `CACHE_ENTRY` and `ARTIFACT`; scan/trace targets are labelled `SOURCE` or `FACT`.
 - **Persistence**: records, lineage edges, candidate edges, requests, plans, items,
@@ -349,7 +371,7 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 Test suite (`python -m pytest`, Python 3.12.0):
 
 ```
-233 passed in 61s (Windows 11, Python 3.12)
+255 passed, 1 skipped in 66s (Windows 11, Python 3.12)
 ```
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,

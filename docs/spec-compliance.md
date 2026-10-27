@@ -7,7 +7,7 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **233 passed**. Run `redacto evaluate` for the
+Test evidence: `python -m pytest` → **255 passed, 1 skipped**. Run `redacto evaluate` for the
 fixture metrics.
 
 ## 1. Executive summary and core rule
@@ -115,17 +115,16 @@ operations (`test_path_traversal_is_rejected`, `test_unapproved_sqlite_table_is_
 ## 8. Modes and execution
 
 - **8.1 Source revocation: Compliant.**
-- **8.2 Fact/secret revocation: Partial.** Only records containing the value are
-  actionable; the anchor record is preserved unless it holds the value. A substring
-  covering less than half of a record is held for review; at or above half the normal
-  delete path applies. Verification rescans stores for the value's tokens. A reviewer
-  can approve or reject a review item through `review-item`. No precise `REDACT_SPAN`
-  support yet, so the reviewer still chooses whole-record deletion or rejection.
-- **8.3 Action types: Partial.** All action names exist. A partial substring match is
-  mapped to `REVIEW_REQUIRED`, not an automatic delete. `DELETE_RECORD`,
+- **8.2 Fact/secret revocation: Met.** Only records containing the value are
+  actionable; the anchor record is preserved unless it holds the value. When the value
+  is under half of a file, memory row or log event, the plan redacts only the value
+  (`REDACT_SPAN`, located again at apply time by keyed fingerprints, never stored).
+  Spaced or rewritten forms, records over 256 KB and vector chunks go to review.
+  Verification rescans stores for the value itself. Regeneration is not implemented.
+- **8.3 Action types: Mostly met.** `DELETE_RECORD`, `REDACT_SPAN`,
   `INVALIDATE_INDEX`, `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE` and
-  `UNREACHABLE` are used. `REDACT_SPAN` and `REGENERATE_FROM_ALLOWED_SOURCES` are
-  defined but unsupported by the current adapters.
+  `UNREACHABLE` are used (`UNREACHABLE` also marks copies in unapproved SQLite tables).
+  `REGENERATE_FROM_ALLOWED_SOURCES` is defined but unsupported.
 - **8.4 State machine: Partial.** `READY_FOR_APPROVAL → APPROVED → EXECUTING →
   VERIFYING → {VERIFIED_WITHIN_SCOPE, PARTIAL, NEEDS_REVIEW}` is implemented and
   `EXECUTING` is set before the first mutation (`test_apply_enters_executing_before_any_mutation`).
@@ -176,10 +175,11 @@ from the desktop UI. This is a platform/user action, not a code gap.
 
 ## 13. UX requirements
 
-**Partial.** Terminal flow, plan preview, action timeline and JSON/Markdown receipts
-exist. Confirmed vs candidate is distinguished by evidence class and `confirmed`/
-`candidate_only` flags. There is no dashboard or graph visualization; the spec makes
-that optional after engine correctness.
+**Mostly met.** Terminal flow, plan preview, action timeline and JSON/Markdown receipts
+exist. `redacto report` writes a read-only HTML dashboard covering all six screens
+(stores, lineage, plan preview with store/evidence/action filters, timeline, receipt).
+Confirmed, exposure-only and candidate edges use distinct line styles, and status words
+are text, never colour alone. It is a generated page, not an interactive app.
 
 ## 14. Security and privacy
 
@@ -381,6 +381,6 @@ Fixed after the "does it remove every trace" audit:
 
 1. Add a per-adapter `find_exact` method if strict interface parity is required.
 2. Implement editable `DRAFT` plans (CANCELLED/FAILED transitions are implemented).
-3. Implement safe `REDACT_SPAN` editing, regeneration and an undo/trash window.
-4. Add a graph visualization that styles confirmed vs candidate edges.
+3. Implement regeneration from allowed sources and an undo/trash window.
+4. ~~Graph visualization~~ done: `redacto report` draws confirmed, exposure and candidate edges.
 5. Register the Alan connector (user action) and publish the docs/demo publicly.
