@@ -314,3 +314,14 @@ def test_secret_id_already_in_the_graph_is_renamed_and_scrubbed(tmp_path):
     assert SECRET not in json.dumps([plan, applied, receipt])
     assert SECRET.encode() not in settings.jsonl_log_path.read_bytes()
     assert SECRET.encode() not in settings.db_path.read_bytes()
+
+
+def test_completed_apply_cannot_be_reapproved_before_verify(tmp_path):
+    settings = seeded_settings(tmp_path)
+    engine = Engine(settings)
+    plan = engine.plan(target_id=SOURCE_ID)
+    applied = approve_and_apply(engine, plan)
+    assert applied["plan_state"] == "VERIFYING"
+    with pytest.raises(RedactoError) as excinfo:
+        engine.approve_plan(plan_id=plan["plan_id"], approval_ref="again")
+    assert excinfo.value.code == "plan_not_approvable"

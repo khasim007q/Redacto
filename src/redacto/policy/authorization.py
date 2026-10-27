@@ -32,14 +32,14 @@ def issue_approval(
     plan = repo.get_plan(plan_id)
     if plan is None:
         raise ValueError("plan_not_found")
-    # EXECUTING is recoverable: a crashed apply may be re-approved with a new
-    # single-use token. Per-action idempotency prevents duplicate work.
+    # EXECUTING, FAILED and PARTIAL are recoverable: they may be re-approved with a
+    # new single-use token. Per-action idempotency prevents duplicate work.
+    # VERIFYING is not: the apply completed, so a second apply has nothing to do.
     if plan["state"] not in {
         "READY_FOR_APPROVAL",
         "APPROVED",
         "EXECUTING",
         "FAILED",
-        "VERIFYING",
         "PARTIAL",
     }:
         raise ValueError("plan_not_approvable")
