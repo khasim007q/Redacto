@@ -48,3 +48,18 @@ def test_report_cli_writes_the_file(tmp_path, monkeypatch, capsys):
     out = tmp_path / "out" / "report.html"
     assert cli.main(["report", "--request-id", plan["request_id"], "--out", str(out)]) == 0
     assert out.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_report_cli_defaults_to_the_latest_request(tmp_path, monkeypatch, capsys):
+    import json
+
+    from redacto import cli
+
+    settings = seeded_settings(tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda: settings)
+    out = tmp_path / "r.html"
+    assert cli.main(["report", "--out", str(out)]) == 2
+    assert "no_requests" in capsys.readouterr().out
+    plan = Engine(settings).plan(target_id=SOURCE_ID)
+    assert cli.main(["report", "--out", str(out)]) == 0
+    assert json.loads(capsys.readouterr().out)["request_id"] == plan["request_id"]

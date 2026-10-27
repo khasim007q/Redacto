@@ -416,6 +416,13 @@ class Repository:
             conn.commit()
         return request_id
 
+    def latest_request_id(self) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT request_id FROM revocation_requests ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return row[0] if row else None
+
     def get_request(self, request_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(

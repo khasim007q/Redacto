@@ -232,11 +232,19 @@ def cmd_keyring(args: argparse.Namespace) -> int:
 def cmd_report(args: argparse.Namespace) -> int:
     from redacto.report import build_report
 
-    html = build_report(_engine(), request_id=args.request_id)
+    engine = _engine()
+    request_id = args.request_id or engine.repo.latest_request_id()
+    if not request_id:
+        raise RedactoError(
+            "no_requests",
+            f"No revocation has been planned in {engine.settings.db_path} yet. "
+            "Run `redacto plan --target-id <id>` (or `redacto demo`) first.",
+        )
+    html = build_report(engine, request_id=request_id)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
-    _print({"ok": True, "report": str(out)})
+    _print({"ok": True, "request_id": request_id, "report": str(out.resolve())})
     return 0
 
 
@@ -538,7 +546,7 @@ def build_parser() -> argparse.ArgumentParser:
     report = sub.add_parser(
         "report", help="write a read-only HTML report: stores, lineage, plan, timeline, receipt"
     )
-    report.add_argument("--request-id", required=True)
+    report.add_argument("--request-id", help="default: the most recent revocation request")
     report.add_argument("--out", default="var/report.html")
     report.set_defaults(func=cmd_report)
 
