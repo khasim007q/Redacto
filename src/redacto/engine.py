@@ -20,6 +20,7 @@ from redacto.discovery.relationship_assessor import (
     build_assessor,
     minimize_snippet,
 )
+import json
 import os
 import socket
 from datetime import datetime, timezone
@@ -212,7 +213,9 @@ class Engine:
                 {"store_id": record["store_id"]},
             )
         try:
-            return slot.adapter.read_record(record["locator"]).content
+            return slot.adapter.read_record(
+                self._resolve_locator(slot.adapter, record["locator"])
+            ).content
         except AdapterError as exc:
             raise RedactoError(
                 "target_unreachable",
@@ -247,6 +250,68 @@ class Engine:
             capabilities=capabilities,
             status="active",
         )
+
+    # ---------------------------------------------------- identifier aliasing
+    REDACTED_LOCATOR = "redacted_locator"
+
+    def _alias_id(self, record_id: str) -> str:
+        prefix = record_id.split(":", 1)[0] if ":" in record_id else "rec"
+        return f"{prefix}:redacted-{fingerprint(record_id, self.settings.current_hmac_key)[:16]}"
+
+    @staticmethod
+    def _locator_text(locator: dict[str, str]) -> str:
+        return json.dumps(locator, sort_keys=True, ensure_ascii=False)
+
+    def _alias_bearing_record(self, record: Record, matcher: ExactMatcher) -> Record:
+        """Hide a revoked value that sits in a record's identity or metadata.
+
+        A record id, locator, sensitivity label or created_at that carries the
+        value would otherwise be echoed in plans, results and receipts and kept in
+        the graph DB. The record gets an opaque id and a keyed locator handle that
+        apply resolves by rescanning the store.
+        """
+        # Only fields Redacto echoes or stores count; other metadata stays in the
+        # store and is removed with the record.
+        identity = [record.record_id, *record.locator.values(), *record.sensitivity]
+        identity.append(record.metadata.get("created_at", ""))
+        if not any(value and matcher.value_in(str(value)) for value in identity):
+            return record
+        alias = self._alias_id(record.record_id)
+        if self.repo.get_record(record.record_id) is not None:
+            self.repo.rename_record(record.record_id, alias)
+        handle = fingerprint(self._locator_text(record.locator), self.settings.current_hmac_key)
+        return record.model_copy(
+            update={
+                "record_id": alias,
+                "locator": {self.REDACTED_LOCATOR: handle},
+                "sensitivity": [
+                    "redacted" if matcher.value_in(value) else value for value in record.sensitivity
+                ],
+                "metadata": {
+                    key: "[redacted]" if matcher.value_in(str(value)) else value
+                    for key, value in record.metadata.items()
+                },
+            }
+        )
+
+    @staticmethod
+    def _identity_bears_tokens(record: Record, tokens: set[str], key: str | None) -> bool:
+        if not tokens or not key:
+            return False
+        identity = " ".join([record.record_id, *record.locator.values()])
+        return any(fingerprint(value, key) in tokens for value in token_set(identity))
+
+    def _resolve_locator(self, adapter, locator: dict[str, str]) -> dict[str, str]:
+        """Map a keyed locator handle back to the store's real locator."""
+        handle = locator.get(self.REDACTED_LOCATOR)
+        if handle is None:
+            return locator
+        keys = list(dict.fromkeys(self.settings.hmac_keys.values()))
+        for candidate in adapter.list_records(limit=self.settings.max_scan_records):
+            text = self._locator_text(candidate.locator)
+            if any(fingerprint(text, key) == handle for key in keys):
+                return candidate.locator
+        raise AdapterError("record no longer exists", code="not_found")
 
     def embedder(self):
         return build_embedder(self.settings.embedding_provider)
@@ -477,6 +542,8 @@ class Engine:
             if truncated:
                 records = records[:limit]
                 truncated_stores.append(store)
+            if target_kind in {"fact", "secret"}:
+                records = [self._alias_bearing_record(r, matcher) for r in records]
             for scanned_record in records:
                 scanned[scanned_record.record_id] = scanned_record
             coverage.append(
@@ -1741,7 +1808,9 @@ class Engine:
             }
 
         try:
-            record = slot.adapter.read_record(entry["locator"])  # type: ignore[union-attr]
+            record = slot.adapter.read_record(  # type: ignore[union-attr]
+                self._resolve_locator(slot.adapter, entry["locator"])
+            )
         except AdapterError as exc:
             outcome = {
                 **policy_snapshot,
@@ -2367,13 +2436,13 @@ class Engine:
             try:
                 if action == classify.DELETE_RECORD:
                     slot.adapter.delete_record(
-                        record["locator"],
+                        self._resolve_locator(slot.adapter, record["locator"]),
                         expected_fingerprint=expected_fingerprint,
                         key=expected_key,
                     )
                 elif action in {classify.INVALIDATE_INDEX, classify.INVALIDATE_CACHE}:
                     slot.adapter.invalidate_derived(
-                        record["locator"],
+                        self._resolve_locator(slot.adapter, record["locator"]),
                         expected_fingerprint=expected_fingerprint,
                         key=expected_key,
                     )
@@ -2634,13 +2703,21 @@ class Engine:
                 records = records[:limit]
             residuals: list[str] = []
             for record in records:
-                if record.record_id in planned_removals:
-                    residuals.append(record.record_id)
+                # A record whose id carried the value was planned under an alias;
+                # report it by that alias so the receipt never echoes the value.
+                alias = self._alias_id(record.record_id)
+                shown = record.record_id
+                if alias in planned_removals or self._identity_bears_tokens(
+                    record, secret_tokens, verify_key
+                ):
+                    shown = alias
+                if record.record_id in planned_removals or alias in planned_removals:
+                    residuals.append(shown)
                     continue
                 if target_fingerprint and verify_key and fingerprint(
                     record.content, verify_key
                 ) == target_fingerprint:
-                    residuals.append(record.record_id)
+                    residuals.append(shown)
                     continue
                 if secret_tokens and verify_key:
                     record_tokens = {
@@ -2648,7 +2725,7 @@ class Engine:
                         for token_value in token_set(record.content)
                     }
                     if secret_tokens.issubset(record_tokens):
-                        residuals.append(record.record_id)
+                        residuals.append(shown)
                         continue
                 if (
                     target_fingerprint
@@ -2660,7 +2737,7 @@ class Engine:
                     if contains_normalized(
                         record.content, target_fingerprint, normalized_len, verify_key
                     ):
-                        residuals.append(record.record_id)
+                        residuals.append(shown)
             # A temp copy left by an interrupted rewrite holds the store as it was
             # before the delete. It is not a record, so it cannot be rescanned like
             # one, and absence is never claimed while it exists.

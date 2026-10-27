@@ -205,7 +205,6 @@ def test_verbatim_copy_with_extra_fields_is_a_direct_match(tmp_path):
 
 
 # ---------------------------------------------- secrets never leak via ids
-@pytest.mark.xfail(strict=True, reason="secret-bearing ids are not aliased yet")
 @pytest.mark.parametrize("where", ["chunk_id", "event_id", "sensitivity", "created_at"])
 def test_secret_in_an_identifier_does_not_leak_into_outputs(tmp_path, where):
     settings = seeded_settings(tmp_path)
@@ -295,3 +294,23 @@ def test_partial_plan_can_be_reapproved_after_the_store_is_freed(tmp_path, monke
     receipt = engine.verify(request_id=second["request_id"])
     assert receipt["status"] in CLEAN
     assert receipt["counts"]["residual_matches"] == 0
+
+
+def test_secret_id_already_in_the_graph_is_renamed_and_scrubbed(tmp_path):
+    settings = seeded_settings(tmp_path)
+    _append_events(settings, {"event_id": SECRET, "content": f"key {SECRET}"})
+    engine = Engine(settings)
+    # An earlier source scan stored the raw event id in the graph.
+    engine.scan(target_id=SOURCE_ID)
+    assert engine.repo.get_record(f"log:{SECRET}") is not None
+    plan = engine.plan(
+        target_id=SOURCE_ID, target_kind="secret", target_text=SECRET, mode="fact_revocation"
+    )
+    assert engine.repo.get_record(f"log:{SECRET}") is None
+    applied = approve_and_apply(engine, plan)
+    assert applied["counts"]["failed"] == 0
+    receipt = engine.verify(request_id=applied["request_id"])
+    assert receipt["counts"]["residual_matches"] == 0
+    assert SECRET not in json.dumps([plan, applied, receipt])
+    assert SECRET.encode() not in settings.jsonl_log_path.read_bytes()
+    assert SECRET.encode() not in settings.db_path.read_bytes()
