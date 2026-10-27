@@ -5,3 +5,7 @@ __pycache__/
 var/
 .env
 *.egg-info/
+demo-video/node_modules/
+demo-video/build/
+demo-video/*.mp4
+.venv-tts/

@@ -74,9 +74,13 @@ uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
 On Linux/macOS use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
 
 The demo runs in a fresh temp workspace and never touches your configured stores
-(`--use-configured` opts in). A full run is in [docs/demo-transcript.txt](docs/demo-transcript.txt);
-it also writes `demo_report.html`, the read-only report described below. It writes `demo_receipt.json` and `demo_receipt.md` next to
-the demo's graph DB and prints the path (`var/` with `--use-configured`).
+(`--use-configured` opts in). It writes `demo_receipt.json`, `demo_receipt.md` and
+`demo_report.html` (the read-only report described below) next to the demo's graph DB and
+prints the path (`var/` with `--use-configured`).
+
+A narrated, motion-designed walkthrough of the same story (about 4.5 minutes, 1080p) is
+built from [demo-video/](demo-video/README.md): the script, the scenes and the render pipeline
+are all in the repo, so the video can be regenerated after any change.
 
 `seed` refuses with `seed_would_destroy_data` when the workspace holds files it did not
 create, the memory store has extra tables, or the graph has tombstones or revocation
