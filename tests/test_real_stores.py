@@ -195,3 +195,45 @@ def test_status_reports_real_stores_without_the_redis_url(redis_settings):
     status = Engine(redis_settings).status(transport="test")
     assert any(a["adapter_id"] == "redis_cache" and a["health"]["reachable"] for a in status["adapters"])
     assert "redis://" not in json.dumps(status)
+
+
+def test_redis_watch_aborts_a_change_between_read_and_exec(redis_settings, redis_client, monkeypatch):
+    from redacto.adapters.redis_cache import RedisCacheAdapter
+    from redacto.discovery.normalization import fingerprint
+
+    adapter = RedisCacheAdapter(None, ("llm-cache:*",), "key", client=redis_client)
+    locator = {"key": "llm-cache:q1"}
+    expected = fingerprint(adapter.read_record(locator).content, "key")
+    read = adapter._read
+
+    def concurrent_update(client, key):
+        snapshot = read(client, key)
+        redis_client.set(key, "new public answer from a concurrent writer")
+        return snapshot
+
+    monkeypatch.setattr(adapter, "_read", concurrent_update)
+    with pytest.raises(AdapterError) as exc:
+        adapter.delete_record(locator, expected_fingerprint=expected)
+    assert exc.value.code == "content_changed"
+    assert redis_client.get(locator["key"]) == b"new public answer from a concurrent writer"
+
+
+@pytest.mark.parametrize("kind", ["set", "zset", "stream"])
+def test_redis_revokes_structured_types_against_the_configured_server(redis_settings, redis_client, kind):
+    key = "llm-cache:structured"
+    if kind == "set":
+        redis_client.sadd(key, SECRET, "public context")
+    elif kind == "zset":
+        redis_client.zadd(key, {SECRET: 1.0, "public context": 2.0})
+    else:
+        redis_client.xadd(key, {"tool_args": json.dumps({"token": SECRET})})
+    engine = Engine(redis_settings)
+    plan = engine.plan(target_id=SOURCE_ID, target_kind="secret", target_text=SECRET, mode="fact_revocation")
+    assert any(item["record_id"] == f"redis:{key}" for item in plan["items"])
+    assert approve_and_apply(engine, plan)["counts"]["failed"] == 0
+    assert redis_client.exists(key) == 0
+    assert redis_client.exists("llm-cache:q2") == 1
+    assert redis_client.exists("session:abc") == 1
+    receipt = engine.verify(request_id=plan["request_id"])
+    assert receipt["counts"]["residual_matches"] == 0
+    assert SECRET not in json.dumps(receipt)

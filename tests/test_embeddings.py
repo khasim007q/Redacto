@@ -90,6 +90,9 @@ def test_embedding_similarity_alone_never_blocks(tmp_path):
     engine = _revoked_engine(tmp_path)
     tombstone = engine.repo.list_tombstones()[0]
     assert tombstone["embedding"]
+    # Override the stored policy explicitly; runtime changes cannot weaken an
+    # already issued tombstone's threshold snapshot.
+    tombstone["policy"]["embedding_policy"]["quarantine_threshold"] = 0.0
     guard = TombstoneGuard(
         [tombstone],
         {1: engine.settings.current_hmac_key},

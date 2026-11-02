@@ -1003,6 +1003,20 @@ class Repository:
             ).fetchall()
         return [self._tombstone_row(row) for row in rows]
 
+    def refresh_tombstone_protection(self, tombstone_id: str, *, related_ids: Sequence[str],
+                                    related_fingerprints: Sequence[Any], policy: dict[str, Any]) -> None:
+        """Preserve previous removals while adding newly completed reviewed actions."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM tombstones WHERE tombstone_id = ?", (tombstone_id,)).fetchone()
+            if row is None:
+                raise ValueError("unknown tombstone")
+            current = self._tombstone_row(row)
+            identities = list(dict.fromkeys([*current["related_record_ids"], *related_ids]))
+            fingerprints = {_json(entry): entry for entry in [*current["related_fingerprints"], *related_fingerprints]}
+            conn.execute("UPDATE tombstones SET related_record_ids_json = ?, related_fingerprints_json = ?, policy_json = ? WHERE tombstone_id = ?",
+                         (_json(identities), _json(list(fingerprints.values())), _json(policy), tombstone_id))
+
     def set_tombstone_status(self, tombstone_id: str, status: str) -> None:
         with self._connect() as conn:
             conn.execute(

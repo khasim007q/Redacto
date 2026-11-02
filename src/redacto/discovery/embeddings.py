@@ -24,9 +24,11 @@ from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
 from redacto.discovery.normalization import normalize_loose
+from redacto.errors import RedactoError
 
 DIMENSION = 512
 MODEL_ID = "local-hashing-v2"
+HYBRID_PREFIX = "hybrid-v1:"
 
 _NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -153,6 +155,75 @@ class NullEmbeddingProvider:
         return []
 
 
+class HybridEmbeddingProvider:
+    """Retain two named spaces; never treat their concatenation as one cosine.
+
+    The wire format remains a vector, so existing databases need no destructive
+    migration. Its model ID versions both components and the concatenation format.
+    """
+
+    def __init__(self, neural: EmbeddingProvider):
+        self.neural = neural
+        self.lexical = HashingEmbeddingProvider()
+        self.model_id = f"{HYBRID_PREFIX}{self.lexical.model_id}|{self.neural.model_id}"
+
+    def embed(self, text: str) -> list[float]:
+        return self.lexical.embed(text) + self.neural.embed(text)
+
+
+def model_components(model_id: str | None) -> set[str]:
+    if model_id and model_id.startswith(HYBRID_PREFIX):
+        lexical, separator, neural = model_id[len(HYBRID_PREFIX):].partition("|")
+        if lexical and separator and neural and "|" not in neural:
+            return {lexical, neural}
+        raise RedactoError("embedding_model_invalid", "Stored hybrid embedding identity is malformed.")
+    return {model_id or "unknown"}
+
+
+def embedding_models_covered(stored_model: str | None, current_model: str | None) -> bool:
+    return bool(stored_model and current_model and model_components(stored_model).issubset(model_components(current_model)))
+
+
+def _components(vector: Sequence[float], model_id: str | None) -> dict[str, Sequence[float]]:
+    if not vector:
+        return {}
+    if any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector):
+        raise RedactoError("embedding_vector_invalid", "Stored embedding contains invalid values; comparison was refused.")
+    names = model_components(model_id)
+    if len(names) == 1:
+        return {next(iter(names)): vector}
+    if len(vector) <= DIMENSION:
+        raise RedactoError("embedding_vector_invalid", "Stored hybrid embedding is missing a component; comparison was refused.")
+    lexical, _, neural = model_id[len(HYBRID_PREFIX):].partition("|")
+    return {lexical: vector[:DIMENSION], neural: vector[DIMENSION:]}
+
+
+def embedding_scores(first: Sequence[float], first_model: str | None,
+                     second: Sequence[float], second_model: str | None) -> dict[str, float]:
+    """Compare only identically versioned component spaces, including old tombstones."""
+    if not first_model or not second_model:
+        return {}
+    left, right = _components(first, first_model), _components(second, second_model)
+    scores = {}
+    for name in sorted(left.keys() & right.keys()):
+        if len(left[name]) != len(right[name]):
+            raise RedactoError("embedding_dimension_mismatch", "Embedding dimensions disagree within the same model space.")
+        scores[name] = cosine(left[name], right[name])
+    return scores
+
+
+def embedding_matches(first: Sequence[float], first_model: str | None,
+                      second: Sequence[float], second_model: str | None,
+                      *, threshold: float, lexical_threshold: float) -> dict[str, float]:
+    if any(type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 1
+           for value in (threshold, lexical_threshold)):
+        raise RedactoError("embedding_policy_invalid", "Stored embedding thresholds are invalid; comparison was refused.")
+    scores = embedding_scores(first, first_model, second, second_model)
+    hybrid = any(model and model.startswith(HYBRID_PREFIX) for model in (first_model, second_model))
+    return {name: score for name, score in scores.items()
+            if score >= (lexical_threshold if hybrid and name == MODEL_ID else threshold)}
+
+
 def cosine(first: Sequence[float], second: Sequence[float]) -> float:
     if not first or not second or len(first) != len(second):
         return 0.0
@@ -171,13 +242,14 @@ def build_embedder(provider: str, *, model: str | None = None, revision: str | N
         return NullEmbeddingProvider()
     if normalized in {"local_hashing", "local-hashing", "hashing"}:
         return HashingEmbeddingProvider()
-    if normalized in {"sentence_transformers", "sentence-transformers"}:
+    if normalized in {"sentence_transformers", "sentence-transformers", "hybrid"}:
         from redacto.discovery.neural import DEFAULT_MODEL, DEFAULT_REVISION, SentenceTransformerEmbeddingProvider
 
-        return SentenceTransformerEmbeddingProvider(model=model or DEFAULT_MODEL, revision=revision or DEFAULT_REVISION,
-                                                    local_files_only=local_files_only)
+        neural = SentenceTransformerEmbeddingProvider(model=model or DEFAULT_MODEL, revision=revision or DEFAULT_REVISION,
+                                                      local_files_only=local_files_only)
+        return HybridEmbeddingProvider(neural) if normalized == "hybrid" else neural
     raise ValueError(
-        f"Unsupported embedding provider '{provider}'. Supported: local_hashing, sentence_transformers, none."
+        f"Unsupported embedding provider '{provider}'. Supported: local_hashing, sentence_transformers, hybrid, none."
     )
 
 

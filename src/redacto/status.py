@@ -10,7 +10,7 @@ from pathlib import Path
 from redacto import __version__
 from redacto.adapters.registry import build_adapters
 from redacto.config import Settings
-from redacto.discovery.embeddings import build_embedder
+from redacto.discovery.embeddings import build_embedder, embedding_models_covered
 
 
 def _model_status(settings: Settings) -> dict[str, object]:
@@ -81,12 +81,12 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
         skipped_models = {str(row[0] or "unknown") for row in conn.execute(
             "SELECT DISTINCT embedding_model FROM tombstones WHERE status = 'active' "
             "AND target_kind != 'secret' AND embedding_json != '[]'"
-        ) if row[0] != provider_id}
+        ) if not embedding_models_covered(row[0], provider_id)}
         for row in conn.execute(
-            "SELECT related_fingerprints_json FROM tombstones WHERE status = 'active'"
+            "SELECT related_fingerprints_json, policy_json FROM tombstones WHERE status = 'active'"
         ).fetchall():
             try:
-                entries = json.loads(row[0] or "[]")
+                entries = [*json.loads(row[0] or "[]"), *json.loads(row[1] or "{}").get("review_fingerprints", [])]
             except json.JSONDecodeError:
                 continue
             for entry in entries:
@@ -188,6 +188,8 @@ def collect_status(settings: Settings, *, transport: str) -> dict[str, object]:
             "health_note": "Status does not load weights or infer model readiness; run redacto check-embeddings explicitly.",
             "candidate_threshold": settings.embedding_candidate_threshold,
             "quarantine_threshold": settings.embedding_quarantine_threshold,
+            "lexical_candidate_threshold": settings.embedding_lexical_candidate_threshold,
+            "lexical_quarantine_threshold": settings.embedding_lexical_quarantine_threshold,
             "role": "candidate generation and risk scoring only; never proof of lineage",
         },
         "storage": {

@@ -67,7 +67,8 @@ flowchart LR
 | `policy/plan.py` | Plan items, version-bound plan hash, estimated impact. |
 | `policy/authorization.py` | Application-issued confirmation tokens (hash stored, short TTL, single use). |
 | `ingestion.py` | Tombstone material, guard evaluation, and the allowed/quarantined/blocked decision. |
-| `discovery/embeddings.py` | Local deterministic embedding provider, cosine scoring, and labelled calibration. |
+| `discovery/embeddings.py` | Hashing and hybrid providers, independently scored/versioned component spaces, compatibility checks and labelled calibration. |
+| `discovery/neural.py` | Optional pinned multilingual CPU embeddings, bounded token windows, offline loading and structured failures. |
 | `engine.py` | scan / trace / plan / apply / verify orchestration and all scope checks. |
 | `receipts.py` | Receipt rendering to JSON and Markdown. |
 | `locking.py` | Reentrant local process/thread coordination for participating store writers and engine operations. |

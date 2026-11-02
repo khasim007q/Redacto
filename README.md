@@ -33,6 +33,10 @@ is **off by default**; with no provider configured its candidates are unassessed
   a required key is missing.
 - Local embedding similarity generates paraphrase candidates and risk scores. It is advisory:
   embeddings never prove lineage and never block on their own.
+- Optional hybrid discovery keeps independent hashing and multilingual neural signals,
+  preserves matching older tombstone spaces, and holds exact replays of review-only
+  candidates. See [semantic discovery](docs/semantic-discovery.md) for measured recall,
+  false-positive costs and remaining limits.
 - Secret/fact revocation deletes only records that contain the value; the anchor record is
   a lookup handle and is preserved unless it holds the value. When the value is a small part
   of a useful file, memory row or log event, the plan redacts just the value (`REDACT_SPAN`)

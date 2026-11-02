@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.12", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
@@ -21,7 +21,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install uv==0.12.23
-          uv sync --frozen --extra dev --extra chroma --extra redis
+          uv sync --frozen --python ${{ matrix.python-version }} --extra dev --extra chroma --extra redis
       - name: Seed fixture
         run: uv run --no-sync python -m redacto seed
       - name: Tests
@@ -63,6 +63,32 @@ jobs:
           python -m redacto --help
           python -m redacto check-embeddings
 
+  redis-integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDACTO_TEST_REDIS_URL: redis://127.0.0.1:6379/15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked store test dependencies
+        run: |
+          python -m pip install uv==0.12.23
+          uv sync --frozen --extra dev --extra chroma --extra redis
+      - name: Real Redis transaction, type coverage and scope checks
+        run: uv run --no-sync python -m pytest -q tests/test_real_stores.py -k redis
+
   semantic-integration:
     if: github.event_name == 'workflow_dispatch'
     strategy:
@@ -85,8 +111,14 @@ jobs:
       - name: Real multilingual discovery, verification and replay guard
         run: uv run --no-sync python -m pytest -q tests/test_semantic_live.py
       - name: Frozen semantic benchmark
-        run: uv run --no-sync python -m redacto benchmark --embedding-provider sentence_transformers --local-files-only --out neural.json
+        run: |
+          uv run --no-sync python -m redacto benchmark --embedding-provider sentence_transformers --local-files-only --out neural.json
+          uv run --no-sync python -m redacto benchmark --embedding-provider hybrid --local-files-only --out hybrid.json
+          uv run --no-sync python -m redacto benchmark --embedding-provider hybrid --split holdout --local-files-only --out hybrid-holdout.json
       - uses: actions/upload-artifact@v4
         with:
           name: neural-evidence-${{ matrix.os }}
-          path: neural.json
+          path: |
+            neural.json
+            hybrid.json
+            hybrid-holdout.json

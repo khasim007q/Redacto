@@ -200,3 +200,71 @@ all eight tools, auto-seeds isolated stores and creates an approval-gated plan.
 Real stdio and bearer-authenticated HTTP clients pass on Windows. CI now specifies
 Python 3.12/3.14 on Linux/Windows and a manually dispatched real-neural CPU job;
 hosted CI and macOS were not executed here. Redis evidence still uses fakeredis.
+
+## Published follow-up: hybrid discovery and persistent review holds
+
+The validated snapshot was pushed as `7dc57ac`; current `main` fixes were then
+merged as `0ac7c01`. Both initial snapshots passed hosted CI on Linux/Windows:
+[snapshot run](https://github.com/khasim007q/Redacto/actions/runs/41421189240),
+[merged-main run](https://github.com/khasim007q/Redacto/actions/runs/41421762424).
+The local validation of the subsequent changes is recorded separately in
+`benchmarks/published-validation-local.json`; use the pushed head's GitHub checks
+for the latest hosted outcome rather than treating an earlier green run as proof.
+
+Hybrid mode retains independently versioned/scored hashing and neural vectors.
+It does not average the two signals. It can compare older matching hashing or
+pinned neural tombstones by selecting their corresponding component; missing
+components or different revisions still report incomplete coverage. Threshold
+policy is captured when a plan is created so raising runtime thresholds cannot
+silently weaken a previously issued revocation.
+
+Two additional replay/recovery defects were fixed:
+
+1. A record could be flagged for review during discovery yet its exact replay could
+   pass ingestion's higher similarity threshold. Tombstones now retain private,
+   versioned HMAC risk holds for review-only payloads. Replays are quarantined,
+   never promoted to deletion proof. Their key versions participate in rotation
+   and fail-closed checks and are omitted from the public tombstone listing.
+2. Tombstones previously returned the first apply's snapshot unchanged. Subsequent
+   reviewed removals now refresh the same tombstone, preserving previous removals
+   and promoting newly removed payloads from quarantine to blocked replay.
+
+Approval, review and cancellation serialize with apply under the same local
+boundary. The `main` merge preserves late JSONL appends and recomputes a rewrite
+after later changes, while checking the target event's fingerprint on every retry.
+Existing databases with an already-present but NULL tombstone length are backfilled
+from the retained request, without restoring any plaintext revoked value.
+
+On the unchanged 400-record authored corpus:
+
+| Measurement | Hashing | Neural only | Hybrid |
+|---|---:|---:|---:|
+| Disclosures discovered | 230/240 | 232/240 | 240/240 |
+| False positives held for review | 9 | 1 | 10 |
+| Precision | 96.23% | 99.57% | 96.00% |
+| Recall | 95.83% | 96.67% | 100.00% |
+| Known-record disclosing replays allowed | 10 | 3 | 0 |
+| Safe replay quarantines | 9 | 1 | 10 |
+| False deletions | 0 | 0 | 0 |
+
+The hybrid split result is 60/60 disclosures found, two false positives, zero
+false deletions and zero allowed known-record disclosing replays on 100 records.
+These results do **not** establish general semantic recall. Replay uses the same
+labelled payloads present before planning, so exact risk holds contribute. Survivor
+assessment also includes known review holds. A separate real-model integration
+test checks a previously unseen translated reformulation and requires an actual
+embedding signal rather than a stored review fingerprint.
+
+**116/240 disclosures remain after approved actions**, because review-only records
+are preserved. The full review-held survivor set is now flagged, but those flags
+are not an independent proof of semantic absence. Hybrid trades additional review
+work for recall. The labelled corpus and its split have already been inspected;
+independent external evaluation is still needed.
+
+Reports: `published-hashing-local.json`, `published-neural-local.json`,
+`hybrid-local.json`, `hybrid-holdout-local.json`, `published-reference-local.json`.
+The persistent application journey still preserves public context and allowed
+summary content, refuses guarded replay, filters bypass retrieval and reports two
+direct bypasses. The final runtime-only wheel and real stdio/HTTP MCP transports
+were rechecked. The compatibility matrix now includes macOS and a separate real
+Redis server job; a manually dispatched job evaluates real CPU neural/hybrid models.

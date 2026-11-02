@@ -11,7 +11,7 @@ from typing import Any, Sequence
 from redacto.adapters.base import AdapterError, Record
 from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
-from redacto.discovery.embeddings import build_embedder, cosine
+from redacto.discovery.embeddings import build_embedder, embedding_matches
 from redacto.discovery.exact import MIN_SUBSTRING_LEN, ExactMatcher, shares_entity
 from redacto.discovery.normalization import contains_normalized, fingerprint, normalize_loose, variants
 from redacto.discovery.relationship_assessor import (
@@ -42,6 +42,7 @@ from redacto.ingestion import (
     overlap_ratio,
     TombstoneGuard,
     TombstoneMaterial,
+    tombstone_fingerprint_entries,
     summarize_guard_findings,
 )
 from redacto.policy import authorization, classify
@@ -352,6 +353,9 @@ class Engine:
 
     def _leak_guard(self, request: dict[str, Any]) -> TombstoneGuard:
         """A guard built from the request's keyed material, before any tombstone exists."""
+        plan = self.repo.latest_plan_for_request(request["request_id"])
+        policy = {**request.get("policy", {}), "review_fingerprints": self._review_fingerprints(
+            self.repo.plan_items(plan["plan_id"]) if plan else [])}
         material = {
             "tombstone_id": "pending",
             "status": "active",
@@ -368,6 +372,7 @@ class Engine:
             "embedding": request.get("target_embedding", []),
             "embedding_model": request.get("target_embedding_model"),
             "normalized_len": request.get("target_normalized_len"),
+            "policy": policy,
         }
         return TombstoneGuard(
             [material],
@@ -375,6 +380,7 @@ class Engine:
             self.settings.hmac_key_version,
             embedder=self.embedder() if material["embedding"] else None,
             embedding_threshold=self.settings.embedding_quarantine_threshold,
+            lexical_embedding_threshold=self.settings.embedding_lexical_quarantine_threshold,
         )
 
     def _regenerate(self, *, item, record, slot, request, plan, expected_fingerprint, expected_key) -> None:
@@ -501,6 +507,7 @@ class Engine:
             current_version=self.settings.hmac_key_version,
             embedder=self.embedder(),
             embedding_threshold=self.settings.embedding_quarantine_threshold,
+            lexical_embedding_threshold=self.settings.embedding_lexical_quarantine_threshold,
         )
 
     def _record_guard_decision(
@@ -1014,9 +1021,11 @@ class Engine:
 
             # Shared names alone cannot override a neural disclosure signal.
             # Keep the lightweight provider's existing conservative entity rule.
-            neural_disclosure = (embedder.model_id.startswith("sentence-transformers:") and target_embedding
-                                 and cosine(target_embedding, embedder.embed(scanned_record.content))
-                                 >= self.settings.embedding_candidate_threshold)
+            signals = embedding_matches(target_embedding, embedder.model_id,
+                embedder.embed(scanned_record.content), embedder.model_id,
+                threshold=self.settings.embedding_candidate_threshold,
+                lexical_threshold=self.settings.embedding_lexical_candidate_threshold) if target_embedding else {}
+            neural_disclosure = any(name.startswith("sentence-transformers:") for name in signals)
             if shares_entity(target_content, scanned_record.content) and not neural_disclosure:
                 evidence = "Shares a named entity with the target but shows no disclosure evidence."
                 candidates[record_id] = self._candidate(
@@ -1049,43 +1058,42 @@ class Engine:
                 }
                 continue
 
-            if target_embedding:
-                similarity = cosine(target_embedding, embedder.embed(scanned_record.content))
-                if similarity >= self.settings.embedding_candidate_threshold:
-                    evidence = (
-                        f"Embedding similarity {similarity:.2f}; candidate only, not lineage."
-                    )
-                    candidates[record_id] = self._candidate(
-                        record_id=record_id,
-                        store_id=scanned_record.store_id,
-                        record_type=scanned_record.record_type,
-                        capabilities=capabilities,
+            if signals:
+                signal_model, similarity = max(signals.items(), key=lambda item: item[1])
+                evidence = (
+                    f"Embedding similarity {similarity:.2f} ({'neural' if signal_model.startswith('sentence-transformers:') else 'lexical'}); candidate only, not lineage."
+                )
+                candidates[record_id] = self._candidate(
+                    record_id=record_id,
+                    store_id=scanned_record.store_id,
+                    record_type=scanned_record.record_type,
+                    capabilities=capabilities,
+                    evidence_class=classify.SUSPECTED_DERIVATIVE,
+                    reason_redacted=classify.explain(
                         evidence_class=classify.SUSPECTED_DERIVATIVE,
-                        reason_redacted=classify.explain(
-                            evidence_class=classify.SUSPECTED_DERIVATIVE,
-                            record_type=scanned_record.record_type,
-                            action=classify.REVIEW_REQUIRED,
-                            candidate_evidence=evidence,
-                        ),
-                        relation="possible_derivative",
-                        match_kind="embedding",
-                        **common,
+                        record_type=scanned_record.record_type,
+                        action=classify.REVIEW_REQUIRED,
+                        candidate_evidence=evidence,
+                    ),
+                    relation="possible_derivative",
+                    match_kind="embedding",
+                    **common,
+                )
+                embedding_candidates += 1
+                if record_id not in candidate_edges:
+                    self.repo.add_candidate_edge(
+                        source_id=target_id,
+                        target_id=record_id,
+                        relation_guess="possible_derivative",
+                        evidence_summary_redacted=evidence,
+                        model_id=embedder.model_id,
+                        confidence=similarity,
                     )
-                    embedding_candidates += 1
-                    if record_id not in candidate_edges:
-                        self.repo.add_candidate_edge(
-                            source_id=target_id,
-                            target_id=record_id,
-                            relation_guess="possible_derivative",
-                            evidence_summary_redacted=evidence,
-                            model_id=embedder.model_id,
-                            confidence=similarity,
-                        )
-                        candidate_edges[record_id] = {
-                            "target_id": record_id,
-                            "relation_guess": "possible_derivative",
-                        }
-                    continue
+                    candidate_edges[record_id] = {
+                        "target_id": record_id,
+                        "relation_guess": "possible_derivative",
+                    }
+                continue
 
             unrelated_preserved += 1
 
@@ -1544,6 +1552,13 @@ class Engine:
             "require_approval": True,
             "unreachable_stores": scan_result["unreachable_stores"],
             "model": scan_result["model"],
+            "embedding_policy": {
+                "model_id": scan_result["embeddings"]["provider"],
+                "candidate_threshold": self.settings.embedding_candidate_threshold,
+                "quarantine_threshold": self.settings.embedding_quarantine_threshold,
+                "lexical_candidate_threshold": self.settings.embedding_lexical_candidate_threshold,
+                "lexical_quarantine_threshold": self.settings.embedding_lexical_quarantine_threshold,
+            },
         }
         # Capture tombstone material now: after apply the target content may be gone.
         target_record = self._require_record(target_id)
@@ -1642,6 +1657,16 @@ class Engine:
 
     # ------------------------------------------------------------- tombstones
     @staticmethod
+    def _review_fingerprints(items: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        fingerprints = {}
+        for item in items:
+            if item.get("proposed_action") == classify.REVIEW_REQUIRED and item.get("expected_fingerprint"):
+                version = item.get("fingerprint_key_version") or 1
+                value = item["expected_fingerprint"]
+                fingerprints[(version, value)] = {"version": version, "fingerprint": value}
+        return list(fingerprints.values())
+
+    @staticmethod
     def _tombstone_public(tombstone: dict[str, Any] | None) -> dict[str, Any] | None:
         if tombstone is None:
             return None
@@ -1652,7 +1677,8 @@ class Engine:
             "target_kind": tombstone["target_kind"],
             "label_redacted": tombstone["label_redacted"],
             "scope": tombstone["scope"],
-            "policy": tombstone["policy"],
+            "policy": {k: v for k, v in tombstone["policy"].items() if k != "review_fingerprints"},
+            "review_fingerprint_count": len(tombstone["policy"].get("review_fingerprints", [])),
             "status": tombstone["status"],
             "key_version": tombstone.get("key_version", 1),
             "embedding_model": tombstone.get("embedding_model"),
@@ -1663,15 +1689,14 @@ class Engine:
         }
 
     def activate_tombstones(self, request_id: str, plan_id: str) -> dict[str, Any] | None:
-        """Create (or return) the active tombstone for a completed revocation."""
+        """Activate protection and refresh it after recovery or later item reviews."""
         existing = self.repo.tombstones_for_request(request_id)
-        if existing:
-            return existing[0]
         request = self.repo.get_request(request_id)
         if request is None or not request.get("target_fingerprint"):
             return None
 
         items = self.repo.plan_items(plan_id)
+        policy = {**request["policy"], "review_fingerprints": self._review_fingerprints(items)}
         # Redacted and regenerated records stay in their stores without the revoked
         # content; their ids and new fingerprints must not be blocked later.
         removed = [
@@ -1682,19 +1707,27 @@ class Engine:
         ]
         related_ids = [i["record_id"] for i in removed if i["record_id"] != request["target_id"]]
         related_fingerprints: list[dict[str, Any]] = []
-        for record_id in related_ids:
-            record = self.repo.get_record(record_id)
-            if record and record.get("fingerprint"):
+        for item in removed:
+            if item["record_id"] == request["target_id"]:
+                continue
+            record = self.repo.get_record(item["record_id"]) or {}
+            value = item.get("expected_fingerprint") or record.get("fingerprint")
+            if value:
                 related_fingerprints.append(
                     {
                         "version": (
-                            record.get("fingerprint_key_version")
+                            item.get("fingerprint_key_version") or record.get("fingerprint_key_version")
                             or request.get("target_key_version")
                             or 1
                         ),
-                        "fingerprint": record["fingerprint"],
+                        "fingerprint": value,
                     }
                 )
+
+        if existing:
+            self.repo.refresh_tombstone_protection(existing[0]["tombstone_id"], related_ids=related_ids,
+                                                   related_fingerprints=related_fingerprints, policy=policy)
+            return self.repo.get_tombstone(existing[0]["tombstone_id"])
 
         tombstone_id = self.repo.add_tombstone(
             request_id=request_id,
@@ -1708,7 +1741,7 @@ class Engine:
             related_record_ids=related_ids,
             related_fingerprints=related_fingerprints,
             scope=request["scope"],
-            policy=request["policy"],
+            policy=policy,
             status="pending",
             key_version=request.get("target_key_version") or self.settings.hmac_key_version,
             embedding=request.get("target_embedding", []),
@@ -1741,7 +1774,7 @@ class Engine:
             version = int(tombstone.get("key_version") or 1)
             by_version[version] = by_version.get(version, 0) + 1
             required_versions.add(version)
-            for entry in tombstone.get("related_fingerprints", []):
+            for entry in tombstone_fingerprint_entries(tombstone):
                 if isinstance(entry, dict) and entry.get("version"):
                     required_versions.add(int(entry["version"]))
         configured = sorted(self.settings.hmac_keys)
@@ -2214,6 +2247,7 @@ class Engine:
         }
 
     # --------------------------------------------------------------- approve
+    @coordinated
     def approve_plan(self, *, plan_id: str, approval_ref: str, ttl_seconds: int = 600) -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
         recovery = bool(plan and plan["state"] in {"EXECUTING", "FAILED", "PARTIAL"})
@@ -2247,6 +2281,7 @@ class Engine:
             )
         return result
 
+    @coordinated
     def review_plan_item(
         self,
         *,
@@ -2362,6 +2397,7 @@ class Engine:
             ),
         }
 
+    @coordinated
     def cancel_plan(self, *, plan_id: str, reason: str = "") -> dict[str, Any]:
         plan = self.repo.get_plan(plan_id)
         if plan is None:
@@ -3323,7 +3359,7 @@ class Engine:
             "scope": {"stores": scope_stores, "verified_stores": verify_stores, "max_depth": plan["scope"].get("max_depth")},
             "stores": store_results,
             "semantic_verification": {
-                "method": "keyed_anchors_shingles_and_embedding_similarity",
+                "method": "review_fingerprints_keyed_anchors_shingles_and_embedding_similarity",
                 "status": (
                     "not_applicable" if request["target_kind"] == "secret"
                     else "unavailable" if key_unavailable or semantic_guard is None

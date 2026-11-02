@@ -238,7 +238,7 @@ def cmd_check_receipt(args: argparse.Namespace) -> int:
 def cmd_check_embeddings(args: argparse.Namespace) -> int:
     """Load explicitly selected weights using public synthetic text only."""
     from dataclasses import replace
-    from redacto.discovery.embeddings import cosine
+    from redacto.discovery.embeddings import embedding_scores
 
     settings = load_settings()
     if args.offline:
@@ -246,9 +246,11 @@ def cmd_check_embeddings(args: argparse.Namespace) -> int:
     provider = Engine(settings).embedder()
     first = provider.embed("The public SDK supports Linux.")
     second = provider.embed("Le SDK public prend en charge Linux.")
+    scores = embedding_scores(first, provider.model_id, second, provider.model_id)
     _print({"ok": True, "provider": settings.embedding_provider, "model_id": provider.model_id,
             "dimensions": len(first), "local_files_only": settings.embedding_local_files_only,
-            "synthetic_translation_similarity": round(cosine(first, second), 4),
+            "synthetic_translation_similarity": round(max(scores.values(), default=0.0), 4),
+            "component_similarities": {name: round(score, 4) for name, score in sorted(scores.items())},
             "candidate_threshold": settings.embedding_candidate_threshold,
             "quarantine_threshold": settings.embedding_quarantine_threshold,
             "role": "advisory candidates only; similarity is not proof of derivation"})
@@ -598,7 +600,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--corpus", default="benchmarks/adversarial-v1.json")
     benchmark.add_argument("--split", choices=["all", "dev", "holdout"], default="all")
     benchmark.add_argument("--out")
-    benchmark.add_argument("--embedding-provider", choices=["local_hashing", "sentence_transformers", "none"], default="local_hashing")
+    benchmark.add_argument("--embedding-provider", choices=["local_hashing", "sentence_transformers", "hybrid", "none"], default="local_hashing")
     benchmark.add_argument("--embedding-model")
     benchmark.add_argument("--embedding-revision", help="immutable model commit hash")
     benchmark.add_argument("--candidate-threshold", type=float)

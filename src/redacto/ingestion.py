@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-from redacto.discovery.embeddings import EmbeddingProvider, cosine
+from redacto.discovery.embeddings import MODEL_ID, EmbeddingProvider, embedding_matches, embedding_models_covered, model_components
 from redacto.discovery.normalization import contains_normalized, fingerprint, normalize_loose
 
 SHINGLE_SIZE = 5
@@ -45,6 +45,12 @@ QUARANTINED = "quarantined"
 BLOCKED = "blocked"
 
 _SEVERITY = {ALLOWED: 0, QUARANTINED: 1, BLOCKED: 2}
+
+
+def tombstone_fingerprint_entries(tombstone: dict[str, Any]) -> list[Any]:
+    """All versioned fingerprint dependencies, including review-only risk holds."""
+    return [*tombstone.get("related_fingerprints", []),
+            *tombstone.get("policy", {}).get("review_fingerprints", [])]
 
 _ANCHOR_PHRASE = re.compile(r"\b[A-Z][a-zA-Z0-9&'\-]*(?:\s+[A-Z][a-zA-Z0-9&'\-]*){1,3}\b")
 _ANCHOR_WORD = re.compile(r"\b[A-Z][a-z][a-zA-Z0-9&'\-]{2,}\b")
@@ -252,22 +258,24 @@ class TombstoneGuard:
         current_version: int,
         embedder: EmbeddingProvider | None = None,
         embedding_threshold: float = 0.30,
+        lexical_embedding_threshold: float = 0.30,
     ):
         self._tombstones = [t for t in tombstones if t.get("status") == "active"]
         self._keyring = {int(version): key for version, key in keyring.items()}
         self._current = int(current_version)
         self._embedder = embedder
         self._embedding_threshold = embedding_threshold
+        self._lexical_embedding_threshold = lexical_embedding_threshold
         required_versions: set[int] = set()
         for tombstone in self._tombstones:
             required_versions.add(int(tombstone.get("key_version") or 1))
-            for entry in tombstone.get("related_fingerprints", []):
+            for entry in tombstone_fingerprint_entries(tombstone):
                 if isinstance(entry, dict) and entry.get("version"):
                     required_versions.add(int(entry["version"]))
         self._missing_versions = sorted(v for v in required_versions if v not in self._keyring)
         self._skipped_embedding_models = sorted({str(t.get("embedding_model") or "unknown")
             for t in self._tombstones if t.get("embedding") and t.get("target_kind") != "secret"
-            and t.get("embedding_model") != getattr(self._embedder, "model_id", None)})
+            and not embedding_models_covered(t.get("embedding_model"), getattr(self._embedder, "model_id", None))})
 
     @classmethod
     def from_repo(
@@ -278,6 +286,7 @@ class TombstoneGuard:
         current_version: int,
         embedder: EmbeddingProvider | None = None,
         embedding_threshold: float = 0.30,
+        lexical_embedding_threshold: float = 0.30,
     ) -> "TombstoneGuard":
         return cls(
             repo.list_tombstones(statuses=("active",), limit=None),
@@ -285,6 +294,7 @@ class TombstoneGuard:
             current_version,
             embedder=embedder,
             embedding_threshold=embedding_threshold,
+            lexical_embedding_threshold=lexical_embedding_threshold,
         )
 
     @property
@@ -324,7 +334,7 @@ class TombstoneGuard:
             int(tombstone.get("key_version") or 1) for tombstone in self._tombstones
         }
         for tombstone in self._tombstones:
-            for entry in tombstone.get("related_fingerprints", []):
+            for entry in tombstone_fingerprint_entries(tombstone):
                 if isinstance(entry, dict) and entry.get("version"):
                     versions.add(int(entry["version"]))
         materials: dict[int, tuple[str, set[str], set[str], set[str]]] = {}
@@ -339,7 +349,7 @@ class TombstoneGuard:
 
         record_embedding: list[float] = []
         if self._embedder is not None and any(t.get("embedding") and t.get("target_kind") != "secret"
-                                             and t.get("embedding_model") == self._embedder.model_id for t in self._tombstones):
+                                             and model_components(t.get("embedding_model")) & model_components(self._embedder.model_id) for t in self._tombstones):
             record_embedding = self._embedder.embed(content)
 
         best = _allowed()
@@ -429,6 +439,13 @@ class TombstoneGuard:
             ):
                 return GuardDecision(BLOCKED, "value_containment", 1.0, **base)
 
+        # Known review-only payloads remain quarantined on exact replay. Check
+        # this AFTER stronger blocking evidence so a hold never weakens a block.
+        for entry in tombstone.get("policy", {}).get("review_fingerprints", []):
+            version = int(entry.get("version") or tombstone.get("key_version") or 1)
+            if entry.get("fingerprint") == (fingerprints_by_version or {}).get(version):
+                return GuardDecision(QUARANTINED, "pending_review_fingerprint", 1.0, **base)
+
         # 5. Weighted distinctive anchors: uncertain, hold for review.
         weights = _anchor_weights(tombstone["anchors"])
         anchor_score = sum(weight for anchor, weight in weights.items() if anchor in record_anchors)
@@ -450,11 +467,18 @@ class TombstoneGuard:
         #    quarantine; exact copies and shared content are handled above.
         tombstone_embedding = tombstone.get("embedding") or []
         if tombstone["target_kind"] != "secret" and record_embedding and tombstone_embedding:
-            if tombstone.get("embedding_model") not in {None, "", getattr(self._embedder, "model_id", None)}:
-                return _allowed()  # vectors from different models are not comparable
-            similarity = cosine(record_embedding, tombstone_embedding)
-            if similarity >= self._embedding_threshold:
-                return GuardDecision(QUARANTINED, "embedding_similarity", similarity, **base)
+            # Revocation policy is a snapshot: a later runtime threshold change
+            # must not silently weaken protection of an already revoked source.
+            policy = tombstone.get("policy", {}).get("embedding_policy", {})
+            lexical_threshold = (policy.get("quarantine_threshold", self._lexical_embedding_threshold)
+                                 if tombstone.get("embedding_model") == MODEL_ID
+                                 else policy.get("lexical_quarantine_threshold", self._lexical_embedding_threshold))
+            signals = embedding_matches(record_embedding, getattr(self._embedder, "model_id", None),
+                tombstone_embedding, tombstone.get("embedding_model"),
+                threshold=policy.get("quarantine_threshold", self._embedding_threshold),
+                lexical_threshold=lexical_threshold)
+            if signals:
+                return GuardDecision(QUARANTINED, "embedding_similarity", max(signals.values()), **base)
 
         return _allowed()
 

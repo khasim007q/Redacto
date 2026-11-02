@@ -30,7 +30,7 @@ def run_benchmark(corpus_path: Path, *, split: str = "all", embedding_provider: 
     categories = defaultdict(lambda: defaultdict(int))
     results = []
     start = time.perf_counter()
-    neural = embedding_provider in {"sentence_transformers", "sentence-transformers"}
+    neural = embedding_provider in {"sentence_transformers", "sentence-transformers", "hybrid"}
     with tempfile.TemporaryDirectory(prefix="redacto-benchmark-") as temp:
         for scenario in corpus["scenarios"]:
             if split != "all" and scenario["split"] != split:
@@ -109,6 +109,7 @@ def run_benchmark(corpus_path: Path, *, split: str = "all", embedding_provider: 
                                     category=record["category"], discloses=actual, confirmed=record["confirmed"],
                                     discovered=found, classification=item.get("evidence_class", "not_found"),
                                     action=item.get("proposed_action", "none"), residual=residual,
+                                    replay_decision=replay.decision, replay_reason=replay.reason_code,
                                     semantic_flag=rid in semantic_ids, collateral_damage=destroyed))
             totals["failed_actions"] += applied["counts"]["failed"]
     ratio = lambda n, d: round(n / d, 4) if d else 1.0
@@ -116,7 +117,9 @@ def run_benchmark(corpus_path: Path, *, split: str = "all", embedding_provider: 
         benchmark=corpus["name"], corpus_sha256=hashlib.sha256(raw).hexdigest(), split=split,
         embeddings={"provider": embedding_provider, "model_id": engine.embedder().model_id,
                     "candidate_threshold": settings.embedding_candidate_threshold,
-                    "quarantine_threshold": settings.embedding_quarantine_threshold},
+                    "quarantine_threshold": settings.embedding_quarantine_threshold,
+                    "lexical_candidate_threshold": settings.embedding_lexical_candidate_threshold,
+                    "lexical_quarantine_threshold": settings.embedding_lexical_quarantine_threshold},
         records=len(results), discovery=_prf(totals["tp"], totals["fp"], totals["fn"]),
         confirmed_descendant_recall=ratio(totals["confirmed_found"], totals["confirmed_expected"]),
         untracked_disclosure_recall=ratio(totals["untracked_found"], totals["untracked_expected"]),
@@ -133,6 +136,8 @@ def run_benchmark(corpus_path: Path, *, split: str = "all", embedding_provider: 
         limitations=["Synthetic, template-based corpus; labels are not independently annotated.",
                      "No thresholds are tuned during evaluation; dev/holdout facts and entities are disjoint.",
                      "Only approved actions execute; unresolved disclosures are intentionally retained for review.",
+                     "Replay reuses labelled records present before planning; exact known-risk fingerprints contribute to quarantine.",
+                     "Survivor assessment includes known review fingerprints and is not an independent semantic-absence test.",
                      "Local neural embeddings were exercised; no external inference service was used."
                      if neural else "No external model or neural embedding is exercised; this is not production recall evidence.",
                      "This benchmark is not evidence of production or universal semantic recall."],

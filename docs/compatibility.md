@@ -27,7 +27,8 @@ reported by status. No store claims physical erasure across backups or replicas.
 ## Runtime and installation
 
 - Python 3.12+; fresh locked environments were exercised on Windows with Python
-  3.12 and 3.14. CI also runs Python 3.12 on Linux and Windows.
+  3.12 and 3.14. Hosted CI now specifies both versions on Linux, Windows and macOS;
+  consult the checks on the pushed commit for executed outcomes.
 - `uv sync --frozen --extra dev --extra chroma --extra redis --python 3.12`
   installs the locked test/store dependencies without neural packages. Add
   `--extra semantic` to install the optional CPU embedding provider. The lock
@@ -39,7 +40,9 @@ reported by status. No store claims physical erasure across backups or replicas.
   and no `pyproject.toml`, without a `PYTHONPATH` shim; it auto-seeds isolated demo
   stores and creates a non-destructive plan through the eight-tool MCP surface.
 - CI runs real local Chroma. Redis tests use fakeredis unless
-  `REDACTO_TEST_REDIS_URL` points at a real Redis instance.
+  `REDACTO_TEST_REDIS_URL` points at a real Redis instance. An isolated Redis 7.4
+  CI service now exercises transaction conflicts, scoped invalidation and the
+  supported Redis types against a real server. No local production Redis is used.
 - For a runtime-only installation, `pip install .` is checked in a separate CI job.
 
 Use `uv lock --upgrade` only as an intentional dependency update, then rerun the
@@ -53,6 +56,9 @@ it is not a distributed transaction. A partial application write can remain if a
 later store fails, and reconciliation/verification must report it.
 
 An approved real apply activates protection before releasing that boundary.
+Approval, review and cancellation share the boundary with apply, preventing a
+review/version change racing an executing plan. Newly completed reviewed actions
+refresh the existing tombstone instead of leaving its first-apply snapshot stale.
 Every active tombstone is enforced; the public listing's display limit does not
 cap enforcement. Direct writes outside the guard remain possible with store access.
 The reference app filters retrieval and exposes `reconcile()` to detect bypasses.
@@ -62,6 +68,10 @@ and scan truncation are reported separately. Local hashing is lexical, with exac
 quantity-scale normalization; it does not establish semantic equivalence, exchange
 rates, multilingual recall or provenance. Different embedding versions are not
 compared; old tombstones retain their keyed fingerprint/anchor/shingle checks.
+Hybrid compares its components separately and preserves old hashing or matching
+pinned-neural tombstones. Threshold snapshots apply to already-issued revocations.
+Known review-only payloads are fingerprinted for quarantine on replay, independently
+of a later similarity score, and their key versions remain required during rotation.
 Model mismatches are now reported as degraded semantic protection in status and
 ingestion results, and as incomplete semantic coverage/PARTIAL during verification.
 Restore the original provider and immutable model revision to compare an old
