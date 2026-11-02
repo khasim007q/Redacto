@@ -12,16 +12,17 @@ import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from redacto.errors import HmacKeyError, RedactoError
 
 
-def _env_path(name: str, default: str) -> Path:
-    return Path(os.environ.get(name, default)).expanduser().resolve()
+def _env_path(name: str, default: str, env: Mapping[str, str] = os.environ) -> Path:
+    return Path(env.get(name, default)).expanduser().resolve()
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
+def _env_bool(name: str, default: bool, env: Mapping[str, str] = os.environ) -> bool:
+    raw = env.get(name)
     if raw is None:
         return default
     value = raw.strip().lower()
@@ -30,8 +31,8 @@ def _env_bool(name: str, default: bool) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _env_list(name: str) -> tuple[str, ...]:
-    return tuple(part.strip() for part in os.environ.get(name, "").split(",") if part.strip())
+def _env_list(name: str, env: Mapping[str, str] = os.environ) -> tuple[str, ...]:
+    return tuple(part.strip() for part in env.get(name, "").split(",") if part.strip())
 
 
 @dataclass(frozen=True)
@@ -73,8 +74,15 @@ class Settings:
     embedding_local_files_only: bool = False
     embedding_lexical_candidate_threshold: float = 0.25
     embedding_lexical_quarantine_threshold: float = 0.30
+    enabled_stores: tuple[str, ...] | None = None
 
     def __post_init__(self):
+        known = {"filesystem", "sqlite_memory", "jsonl_logs", "vector_fixture", "chroma", "redis_cache"}
+        if self.enabled_stores is not None and (
+            not self.enabled_stores or set(self.enabled_stores) - known
+            or len(set(self.enabled_stores)) != len(self.enabled_stores)
+        ):
+            raise RedactoError("invalid_configuration", "REDACTO_STORES must list distinct supported store IDs.")
         if self.embedding_provider not in {"local_hashing", "local-hashing", "hashing", "sentence_transformers", "sentence-transformers", "hybrid", "none", "disabled", ""}:
             raise RedactoError("invalid_configuration", "Unknown REDACTO_EMBEDDING_PROVIDER.")
         if self.embedding_provider in {"sentence_transformers", "sentence-transformers", "hybrid"}:
@@ -163,19 +171,20 @@ class Settings:
                 else None
             ),
             "regenerate_derivatives": self.regenerate_derivatives,
+            "enabled_stores": list(self.enabled_stores) if self.enabled_stores is not None else None,
         }
 
 
-def _load_keyring(default_key: str) -> tuple[dict[int, str], int, str | None]:
+def _load_keyring(default_key: str, env: Mapping[str, str] = os.environ) -> tuple[dict[int, str], int, str | None]:
     """Versioned key ring: old versions stay available during rotation."""
     try:
-        current_version = int(os.environ.get("REDACTO_HMAC_KEY_VERSION", "1"))
+        current_version = int(env.get("REDACTO_HMAC_KEY_VERSION", "1"))
     except ValueError:
         return {}, 1, "REDACTO_HMAC_KEY_VERSION must be an integer."
     if current_version < 1:
         return {}, current_version, "REDACTO_HMAC_KEY_VERSION must be >= 1."
 
-    raw = os.environ.get("REDACTO_HMAC_KEYS")
+    raw = env.get("REDACTO_HMAC_KEYS")
     if not raw:
         return {current_version: default_key}, current_version, None
     try:
@@ -230,60 +239,75 @@ def _load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
-def load_settings() -> Settings:
+def load_settings(profile: str | Path | None = None) -> Settings:
+    try:
+        return _load_settings(profile)
+    except (ValueError, OverflowError) as exc:
+        raise RedactoError("invalid_configuration", "A numeric runtime setting is invalid.") from exc
+
+
+def _load_settings(profile: str | Path | None = None) -> Settings:
     base = Path.cwd()
-    _load_dotenv(base / ".env")
-    model_provider = os.environ.get("REDACTO_MODEL_PROVIDER", "none").strip().lower()
-    embedding_provider = os.environ.get("REDACTO_EMBEDDING_PROVIDER", "local_hashing").strip().lower()
+    profile = profile or os.environ.get("REDACTO_PROFILE")
+    if profile:
+        from redacto.profiles import profile_environment
+
+        env = profile_environment(Path(profile))
+    else:
+        _load_dotenv(base / ".env")
+        env = os.environ
+    model_provider = env.get("REDACTO_MODEL_PROVIDER", "none").strip().lower()
+    embedding_provider = env.get("REDACTO_EMBEDDING_PROVIDER", "local_hashing").strip().lower()
     neural = embedding_provider in {"sentence_transformers", "sentence-transformers", "hybrid"}
     hmac_keys, hmac_key_version, keyring_error = _load_keyring(
-        os.environ.get("REDACTO_HMAC_KEY", "dev-only-synthetic-fixture-key")
+        env.get("REDACTO_HMAC_KEY", "dev-only-synthetic-fixture-key"), env
     )
     return Settings(
-        db_path=_env_path("REDACTO_DB_PATH", str(base / "var" / "redacto.sqlite3")),
-        workspace_root=_env_path("REDACTO_WORKSPACE_ROOT", str(base / "fixtures" / "workspace")),
+        db_path=_env_path("REDACTO_DB_PATH", str(base / "var" / "redacto.sqlite3"), env),
+        workspace_root=_env_path("REDACTO_WORKSPACE_ROOT", str(base / "fixtures" / "workspace"), env),
         sqlite_store_path=_env_path(
-            "REDACTO_SQLITE_PATH", str(base / "fixtures" / "workspace" / "agent_memory.sqlite3")
+            "REDACTO_SQLITE_PATH", str(base / "fixtures" / "workspace" / "agent_memory.sqlite3"), env
         ),
         jsonl_log_path=_env_path(
-            "REDACTO_JSONL_PATH", str(base / "fixtures" / "workspace" / "agent_events.jsonl")
+            "REDACTO_JSONL_PATH", str(base / "fixtures" / "workspace" / "agent_events.jsonl"), env
         ),
         vector_fixture_path=_env_path(
-            "REDACTO_VECTOR_PATH", str(base / "fixtures" / "workspace" / "vector_chunks.json")
+            "REDACTO_VECTOR_PATH", str(base / "fixtures" / "workspace" / "vector_chunks.json"), env
         ),
         hmac_keys=hmac_keys,
         hmac_key_version=hmac_key_version,
         embedding_provider=embedding_provider,
-        embedding_model=os.environ.get("REDACTO_EMBEDDING_MODEL") or None,
-        embedding_revision=os.environ.get("REDACTO_EMBEDDING_REVISION") or None,
-        embedding_local_files_only=_env_bool("REDACTO_EMBEDDING_LOCAL_FILES_ONLY", False),
-        embedding_lexical_candidate_threshold=float(os.environ.get("REDACTO_EMBEDDING_LEXICAL_CANDIDATE_THRESHOLD", "0.25")),
-        embedding_lexical_quarantine_threshold=float(os.environ.get("REDACTO_EMBEDDING_LEXICAL_QUARANTINE_THRESHOLD", "0.30")),
+        embedding_model=env.get("REDACTO_EMBEDDING_MODEL") or None,
+        embedding_revision=env.get("REDACTO_EMBEDDING_REVISION") or None,
+        embedding_local_files_only=_env_bool("REDACTO_EMBEDDING_LOCAL_FILES_ONLY", False, env),
+        embedding_lexical_candidate_threshold=float(env.get("REDACTO_EMBEDDING_LEXICAL_CANDIDATE_THRESHOLD", "0.25")),
+        embedding_lexical_quarantine_threshold=float(env.get("REDACTO_EMBEDDING_LEXICAL_QUARANTINE_THRESHOLD", "0.30")),
         embedding_candidate_threshold=float(
-            os.environ.get("REDACTO_EMBEDDING_CANDIDATE_THRESHOLD", "0.55" if neural else "0.25")
+            env.get("REDACTO_EMBEDDING_CANDIDATE_THRESHOLD", "0.55" if neural else "0.25")
         ),
         embedding_quarantine_threshold=float(
-            os.environ.get("REDACTO_EMBEDDING_QUARANTINE_THRESHOLD", "0.60" if neural else "0.30")
+            env.get("REDACTO_EMBEDDING_QUARANTINE_THRESHOLD", "0.60" if neural else "0.30")
         ),
-        safety_mode=os.environ.get("REDACTO_SAFETY_MODE", "review"),
-        dry_run=_env_bool("REDACTO_DRY_RUN", True),
-        max_scan_records=int(os.environ.get("REDACTO_MAX_SCAN_RECORDS", "500")),
-        max_record_bytes=int(os.environ.get("REDACTO_MAX_RECORD_BYTES", "1000000")),
+        safety_mode=env.get("REDACTO_SAFETY_MODE", "review"),
+        dry_run=_env_bool("REDACTO_DRY_RUN", True, env),
+        max_scan_records=int(env.get("REDACTO_MAX_SCAN_RECORDS", "500")),
+        max_record_bytes=int(env.get("REDACTO_MAX_RECORD_BYTES", "1000000")),
         model_provider=model_provider,
-        model_base_url=os.environ.get("REDACTO_MODEL_BASE_URL") or None,
-        model_name=os.environ.get("REDACTO_MODEL_NAME") or None,
-        model_timeout_seconds=float(os.environ.get("REDACTO_MODEL_TIMEOUT", "10")),
-        http_host=os.environ.get("REDACTO_HTTP_HOST", "127.0.0.1"),
-        http_port=int(os.environ.get("REDACTO_HTTP_PORT", "8765")),
-        http_token=os.environ.get("REDACTO_HTTP_TOKEN") or None,
+        model_base_url=env.get("REDACTO_MODEL_BASE_URL") or None,
+        model_name=env.get("REDACTO_MODEL_NAME") or None,
+        model_timeout_seconds=float(env.get("REDACTO_MODEL_TIMEOUT", "10")),
+        http_host=env.get("REDACTO_HTTP_HOST", "127.0.0.1"),
+        http_port=int(env.get("REDACTO_HTTP_PORT", "8765")),
+        http_token=env.get("REDACTO_HTTP_TOKEN") or None,
         keyring_error=keyring_error,
         chroma_path=(
-            Path(os.environ["REDACTO_CHROMA_PATH"]).expanduser().resolve()
-            if os.environ.get("REDACTO_CHROMA_PATH")
+            Path(env["REDACTO_CHROMA_PATH"]).expanduser().resolve()
+            if env.get("REDACTO_CHROMA_PATH")
             else None
         ),
-        chroma_collections=_env_list("REDACTO_CHROMA_COLLECTIONS"),
-        redis_url=os.environ.get("REDACTO_REDIS_URL") or None,
-        redis_key_patterns=_env_list("REDACTO_REDIS_KEY_PATTERNS"),
-        regenerate_derivatives=_env_bool("REDACTO_REGENERATE", False),
+        chroma_collections=_env_list("REDACTO_CHROMA_COLLECTIONS", env),
+        redis_url=env.get("REDACTO_REDIS_URL") or None,
+        redis_key_patterns=_env_list("REDACTO_REDIS_KEY_PATTERNS", env),
+        enabled_stores=_env_list("REDACTO_STORES", env) if "REDACTO_STORES" in env else None,
+        regenerate_derivatives=_env_bool("REDACTO_REGENERATE", False, env),
     )

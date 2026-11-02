@@ -545,6 +545,8 @@ class Repository:
         parsed = _row(row)
         if parsed:
             parsed["approved"] = bool(parsed["approved"])
+            parsed["redact_spans"] = _loads(parsed.get("redact_spans_json"), [])
+            parsed["regen_sources"] = _loads(parsed.get("regen_sources_json"), [])
         return parsed
 
     def claim_plan_execution(self, plan_id: str) -> str | None:

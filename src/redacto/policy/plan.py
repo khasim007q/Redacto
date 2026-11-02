@@ -57,9 +57,10 @@ def build_plan_items(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any
                 # Keyed fingerprints + lengths of the value's exact forms, never the value.
                 "redact_spans": (
                     list(candidate.get("redact_spans") or [])
-                    if action == classify.REDACT_SPAN
+                    if action in {classify.REDACT_SPAN, classify.REVIEW_REQUIRED}
                     else []
                 ),
+                "review_actions": candidate.get("review_actions") or [],
                 # Allowed source record ids a regenerated derivative is rebuilt from.
                 "regen_sources": (
                     list(candidate.get("regen_sources") or [])

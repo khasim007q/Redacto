@@ -38,8 +38,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def build_app():
-    settings = load_settings()
+def build_app(settings=None):
+    settings = settings or load_settings()
     if not settings.http_token:
         raise RuntimeError(
             "REDACTO_HTTP_TOKEN must be set for HTTP transport; refusing to serve unauthenticated."

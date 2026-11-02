@@ -1,0 +1,62 @@
+{
+  "date_local": "2026-11-02",
+  "timezone": "Asia/Calcutta",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "source_tests_scripts_sha256": "85c196050204b46cb9480464185be6fa77043f5b0ff901f5b633f081346eabcf",
+  "uv_lock_sha256": "7e7bf89448f1b0829798b9b46d79e16d5d79b71149adf0713f21bc029831f6a3",
+  "test_runs": [
+    {
+      "python": "3.12.0",
+      "real_neural_enabled": true,
+      "tests": 411,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 2,
+      "passed": 409,
+      "seconds": 161.657
+    },
+    {
+      "python": "3.14.2",
+      "real_neural_enabled": false,
+      "tests": 411,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 4,
+      "passed": 407,
+      "seconds": 141.225
+    }
+  ],
+  "new_capability_tests": 34,
+  "runtime_only_wheel": {
+    "profile_stdio_and_separate_cli_approval": "PASS",
+    "legacy_stdio": "PASS",
+    "authenticated_http": "PASS",
+    "outside_project_with_spaces": true,
+    "pyproject_required_in_target": false
+  },
+  "hashing_benchmark": {
+    "records": 400,
+    "discovery": {
+      "false_negatives": 10,
+      "false_positives": 9,
+      "precision": 0.9623,
+      "recall": 0.9583,
+      "true_positives": 230
+    },
+    "false_deletions": 0,
+    "residual_disclosures": 116,
+    "replay_guard": {
+      "disclosing_allowed": 10,
+      "disclosing_blocked": 144,
+      "disclosing_quarantined": 86,
+      "safe_blocked": 0,
+      "safe_quarantined": 9
+    }
+  },
+  "limitations": [
+    "Local Windows evidence; use latest commit checks for hosted Linux/macOS/Windows outcomes.",
+    "Uncertain paraphrases require assessment; source-passage redaction offers are exact matching and reviewed.",
+    "Direct writers can bypass writes; scoped guards and rescans do not prove universal erasure.",
+    "External model assessor tests were skipped; real pinned CPU neural/hybrid integration tests ran on Python 3.12."
+  ]
+}

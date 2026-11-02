@@ -1,5 +1,12 @@
 # Compatibility and guarantees
 
+For ordinary-folder MCP setup and a runtime-only application API, see
+[workspace profiles](workspace-setup.md). `setup` prints one profile-based client
+entry; the scanned folder does not require a Python project. Files-only profiles
+scope only the filesystem, managed profiles add owned SQLite/JSONL, and explicit
+demo profiles add synthetic vector fixtures. Enabled stores that disappear remain
+unavailable and prevent a complete receipt; disabled stores are outside scope.
+
 This is the authoritative store matrix. Configuration is explicit; discovering
 a store in the same directory never grants mutation permission.
 

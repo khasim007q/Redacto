@@ -61,6 +61,20 @@ is **off by default**; with no provider configured its candidates are unassessed
 
 ## Quick start
 
+To connect an ordinary folder to Claude, use the [saved workspace setup](docs/workspace-setup.md):
+
+```powershell
+uv sync --frozen --python 3.12
+.\.venv\Scripts\python.exe -m redacto setup --workspace "C:\path\to\Agent Notes"
+```
+
+Paste the printed `mcp_config` into your client's local MCP settings. The documents
+folder needs no `pyproject.toml`. Add `--demo` for explicit synthetic data in a new
+folder, or `--managed-memory` for owned SQLite memory/cache and JSONL stores plus
+the guarded `WorkspaceClient` application API. Use the printed profile for operator
+commands. Reviewed source-passage edits can now preserve public content inside
+mixed files, memory rows and logs; uncertain paraphrases still need assessment.
+
 For a reproducible install, use the checked-in dependency lock:
 
 ```powershell

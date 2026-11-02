@@ -43,6 +43,8 @@ jobs:
             scale.json
       - name: stdio MCP smoke test
         run: uv run --no-sync python scripts/mcp_smoke.py
+      - name: Saved profile MCP and operator approval smoke test
+        run: uv run --no-sync python scripts/profile_smoke.py
       - name: HTTP MCP smoke test
         if: runner.os == 'Linux'
         run: uv run --no-sync python scripts/mcp_http_smoke.py
@@ -62,6 +64,7 @@ jobs:
         run: |
           python -m redacto --help
           python -m redacto check-embeddings
+          python scripts/profile_smoke.py
 
   redis-integration:
     runs-on: ubuntu-latest

@@ -76,6 +76,9 @@ def propose_action(
     if regenerable and evidence_class == CONFIRMED_DESCENDANT and capabilities.get("regenerate"):
         return REGENERATE, True, "medium"
 
+    if evidence_class == CONFIRMED_DESCENDANT and partial_match and redactable:
+        return REVIEW_REQUIRED, False, "high"
+
     # A substring match inside a larger, useful record is not a safe automatic
     # delete: hold it for review so the reviewer sees the collateral damage.
     if (
@@ -109,9 +112,14 @@ def propose_action(
 
 
 def override_action(
-    *, record_type: str, capabilities: dict[str, bool]
+    *, record_type: str, capabilities: dict[str, bool], redactable: bool = False,
+    preferred: str | None = None,
 ) -> str | None:
     """Action for a reviewer-approved review item, or None if unsupported."""
+    if preferred == "redact" or (preferred is None and redactable):
+        return REDACT_SPAN if redactable and capabilities.get("redact") else None
+    if preferred == "delete":
+        return DELETE_RECORD if capabilities.get("delete") else None
     if record_type == "index_entry" and capabilities.get("invalidate"):
         return INVALIDATE_INDEX
     if record_type == "cache_entry" and capabilities.get("invalidate"):
@@ -204,5 +212,7 @@ def summarize_candidate(item: dict[str, Any]) -> dict[str, Any]:
         "expected_fingerprint": item.get("expected_fingerprint"),
         "fingerprint_key_version": item.get("fingerprint_key_version"),
         "redact_spans": item.get("redact_spans") or [],
+        "review_actions": ([REDACT_SPAN, DELETE_RECORD] if item.get("redact_spans") and item.get("capabilities", {}).get("delete")
+                           else [REDACT_SPAN] if item.get("redact_spans") else []),
         "regen_sources": item.get("regen_sources") or [],
     }

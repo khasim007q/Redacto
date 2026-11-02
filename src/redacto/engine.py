@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from redacto.adapters.base import AdapterError, Record
+from redacto.adapters.base import AdapterError, Record, REDACTION_MARK, redact_spans
 from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
 from redacto.discovery.embeddings import build_embedder, embedding_matches
@@ -52,6 +52,7 @@ from redacto.policy.plan import build_plan_items, compute_plan_hash, estimated_i
 from redacto.status import collect_status
 from redacto.locking import coordinated, resource_lock
 from redacto.receipts import sign_receipt
+from redacto.selective import passage_offer
 
 TARGET_KINDS = {"source", "fact", "secret"}
 MODES = {"source_revocation", "fact_revocation"}
@@ -1175,6 +1176,29 @@ class Engine:
             enabled=use_model,
         )
 
+        if target_kind == "source":
+            for identity, candidate in candidates.items():
+                current = scanned.get(identity)
+                if (current is None or identity == target_id or candidate.get("unreachable")
+                    or candidate.get("regen_sources") or not candidate.get("capabilities", {}).get("redact")
+                    or candidate["record_type"] not in {"doc", "memory", "log"}
+                    or candidate["evidence_class"] not in {classify.SUSPECTED_DERIVATIVE, classify.UNKNOWN, classify.CONFIRMED_DESCENDANT}):
+                    continue
+                payload = current.content
+                offer = passage_offer(target_content, payload, self.settings.current_hmac_key, max_bytes=self.REDACT_MAX_BYTES)
+                if offer is None:
+                    continue
+                if current.core_content is not None:
+                    retained_core, _ = redact_spans(current.core_content, offer.spans, self.settings.current_hmac_key)
+                    if len(re.findall(r"\w+", retained_core.replace(REDACTION_MARK, ""))) < 8:
+                        continue
+                candidate.update(redact_spans=offer.spans, partial_match=True,
+                    proposed_action=classify.REVIEW_REQUIRED, approved=False, risk="high",
+                    review_actions=[classify.REDACT_SPAN, classify.DELETE_RECORD],
+                    matched_bytes=offer.matched_bytes,
+                    match_ratio=round(offer.matched_bytes / max(1, len(payload.encode("utf-8"))), 4),
+                    collateral_note=f"Reviewed redaction can preserve about {offer.retained_bytes} bytes of other content; semantic survivors still require verification.")
+
         ordered = sorted(
             candidates.values(),
             key=lambda c: (classify.severity(c["evidence_class"]), c["record_id"]),
@@ -2290,6 +2314,7 @@ class Engine:
         decision: str,
         reviewer: str,
         note: str | None = None,
+        action: str | None = None,
     ) -> dict[str, Any]:
         """Approve or reject one review-required plan item (application action).
 
@@ -2299,6 +2324,8 @@ class Engine:
         """
         if decision not in {"approved", "rejected"}:
             raise RedactoError("invalid_decision", "decision must be 'approved' or 'rejected'.")
+        if action not in {None, "redact", "delete"} or (decision == "rejected" and action is not None):
+            raise RedactoError("invalid_action", "Choose redact or delete only when approving an item.")
         reviewer = (reviewer or "").strip()
         if not reviewer:
             raise RedactoError("invalid_reviewer", "A reviewer identity is required.")
@@ -2342,6 +2369,7 @@ class Engine:
             action = classify.override_action(
                 record_type=record.get("record_type", "unknown"),
                 capabilities=record.get("capabilities", {}),
+                redactable=bool(item.get("redact_spans")), preferred=action,
             )
             if action is None:
                 raise RedactoError(
@@ -2391,6 +2419,8 @@ class Engine:
             "item_id": item_id,
             "decision": decision,
             "review_id": review_id,
+            "selected_action": self.repo.get_plan_item(item_id)["proposed_action"],
+            "redaction_span_count": len(item.get("redact_spans") or []),
             "approval_required": True,
             "message": (
                 "Plan changed; issue a new approval token for this version before applying."
@@ -2801,6 +2831,14 @@ class Engine:
                         f"{action} is not supported by this adapter", code="unsupported_operation"
                     )
             except AdapterError as exc:
+                if exc.code == "not_found" and action in {classify.REDACT_SPAN, classify.REGENERATE}:
+                    try:
+                        slot.adapter.read_record(self._resolve_locator(slot.adapter, record["locator"]))
+                    except AdapterError as read_error:
+                        if read_error.code != "not_found":
+                            exc = read_error
+                    else:
+                        exc = AdapterError("The record still exists and the planned edit was not applied.", code="action_not_applied")
                 if exc.code == "not_found":
                     self.repo.record_action(
                         request_id=plan["request_id"],

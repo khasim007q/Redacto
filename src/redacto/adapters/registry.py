@@ -30,6 +30,8 @@ def build_adapters(settings: Settings) -> dict[str, AdapterSlot]:
     slots: dict[str, AdapterSlot] = {}
 
     def _add(adapter_id: str, factory) -> None:
+        if settings.enabled_stores is not None and adapter_id not in settings.enabled_stores:
+            return
         try:
             slots[adapter_id] = AdapterSlot(adapter_id, factory())
         except (AdapterError, HmacKeyError) as exc:
@@ -58,6 +60,9 @@ def build_adapters(settings: Settings) -> dict[str, AdapterSlot]:
                 settings.redis_url, settings.redis_key_patterns, settings.current_hmac_key
             ),
         )
+    for store in settings.enabled_stores or ():
+        if store not in slots:
+            slots[store] = AdapterSlot(store, None, "Enabled store has no connection configuration.")
     return slots
 
 

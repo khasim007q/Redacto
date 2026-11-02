@@ -268,3 +268,52 @@ summary content, refuses guarded replay, filters bypass retrieval and reports tw
 direct bypasses. The final runtime-only wheel and real stdio/HTTP MCP transports
 were rechecked. The compatibility matrix now includes macOS and a separate real
 Redis server job; a manually dispatched job evaluates real CPU neural/hybrid models.
+
+## Selective cleanup and simpler integration (2026-11-02)
+
+Mixed records containing matching source passages now offer reviewed span edits,
+including confirmed descendants whose other content should survive. Plans retain
+only keyed span fingerprints/lengths, show the preservation option and bind it to
+the approved version. `review-item --action redact` selects the edit;
+`--action delete` explicitly selects whole-record removal. Default approval uses
+an available planned edit. Optional allowed-parent regeneration still takes
+precedence. Suspected relationships remain suspected after review.
+
+JSONL edits operate on decoded nested strings, including escaped quotes, while
+preserving event identity and other values. Ambiguous duplicate keys, colliding
+rewritten keys and identity-changing edits fail without replacing the log. A
+missing span in a still-present record is an action failure rather than a false
+claim that the record is already absent. Changed fingerprints prevent stale edits.
+
+`setup` creates one strict saved profile and prints a local MCP client entry.
+Ordinary folders need no Python project file. Files-only profiles exclude unused
+stores explicitly; managed profiles add owned SQLite memory/cache and JSONL stores.
+Demo seeding is explicit. Private state stays outside scanned documents, unknown
+state/scope conflicts are refused, and reruns preserve keys and stores. Profiles
+ignore ambient scope/key overrides and launch-directory `.env` files. `doctor`
+reports missing stores, unavailable graph state and degraded tombstone protection.
+
+`WorkspaceClient` shares the profile with MCP and operator commands, checks current
+sources before dependent writes, guards admission/retrieval and records instrumented
+lineage. Content and graph writes remain separate persistence operations; failures
+report known/uncertain write status for reconciliation. Direct writers remain
+possible. The [setup guide](workspace-setup.md) includes the interview workflow,
+application example and exact boundaries.
+
+Final local validation: 409 passed/2 skipped on Windows Python 3.12 with actual
+pinned CPU neural/hybrid integration; 407 passed/4 skipped on Python 3.14. There are
+34 new capability regression cases. A rebuilt runtime-only wheel passed the new
+profile stdio journey (separate CLI approval, apply, verify, public preservation and
+replay refusal) outside the repository with spaces and no `pyproject.toml`, as well
+as legacy stdio and authenticated HTTP smoke tests. The persistent Chroma app now
+reviews/redacts mixed query logs, regenerates its mixed summary, preserves public
+context and detects two deliberate bypasses. Its final clean scoped receipt follows
+the explicit review step. The unchanged hashing corpus still finds 230/240
+disclosures, leaves 116 review-held disclosures and allows ten disclosing replays;
+this iteration makes no new general semantic-recall claim.
+
+Machine-readable evidence: `benchmarks/capabilities-validation-local.json` and
+`benchmarks/capabilities-reference-local.json`. CI now exercises the profile MCP
+journey across the OS/Python matrix and in the runtime-only install job. Hosted
+results must be checked against the new commit rather than inferred from earlier
+green runs.

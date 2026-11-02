@@ -25,6 +25,15 @@ def run():
         approval = app.engine.approve_plan(plan_id=plan["plan_id"], approval_ref="synthetic-evidence-operator")
         applied = app.engine.apply(plan_id=plan["plan_id"], plan_version=plan["plan_version"], approval_ref=approval["approval_ref"],
                                    confirmation_token=approval["confirmation_token"], dry_run=False)
+        reviewed_items = [i for i in plan["items"] if i["proposed_action"] == "REVIEW_REQUIRED" and i["redact_spans"]]
+        for item in reviewed_items:
+            reviewed = app.engine.review_plan_item(plan_id=plan["plan_id"], item_id=item["item_id"],
+                                                   decision="approved", reviewer="synthetic-evidence-operator", action="redact")
+        if reviewed_items:
+            approval = app.engine.approve_plan(plan_id=plan["plan_id"], approval_ref="synthetic-reviewed-redaction")
+            completed = app.engine.apply(plan_id=plan["plan_id"], plan_version=reviewed["plan_version"],
+                                         approval_ref=approval["approval_ref"], confirmation_token=approval["confirmation_token"], dry_run=False)
+            assert completed["counts"]["failed"] == 0
         after = app.query("SDK Linux")
         clean_receipt = app.engine.verify(request_id=plan["request_id"])
         replay_refused = False
@@ -45,6 +54,7 @@ def run():
                 "after_query_disclosed": "48 million" in after["answer"],
                 "public_context_retained": "Linux" in after["answer"],
                 "mixed_summary_retained_only_allowed_source": summary == public,
+                "mixed_logs_redacted_after_review": len(reviewed_items),
                 "failed_actions": applied["counts"]["failed"],
                 "clean_verification_status": clean_receipt["status"],
                 "guarded_replay_refused": replay_refused,
@@ -61,7 +71,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     result = run()
     if args.out:
-        Path(args.out).write_text(json.dumps(result, indent=2) + "\n")
+        Path(args.out).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))
     assert result["before_query_disclosed"] and not result["after_query_disclosed"]
     assert result["public_context_retained"] and result["mixed_summary_retained_only_allowed_source"]

@@ -305,26 +305,56 @@ class JsonlLogAdapter(StoreAdapter):
                 preferred_line = None
 
         def transform(line: str) -> str:
+            def unique_object(pairs):
+                result = {}
+                for name, value in pairs:
+                    if name in result:
+                        raise AdapterError("Duplicate JSON keys make a selective edit ambiguous.", code="unsupported_operation")
+                    result[name] = value
+                return result
             try:
-                payload = json.loads(line)
-                if not isinstance(payload, dict):
-                    payload = {"_malformed": True, "content": line}
+                payload = json.loads(line, object_pairs_hook=unique_object)
+                parsed_object = isinstance(payload, dict)
             except json.JSONDecodeError:
+                payload = {"_malformed": True, "content": line}
+                parsed_object = False
+            if not parsed_object:
                 payload = {"_malformed": True, "content": line}
             if expected_fingerprint and (
                 fingerprint(self._content(payload), signing_key) != expected_fingerprint
             ):
                 raise AdapterError("record content changed since planning", code="content_changed")
-            redacted, count = redact_spans(line, spans, signing_key)
+            if not parsed_object:
+                redacted, count = redact_spans(line, spans, signing_key)
+            else:
+                count = 0
+                def edit(value, depth=0):
+                    nonlocal count
+                    if depth > 64:
+                        raise AdapterError("JSON nesting exceeds the selective edit budget.", code="unsupported_operation")
+                    if isinstance(value, str):
+                        updated, matches = redact_spans(value, spans, signing_key)
+                        count += matches
+                        return updated
+                    if isinstance(value, list):
+                        return [edit(item, depth + 1) for item in value]
+                    if isinstance(value, dict):
+                        updated = {}
+                        for name, item in value.items():
+                            new_name = edit(name, depth + 1)
+                            if new_name in updated:
+                                raise AdapterError("Redaction would merge distinct JSON keys.", code="unsupported_operation")
+                            if depth == 0 and name == "event_id":
+                                if new_name != name or edit(item, depth + 1) != item:
+                                    raise AdapterError("Selective redaction cannot change event identity.", code="unsupported_operation")
+                                updated[name] = item
+                            else:
+                                updated[new_name] = edit(item, depth + 1)
+                        return updated
+                    return value
+                redacted = json.dumps(edit(payload), ensure_ascii=False)
             if count == 0:
                 raise AdapterError("no planned span is present any more", code="not_found")
-            if not payload.get("_malformed"):
-                try:
-                    json.loads(redacted)
-                except json.JSONDecodeError as exc:
-                    raise AdapterError(
-                        "redaction would break the event's JSON", code="unsupported_operation"
-                    ) from exc
             return redacted
 
         self._rewrite_line(event_id, preferred_line=preferred_line, transform=transform)

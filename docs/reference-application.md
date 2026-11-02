@@ -61,7 +61,10 @@ uv run --no-sync python -m pytest -q tests/test_reference_application.py tests/t
 The isolated journey ingests confidential and public sources, creates a mixed
 summary, queries before revocation, applies an operator-approved plan, then queries
 again. The summary is regenerated from the public source with grounding and retention
-checks. It attempts replay through the guarded API and deliberate direct SQLite and
+checks. Mixed query logs are preserved until an operator approves their planned
+source-passage redactions and issues approval for the new plan version. The evidence
+script performs that explicit review before claiming clean scoped verification.
+It attempts replay through the guarded API and deliberate direct SQLite and
 Chroma writes. The evidence records successful filtering/detection and a `PARTIAL`
 receipt after those bypasses; the original clean receipt is not treated as permanent.
 

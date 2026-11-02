@@ -28,10 +28,19 @@ def test_live_application_revokes_across_all_stores_and_preserves_public_context
     # Reopening the app proves persistence instead of an in-memory demo.
     app = MemoryApplication(tmp_path)
     plan = app.engine.plan(target_id="fs:private.md", depth=5)
-    stores = {app.engine.repo.get_record(i["record_id"])["store_id"] for i in plan["items"] if i["approved"]}
+    stores = {app.engine.repo.get_record(i["record_id"])["store_id"] for i in plan["items"]}
     assert {"filesystem", "sqlite_memory", "jsonl_logs", "chroma"} <= stores
     result = approve_and_apply(app.engine, plan)
     assert result["counts"]["failed"] == 0
+    # Mixed query logs now preserve public material through reviewed edits.
+    mixed_logs = [i for i in plan["items"] if i["record_type"] == "log" and i["redact_spans"]]
+    assert mixed_logs and all(i["proposed_action"] == "REVIEW_REQUIRED" for i in mixed_logs)
+    assert app.engine.verify(request_id=plan["request_id"])["status"] == "NEEDS_REVIEW"
+    for item in mixed_logs:
+        reviewed = app.engine.review_plan_item(plan_id=plan["plan_id"], item_id=item["item_id"],
+                                               decision="approved", reviewer="test-operator", action="redact")
+    completed = approve_and_apply(app.engine, reviewed)
+    assert completed["counts"]["failed"] == 0
     after = app.query("public SDK Linux")
     assert "Linux" in after["answer"]
     assert "48 million" not in after["answer"]
@@ -39,7 +48,8 @@ def test_live_application_revokes_across_all_stores_and_preserves_public_context
     receipt = app.engine.verify(request_id=plan["request_id"])
     assert receipt["counts"]["residual_matches"] == 0
     assert receipt["counts"]["records_regenerated"] >= 1
-    assert receipt["counts"]["records_removed"] < result["counts"]["succeeded"]
+    assert receipt["counts"]["records_redacted"] == len(mixed_logs)
+    assert receipt["counts"]["records_removed"] < result["counts"]["succeeded"] + completed["counts"]["succeeded"]
     assert (tmp_path / "documents/public.md").read_text() == PUBLIC
     with sqlite3.connect(app.engine.settings.sqlite_store_path) as conn:
         summary = conn.execute("SELECT content FROM memories WHERE id = 'mixed'").fetchone()
