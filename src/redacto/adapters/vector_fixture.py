@@ -20,8 +20,10 @@ from redacto.adapters.base import (
     StoreAdapter,
     leftover_rewrite_temps,
     rewrite_temp_prefix,
+    checked_replace,
 )
 from redacto.discovery.normalization import fingerprint
+from redacto.locking import locked_store
 
 
 class VectorFixtureAdapter(StoreAdapter):
@@ -49,14 +51,28 @@ class VectorFixtureAdapter(StoreAdapter):
             notes=["Local fixture only; invalidate removes the chunk entry (no real vector DB)."],
         )
 
+    @locked_store
     def _load(self) -> list[dict]:
         try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            snapshot = self._path.read_bytes()
+            payload = json.loads(snapshot.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise AdapterError(f"vector fixture unreadable: {exc}", code="store_unreadable") from exc
         chunks = payload.get("chunks") if isinstance(payload, dict) else None
         if not isinstance(chunks, list):
             raise AdapterError("vector fixture must be {'chunks': [...]}", code="invalid_schema")
+        ids: set[str] = set()
+        for chunk in chunks:
+            if not isinstance(chunk, dict) or not (chunk.get("id") or chunk.get("chunk_id")):
+                raise AdapterError("each chunk requires a non-empty id", code="invalid_schema")
+            identity = str(chunk.get("id") or chunk.get("chunk_id"))
+            if identity in ids:
+                raise AdapterError("duplicate chunk ids are ambiguous", code="invalid_schema")
+            ids.add(identity)
+            if chunk.get("metadata") is not None and not isinstance(chunk["metadata"], dict):
+                raise AdapterError("chunk metadata must be an object", code="invalid_schema")
+        self._snapshot = snapshot
+        self._payload = payload
         return chunks
 
     def _save(self, chunks: list[dict]) -> None:
@@ -67,10 +83,12 @@ class VectorFixtureAdapter(StoreAdapter):
                 dir=str(self._path.parent), prefix=rewrite_temp_prefix(self._path), suffix=".tmp"
             )
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                json.dump({"chunks": chunks}, handle, indent=2)
+                json.dump({**self._payload, "chunks": chunks}, handle, indent=2)
                 handle.write("\n")
             os.chmod(tmp, mode)
-            os.replace(tmp, self._path)
+            if self._path.read_bytes() != self._snapshot:
+                raise AdapterError("vector fixture changed during rewrite", code="content_changed", retryable=True)
+            checked_replace(tmp, self._path, lambda: self._path.read_bytes() == self._snapshot)
             tmp = None
         except OSError as exc:
             raise AdapterError(f"vector fixture write failed: {exc}", code="delete_failed") from exc
@@ -181,6 +199,7 @@ class VectorFixtureAdapter(StoreAdapter):
                 return self._to_record(chunk)
         raise AdapterError("record no longer exists", code="not_found")
 
+    @locked_store
     def delete_record(
         self,
         locator: dict[str, str],
@@ -215,6 +234,7 @@ class VectorFixtureAdapter(StoreAdapter):
     ) -> None:
         self.delete_record(locator, expected_fingerprint=expected_fingerprint, key=key)
 
+    @locked_store
     def write_record(self, record: Record) -> None:
         chunk_id = record.locator.get("id")
         if not chunk_id:

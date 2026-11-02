@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
@@ -29,36 +30,38 @@ def _payload(result) -> dict:
 
 
 async def main() -> int:
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(ROOT / "src"),
-        "REDACTO_DB_PATH": str(ROOT / "var" / "smoke.sqlite3"),
-        "REDACTO_WORKSPACE_ROOT": str(ROOT / "fixtures" / "workspace"),
-        "REDACTO_SQLITE_PATH": str(ROOT / "fixtures" / "workspace" / "agent_memory.sqlite3"),
-        "REDACTO_JSONL_PATH": str(ROOT / "fixtures" / "workspace" / "agent_events.jsonl"),
-        "REDACTO_VECTOR_PATH": str(ROOT / "fixtures" / "workspace" / "vector_chunks.json"),
-    }
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "redacto.mcp.stdio_server"],
-        env=env,
-        cwd=str(ROOT),
-    )
-    async with stdio_client(params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            tools = await session.list_tools()
-            names = [tool.name for tool in tools.tools]
-            print("tools:", names)
-            if "redacto_status" not in names:
-                print("FAIL: redacto_status not discoverable")
-                return 1
-            result = await session.call_tool("redacto_status", {})
-            payload = _payload(result)
-            print(json.dumps(payload, indent=2)[:4000])
-            ok = payload.get("service") == "redacto" and "adapters" in payload
-            print("RESULT:", "PASS" if ok else "FAIL")
-            return 0 if ok else 1
+    # Exercise the installed package from a folder with spaces, no pyproject.toml,
+    # no PYTHONPATH shim and no fixture dependency. Nothing touches user stores.
+    with tempfile.TemporaryDirectory(prefix="redacto MCP smoke ") as temp:
+        root = Path(temp)
+        workspace = root / "state" / "workspace"
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("REDACTO_") and k not in {"PYTHONPATH", "PYTHONHOME"}}
+        env.update({
+            "REDACTO_DB_PATH": str(root / "state" / "graph.sqlite3"),
+            "REDACTO_WORKSPACE_ROOT": str(workspace),
+            "REDACTO_SQLITE_PATH": str(workspace / "agent_memory.sqlite3"),
+            "REDACTO_JSONL_PATH": str(workspace / "agent_events.jsonl"),
+            "REDACTO_VECTOR_PATH": str(workspace / "vector_chunks.json"),
+            "REDACTO_DEMO_SEED_IF_MISSING": "true",
+        })
+        params = StdioServerParameters(command=sys.executable, args=["-m", "redacto.mcp.stdio_server"],
+                                      env=env, cwd=str(root))
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                names = {tool.name for tool in (await session.list_tools()).tools}
+                expected = {f"redacto_{name}" for name in ("status", "scan", "trace", "plan", "apply", "verify", "tombstones", "quarantine")}
+                status = _payload(await session.call_tool("redacto_status", {}))
+                plan = _payload(await session.call_tool("redacto_plan", {"target_id": "fs:acquisition-plan.md", "use_model": False}))
+                ok = (names == expected and status.get("reachable_adapter_count") == 4
+                      and plan.get("ok") is True and plan.get("approval_required") is True
+                      and (workspace / "acquisition-plan.md").is_file())
+                print(json.dumps({"tools": sorted(names), "cwd_has_pyproject": (root / "pyproject.toml").exists(),
+                                  "reachable_adapters": status.get("reachable_adapter_count"),
+                                  "plan_created": plan.get("ok"), "source_preserved": (workspace / "acquisition-plan.md").exists(),
+                                  "result": "PASS" if ok else "FAIL"}, indent=2))
+                return 0 if ok else 1
 
 
 if __name__ == "__main__":

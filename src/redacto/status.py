@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import importlib.util
 from pathlib import Path
 
 from redacto import __version__
 from redacto.adapters.registry import build_adapters
 from redacto.config import Settings
+from redacto.discovery.embeddings import build_embedder
 
 
 def _model_status(settings: Settings) -> dict[str, object]:
@@ -50,6 +52,8 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
         "keyring_error": settings.keyring_error,
         "configured_key_versions": sorted(settings.hmac_keys),
         "current_key_version": settings.hmac_key_version,
+        "semantic_protection_degraded": False,
+        "skipped_embedding_models": [],
     }
     db_path = settings.db_path
     if not db_path.is_file():
@@ -71,6 +75,13 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
             ).fetchall()
         }
         required_versions: set[int] = set(by_version)
+        provider_id = build_embedder(settings.embedding_provider, model=settings.embedding_model,
+                                    revision=settings.embedding_revision,
+                                    local_files_only=settings.embedding_local_files_only).model_id
+        skipped_models = {str(row[0] or "unknown") for row in conn.execute(
+            "SELECT DISTINCT embedding_model FROM tombstones WHERE status = 'active' "
+            "AND target_kind != 'secret' AND embedding_json != '[]'"
+        ) if row[0] != provider_id}
         for row in conn.execute(
             "SELECT related_fingerprints_json FROM tombstones WHERE status = 'active'"
         ).fetchall():
@@ -96,6 +107,8 @@ def _revocation_status(settings: Settings) -> dict[str, object]:
             "tombstones_by_key_version": by_version,
             "in_use_key_versions": sorted(required_versions),
             "missing_key_versions": missing,
+            "semantic_protection_degraded": bool(skipped_models),
+            "skipped_embedding_models": sorted(skipped_models),
             "protection_degraded": bool(
                 settings.keyring_error or missing or current_missing
             ),
@@ -168,6 +181,11 @@ def collect_status(settings: Settings, *, transport: str) -> dict[str, object]:
         "model_assessment": _model_status(settings),
         "embeddings": {
             "provider": settings.embedding_provider,
+            "model": settings.embedding_model,
+            "revision": settings.embedding_revision,
+            "local_files_only": settings.embedding_local_files_only,
+            "optional_dependency_installed": importlib.util.find_spec("sentence_transformers") is not None,
+            "health_note": "Status does not load weights or infer model readiness; run redacto check-embeddings explicitly.",
             "candidate_threshold": settings.embedding_candidate_threshold,
             "quarantine_threshold": settings.embedding_quarantine_threshold,
             "role": "candidate generation and risk scoring only; never proof of lineage",

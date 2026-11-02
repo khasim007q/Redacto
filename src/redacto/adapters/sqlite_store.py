@@ -226,16 +226,16 @@ class SqliteMemoryAdapter(StoreAdapter):
                 sql += f" LIMIT {int(remaining)}"
             try:
                 with self._connect() as conn:
-                    rows = conn.execute(sql).fetchall()
+                    rows = conn.execute(sql)
+                    columns = self._columns[table]
+                    for row in rows:
+                        yield self._row_to_record(table, row, columns)
+                        if remaining is not None:
+                            remaining -= 1
+                            if remaining <= 0:
+                                return
             except sqlite3.Error as exc:
                 raise AdapterError(f"sqlite scan failed: {exc}", code="scan_failed") from exc
-            columns = self._columns[table]
-            for row in rows:
-                yield self._row_to_record(table, row, columns)
-                if remaining is not None:
-                    remaining -= 1
-                    if remaining <= 0:
-                        return
 
     def read_record(self, locator: dict[str, str]) -> Record:
         table = locator.get("table")

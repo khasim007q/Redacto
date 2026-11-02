@@ -2,7 +2,8 @@
 
 Only keys matching REDACTO_REDIS_KEY_PATTERNS (Redis glob patterns such as
 `llm-cache:*`) are in scope; patterns never come from tool input. Strings,
-hashes and lists are read; other types are left alone. Each key is one cache
+hashes, lists, sets, sorted sets and streams are read. Unknown module types fail
+the scan rather than disappearing from coverage. Each key is one cache
 entry, so the plan's action is INVALIDATE_CACHE, which deletes the key.
 
 The content check and the delete run under WATCH/MULTI/EXEC: if the key changes
@@ -20,7 +21,7 @@ from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapt
 from redacto.adapters.vector_fixture import VectorFixtureAdapter
 from redacto.discovery.normalization import fingerprint
 
-READABLE_TYPES = {"string", "hash", "list"}
+READABLE_TYPES = {"string", "hash", "list", "set", "zset", "stream"}
 
 
 class RedisCacheAdapter(StoreAdapter):
@@ -101,7 +102,7 @@ class RedisCacheAdapter(StoreAdapter):
         if kind == "none":
             return None
         if kind not in READABLE_TYPES:
-            return "", ""
+            raise AdapterError("an in-scope Redis key has an unsupported type", code="unsupported_record_type")
         if kind == "string":
             raw = self._text(client.get(key))
             try:
@@ -115,8 +116,20 @@ class RedisCacheAdapter(StoreAdapter):
             fields = dict(sorted((self._text(k), self._text(v)) for k, v in client.hgetall(key).items()))
             core = self._canonical(fields)
             return VectorFixtureAdapter._content({"key": key, "value": fields}), core
-        items = [self._text(v) for v in client.lrange(key, 0, -1)]
-        return VectorFixtureAdapter._content({"key": key, "value": items}), "\n".join(items)
+        if kind == "list":
+            items = [self._text(v) for v in client.lrange(key, 0, -1)]
+        elif kind == "set":
+            items = sorted(self._text(v) for v in client.smembers(key))
+        elif kind == "zset":
+            items = [{"member": self._text(member), "score": str(score)}
+                     for member, score in client.zrange(key, 0, -1, withscores=True)]
+        else:
+            items = [{"id": self._text(identity),
+                      "fields": dict(sorted((self._text(k), self._text(v)) for k, v in fields.items()))}
+                     for identity, fields in client.xrange(key)]
+        content = VectorFixtureAdapter._content({"key": key, "value": items})
+        core = "\n".join(items) if kind in {"list", "set"} else VectorFixtureAdapter._content({"value": items})
+        return content, core
 
     def _to_record(self, key: str, content: str, core: str) -> Record:
         return Record(

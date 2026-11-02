@@ -15,12 +15,31 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+import weakref
 
 from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
 from redacto.adapters.vector_fixture import VectorFixtureAdapter
 from redacto.discovery.normalization import fingerprint
+from redacto.discovery.embeddings import DIMENSION, MODEL_ID, HashingEmbeddingProvider
+from redacto.locking import locked_store
 
 PAGE_SIZE = 200
+EMBEDDING_MODEL_KEY = "redacto:embedding_model"
+EMBEDDING_DIMENSION_KEY = "redacto:embedding_dimension"
+
+
+def validate_hashing_collection(collection: Any) -> None:
+    """Only write vectors into a collection explicitly owned by this embedder.
+
+    Equal dimensions do not imply equal embedding spaces. Never infer ownership
+    from an existing vector's shape or silently relabel an external collection.
+    """
+    metadata = collection.metadata or {}
+    if metadata.get(EMBEDDING_MODEL_KEY) != MODEL_ID or metadata.get(EMBEDDING_DIMENSION_KEY) != DIMENSION:
+        raise AdapterError(
+            "Chroma writes require a collection labelled with Redacto's current embedding model and dimension.",
+            code="embedding_model_mismatch",
+        )
 
 
 class ChromaAdapter(StoreAdapter):
@@ -35,6 +54,7 @@ class ChromaAdapter(StoreAdapter):
         *,
         client: Any = None,
     ):
+        self._path = Path(path).expanduser().resolve()
         if not collections:
             raise AdapterError(
                 "REDACTO_CHROMA_COLLECTIONS must name the collections Redacto may touch",
@@ -42,6 +62,7 @@ class ChromaAdapter(StoreAdapter):
             )
         self._key = hmac_key
         self._allowed = tuple(dict.fromkeys(collections))
+        owns_client = client is None
         if client is None:
             path = path.expanduser().resolve()
             if not path.is_dir():
@@ -58,6 +79,10 @@ class ChromaAdapter(StoreAdapter):
             except Exception as exc:  # chromadb raises its own error types
                 raise AdapterError(f"chroma store unreadable: {exc}", code="store_unreadable") from exc
         self._client = client
+        # Short-lived registry adapters must not pin the shared Chroma system
+        # (and its SQLite/Windows file handles) for the lifetime of the process.
+        close = getattr(client, "close", None)
+        self._finalizer = weakref.finalize(self, close) if owns_client and callable(close) else None
         try:
             present = {c if isinstance(c, str) else c.name for c in self._client.list_collections()}
         except Exception as exc:
@@ -155,6 +180,7 @@ class ChromaAdapter(StoreAdapter):
             raise AdapterError("record no longer exists", code="not_found")
         return record
 
+    @locked_store
     def delete_record(
         self,
         locator: dict[str, str],
@@ -183,6 +209,23 @@ class ChromaAdapter(StoreAdapter):
         key: str | None = None,
     ) -> None:
         self.delete_record(locator, expected_fingerprint=expected_fingerprint, key=key)
+
+    @locked_store
+    def write_record(self, record: Record) -> None:
+        """Reference writer using explicit local embeddings (no model download)."""
+        collection = self._collection(record.locator.get("collection"))
+        validate_hashing_collection(collection)
+        item_id = record.locator.get("id")
+        if not item_id:
+            raise AdapterError("chroma locator requires 'id'", code="invalid_locator")
+        try:
+            kwargs = {"ids": [item_id], "documents": [record.content],
+                      "embeddings": [HashingEmbeddingProvider().embed(record.content)]}
+            if record.metadata:
+                kwargs["metadatas"] = [dict(record.metadata)]
+            collection.upsert(**kwargs)
+        except Exception as exc:
+            raise AdapterError("chroma write failed", code="write_failed") from exc
 
     def verify_absent(self, fingerprint_value: str) -> tuple[bool, list[str]]:
         residuals = sum(

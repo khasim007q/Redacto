@@ -3,6 +3,7 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -10,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.12"]
+        python-version: ["3.12", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,17 +20,32 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          python -m pip install uv==0.12.23
+          uv sync --frozen --extra dev --extra chroma --extra redis
       - name: Seed fixture
-        run: python -m redacto seed
+        run: uv run --no-sync python -m redacto seed
       - name: Tests
-        run: python -m pytest -q
+        run: uv run --no-sync python -m pytest -q
+      - name: Adversarial corpus and real application evidence
+        run: |
+          uv run --no-sync python -m redacto benchmark --out benchmark.json
+          uv run --no-sync python scripts/reference_evidence.py --out reference.json
+      - name: Bounded scale probe
+        if: runner.os == 'Linux'
+        run: uv run --no-sync python scripts/scale_probe.py --records 100000 --out scale.json
+      - name: Publish evaluation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.os }}-${{ matrix.python-version }}
+          path: |
+            benchmark.json
+            reference.json
+            scale.json
       - name: stdio MCP smoke test
-        run: python scripts/mcp_smoke.py
+        run: uv run --no-sync python scripts/mcp_smoke.py
       - name: HTTP MCP smoke test
         if: runner.os == 'Linux'
-        run: python scripts/mcp_http_smoke.py
+        run: uv run --no-sync python scripts/mcp_http_smoke.py
 
   runtime-install:
     runs-on: ubuntu-latest
@@ -43,4 +59,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install .
       - name: Every command must import without dev extras
-        run: python -m redacto --help
+        run: |
+          python -m redacto --help
+          python -m redacto check-embeddings
+
+  semantic-integration:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      REDACTO_TEST_NEURAL: "1"
+      OMP_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install optional CPU semantic dependencies
+        run: |
+          python -m pip install uv==0.12.23
+          uv sync --frozen --extra dev --extra semantic
+      - name: Real multilingual discovery, verification and replay guard
+        run: uv run --no-sync python -m pytest -q tests/test_semantic_live.py
+      - name: Frozen semantic benchmark
+        run: uv run --no-sync python -m redacto benchmark --embedding-provider sentence_transformers --local-files-only --out neural.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neural-evidence-${{ matrix.os }}
+          path: neural.json

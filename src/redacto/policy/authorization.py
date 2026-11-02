@@ -50,7 +50,9 @@ def issue_approval(
             "characters after trimming"
         )
 
-    token = secrets.token_urlsafe(32)
+    # URL-safe randomness can start with '-' and be parsed as a CLI option
+    # when passed as `--token <value>`. A fixed prefix preserves all entropy.
+    token = "redacto_" + secrets.token_urlsafe(32)
     approval_id, expires_at = repo.create_approval(
         plan_id=plan_id,
         plan_version=int(plan["version"]),

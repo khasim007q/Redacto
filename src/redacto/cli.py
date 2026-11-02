@@ -198,6 +198,63 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    from redacto.benchmark import run_benchmark
+
+    result = run_benchmark(Path(args.corpus), split=args.split, embedding_provider=args.embedding_provider,
+                           embedding_model=args.embedding_model, embedding_revision=args.embedding_revision,
+                           candidate_threshold=args.candidate_threshold, quarantine_threshold=args.quarantine_threshold,
+                           local_files_only=args.local_files_only)
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(to_json(result), encoding="utf-8")
+    _print({key: value for key, value in result.items() if key != "results"})
+    return 0 if result["false_deletions"] == 0 and result["failed_actions"] == 0 else 1
+
+
+def cmd_reference(args: argparse.Namespace) -> int:
+    import uvicorn
+    from redacto.reference import create_app
+
+    uvicorn.run(create_app(Path(args.root)), host="127.0.0.1", port=args.port)
+    return 0
+
+
+def cmd_check_receipt(args: argparse.Namespace) -> int:
+    from redacto.receipts import check_receipt
+
+    try:
+        summary = json.loads(Path(args.path).read_text(encoding="utf-8"))
+        if not isinstance(summary, dict):
+            raise ValueError("receipt must be an object")
+    except (OSError, ValueError) as exc:
+        raise RedactoError("invalid_receipt", "Receipt is not a readable JSON object.") from exc
+    result = check_receipt(summary, keyring=load_settings().hmac_keys)
+    _print(result)
+    return 0 if result["valid"] else 1
+
+
+def cmd_check_embeddings(args: argparse.Namespace) -> int:
+    """Load explicitly selected weights using public synthetic text only."""
+    from dataclasses import replace
+    from redacto.discovery.embeddings import cosine
+
+    settings = load_settings()
+    if args.offline:
+        settings = replace(settings, embedding_local_files_only=True)
+    provider = Engine(settings).embedder()
+    first = provider.embed("The public SDK supports Linux.")
+    second = provider.embed("Le SDK public prend en charge Linux.")
+    _print({"ok": True, "provider": settings.embedding_provider, "model_id": provider.model_id,
+            "dimensions": len(first), "local_files_only": settings.embedding_local_files_only,
+            "synthetic_translation_similarity": round(cosine(first, second), 4),
+            "candidate_threshold": settings.embedding_candidate_threshold,
+            "quarantine_threshold": settings.embedding_quarantine_threshold,
+            "role": "advisory candidates only; similarity is not proof of derivation"})
+    return 0
+
+
 def cmd_calibrate_embeddings(args: argparse.Namespace) -> int:
     from redacto.discovery.embeddings import default_calibration
 
@@ -536,6 +593,31 @@ def build_parser() -> argparse.ArgumentParser:
         "evaluate", help="report fixture-level precision, recall and policy counts"
     )
     evaluate.set_defaults(func=cmd_evaluate)
+
+    benchmark = sub.add_parser("benchmark", help="run labelled adversarial disclosure evaluation in temporary stores")
+    benchmark.add_argument("--corpus", default="benchmarks/adversarial-v1.json")
+    benchmark.add_argument("--split", choices=["all", "dev", "holdout"], default="all")
+    benchmark.add_argument("--out")
+    benchmark.add_argument("--embedding-provider", choices=["local_hashing", "sentence_transformers", "none"], default="local_hashing")
+    benchmark.add_argument("--embedding-model")
+    benchmark.add_argument("--embedding-revision", help="immutable model commit hash")
+    benchmark.add_argument("--candidate-threshold", type=float)
+    benchmark.add_argument("--quarantine-threshold", type=float)
+    benchmark.add_argument("--local-files-only", action="store_true", help="do not download model files")
+    benchmark.set_defaults(func=cmd_benchmark)
+
+    reference = sub.add_parser("reference-app", help="serve the local guarded memory/RAG example (requires chroma extra)")
+    reference.add_argument("--root", required=True)
+    reference.add_argument("--port", type=int, default=8766)
+    reference.set_defaults(func=cmd_reference)
+
+    check = sub.add_parser("check-receipt", help="verify a JSON receipt's HMAC integrity against the configured keyring")
+    check.add_argument("path")
+    check.set_defaults(func=cmd_check_receipt)
+
+    embeddings = sub.add_parser("check-embeddings", help="check the configured embedder with public synthetic text; downloads weights only when explicitly enabled")
+    embeddings.add_argument("--offline", action="store_true", help="load cached model files only")
+    embeddings.set_defaults(func=cmd_check_embeddings)
 
     calibrate = sub.add_parser(
         "calibrate-embeddings", help="measure embedding false positives and missed paraphrases"

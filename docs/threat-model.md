@@ -96,11 +96,13 @@ destructive or leaking component**.
 
 - **Physical erasure is not provable.** Backups, replicas, provider logs, caches and
   model weights are outside Redacto's reach. Receipts say so.
-- **Paraphrase detection is incomplete.** Verification matches planned record IDs and
-  the keyed whole-target fingerprint; a reworded remnant in an unlinked store may
-  survive and is not detectable by this method.
-- **Secret verification is token-based.** The value is never stored, so a value embedded
-  inside a longer token, and reworded traces, are not proven absent.
+- **Paraphrase detection is incomplete.** Verification checks planned record IDs,
+  keyed fingerprints and a separate advisory survivor assessment. Reworded remnants
+  can still evade those signals; the receipt explicitly denies semantic-absence proof.
+- **Semantic detection is incomplete.** Secret verification uses normalized windows
+  as well as tokens, including values embedded in longer tokens. Source/fact
+  verification also reports suspected semantic residuals, but transformed amounts,
+  translations and heavy paraphrases can still evade those advisory checks.
 - **Physical removal is best effort.** Files are unlinked, and SQLite secure-delete plus a
   WAL checkpoint can be delayed by another open writer.
 - **Unscanned file types.** Only configured extensions under a root are scanned; status

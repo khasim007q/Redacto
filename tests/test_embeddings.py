@@ -117,7 +117,8 @@ def test_scan_generates_an_embedding_review_candidate(tmp_path):
     assert candidate["approved"] is False
     assert candidate["candidate_only"] is True
     assert "Embedding similarity" in candidate["reason_redacted"]
-    assert scan["embeddings"]["provider"] == "local-hashing-v1"
+    from redacto.discovery.embeddings import MODEL_ID
+    assert scan["embeddings"]["provider"] == MODEL_ID
     assert scan["embeddings"]["candidates_generated"] >= 1
     # The unrelated engineering note is not swept up by the embedding signal.
     assert "mem:mem-unrelated-eng" not in {

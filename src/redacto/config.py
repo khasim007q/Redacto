@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 import os
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from redacto.errors import HmacKeyError
+from redacto.errors import HmacKeyError, RedactoError
 
 
 def _env_path(name: str, default: str) -> Path:
@@ -22,7 +24,10 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    value = raw.strip().lower()
+    if value not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise RedactoError("invalid_configuration", f"{name} must be a boolean (true/false).")
+    return value in {"1", "true", "yes", "on"}
 
 
 def _env_list(name: str) -> tuple[str, ...]:
@@ -63,6 +68,27 @@ class Settings:
     redis_key_patterns: tuple[str, ...] = ()
     # Opt-in: rebuild confirmed derivatives from their remaining allowed sources.
     regenerate_derivatives: bool = False
+    embedding_model: str | None = None
+    embedding_revision: str | None = None
+    embedding_local_files_only: bool = False
+
+    def __post_init__(self):
+        if self.embedding_provider not in {"local_hashing", "local-hashing", "hashing", "sentence_transformers", "sentence-transformers", "none", "disabled", ""}:
+            raise RedactoError("invalid_configuration", "Unknown REDACTO_EMBEDDING_PROVIDER.")
+        if self.embedding_provider in {"sentence_transformers", "sentence-transformers"}:
+            if self.embedding_model and not self.embedding_revision:
+                raise RedactoError("invalid_configuration", "A custom neural model requires REDACTO_EMBEDDING_REVISION.")
+            if self.embedding_revision and not re.fullmatch(r"[a-fA-F0-9]{40}", self.embedding_revision):
+                raise RedactoError("invalid_configuration", "REDACTO_EMBEDDING_REVISION must be an immutable commit hash.")
+        if self.safety_mode not in {"review", "strict", "dry_run_only"}:
+            raise RedactoError("invalid_configuration", "Unknown REDACTO_SAFETY_MODE.")
+        if self.max_scan_records <= 0 or self.max_record_bytes <= 0:
+            raise RedactoError("invalid_configuration", "Scan and record byte limits must be positive.")
+        for threshold in (self.embedding_candidate_threshold, self.embedding_quarantine_threshold):
+            if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+                raise RedactoError("invalid_configuration", "Embedding thresholds must be finite numbers between 0 and 1.")
+        if not math.isfinite(self.model_timeout_seconds) or self.model_timeout_seconds <= 0:
+            raise RedactoError("invalid_configuration", "Model timeout must be a positive finite number.")
 
     @property
     def current_hmac_key(self) -> str:
@@ -115,6 +141,9 @@ class Settings:
             "hmac_key_versions": sorted(self.hmac_keys),
             "keyring_error": self.keyring_error,
             "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
+            "embedding_revision": self.embedding_revision,
+            "embedding_local_files_only": self.embedding_local_files_only,
             "embedding_candidate_threshold": self.embedding_candidate_threshold,
             "embedding_quarantine_threshold": self.embedding_quarantine_threshold,
             "chroma": (
@@ -200,6 +229,8 @@ def load_settings() -> Settings:
     base = Path.cwd()
     _load_dotenv(base / ".env")
     model_provider = os.environ.get("REDACTO_MODEL_PROVIDER", "none").strip().lower()
+    embedding_provider = os.environ.get("REDACTO_EMBEDDING_PROVIDER", "local_hashing").strip().lower()
+    neural = embedding_provider in {"sentence_transformers", "sentence-transformers"}
     hmac_keys, hmac_key_version, keyring_error = _load_keyring(
         os.environ.get("REDACTO_HMAC_KEY", "dev-only-synthetic-fixture-key")
     )
@@ -217,12 +248,15 @@ def load_settings() -> Settings:
         ),
         hmac_keys=hmac_keys,
         hmac_key_version=hmac_key_version,
-        embedding_provider=os.environ.get("REDACTO_EMBEDDING_PROVIDER", "local_hashing").strip().lower(),
+        embedding_provider=embedding_provider,
+        embedding_model=os.environ.get("REDACTO_EMBEDDING_MODEL") or None,
+        embedding_revision=os.environ.get("REDACTO_EMBEDDING_REVISION") or None,
+        embedding_local_files_only=_env_bool("REDACTO_EMBEDDING_LOCAL_FILES_ONLY", False),
         embedding_candidate_threshold=float(
-            os.environ.get("REDACTO_EMBEDDING_CANDIDATE_THRESHOLD", "0.25")
+            os.environ.get("REDACTO_EMBEDDING_CANDIDATE_THRESHOLD", "0.55" if neural else "0.25")
         ),
         embedding_quarantine_threshold=float(
-            os.environ.get("REDACTO_EMBEDDING_QUARANTINE_THRESHOLD", "0.30")
+            os.environ.get("REDACTO_EMBEDDING_QUARANTINE_THRESHOLD", "0.60" if neural else "0.30")
         ),
         safety_mode=os.environ.get("REDACTO_SAFETY_MODE", "review"),
         dry_run=_env_bool("REDACTO_DRY_RUN", True),

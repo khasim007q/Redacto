@@ -19,13 +19,14 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from typing import Protocol, Sequence
 
 from redacto.discovery.normalization import normalize_loose
 
 DIMENSION = 512
-MODEL_ID = "local-hashing-v1"
+MODEL_ID = "local-hashing-v2"
 
 _NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -71,8 +72,24 @@ def _number_words_to_digits(text: str) -> str:
 
 def normalize_for_embedding(text: str) -> str:
     numbered = _number_words_to_digits(text)
+    # Canonicalize quantities BEFORE punctuation removal (1.2 is not 12).
+    # Unit scaling is exact; no exchange rates or guessed currency conversions.
+    numbered = _SCALED_NUMBER.sub(_scale_number, numbered)
     tokens = normalize_loose(numbered).split()
     return " ".join(_CONCEPTS.get(token, token) for token in tokens)
+
+
+_SCALES = {"billion": 1_000_000_000, "million": 1_000_000, "crore": 10_000_000,
+           "lakh": 100_000, "thousand": 1000, "dozen": 12}
+_SCALED_NUMBER = re.compile(r"\b(\d+(?:,\d{3})*(?:\.\d+)?)\s*(billion|million|crore|lakh|thousand|dozen)s?\b", re.IGNORECASE)
+
+
+def _scale_number(match: re.Match) -> str:
+    try:
+        value = Decimal(match.group(1).replace(",", "")) * _SCALES[match.group(2).lower()]
+        return format(value.normalize(), "f")
+    except InvalidOperation:
+        return match.group(0)
 
 
 @dataclass(frozen=True)
@@ -147,14 +164,20 @@ def cosine(first: Sequence[float], second: Sequence[float]) -> float:
     return max(0.0, min(1.0, dot / (norm_first * norm_second)))
 
 
-def build_embedder(provider: str) -> EmbeddingProvider:
+def build_embedder(provider: str, *, model: str | None = None, revision: str | None = None,
+                   local_files_only: bool = False) -> EmbeddingProvider:
     normalized = (provider or "").strip().lower()
     if normalized in {"", "none", "disabled"}:
         return NullEmbeddingProvider()
     if normalized in {"local_hashing", "local-hashing", "hashing"}:
         return HashingEmbeddingProvider()
+    if normalized in {"sentence_transformers", "sentence-transformers"}:
+        from redacto.discovery.neural import DEFAULT_MODEL, DEFAULT_REVISION, SentenceTransformerEmbeddingProvider
+
+        return SentenceTransformerEmbeddingProvider(model=model or DEFAULT_MODEL, revision=revision or DEFAULT_REVISION,
+                                                    local_files_only=local_files_only)
     raise ValueError(
-        f"Unsupported embedding provider '{provider}'. Supported: local_hashing, none."
+        f"Unsupported embedding provider '{provider}'. Supported: local_hashing, sentence_transformers, none."
     )
 
 

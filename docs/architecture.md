@@ -15,7 +15,7 @@ flowchart LR
         C["CLI / demo (application role)"]
     end
     subgraph transport["Transport"]
-        S["mcp/server.py<br/>6 tools + error guard"]
+        S["mcp/server.py<br/>8 tools + error guard"]
         H["mcp/http_server.py<br/>bearer middleware"]
     end
     E["engine.Engine"]
@@ -31,6 +31,8 @@ flowchart LR
         Q["sqlite memories + cache"]
         L["jsonl logs"]
         V["vector fixture"]
+        CH["Chroma collections"]
+        RC["Redis cache patterns"]
     end
     DB[("SQLite graph, plans,<br/>actions, receipts")]
     A --> S --> E
@@ -46,6 +48,8 @@ flowchart LR
     E --> Q
     E --> L
     E --> V
+    E --> CH
+    E --> RC
 ```
 
 ## Module map
@@ -66,6 +70,10 @@ flowchart LR
 | `discovery/embeddings.py` | Local deterministic embedding provider, cosine scoring, and labelled calibration. |
 | `engine.py` | scan / trace / plan / apply / verify orchestration and all scope checks. |
 | `receipts.py` | Receipt rendering to JSON and Markdown. |
+| `locking.py` | Reentrant local process/thread coordination for participating store writers and engine operations. |
+| `regeneration.py` | Model/extractive generation, sentence grounding and allowed-source retention gate. |
+| `reference.py` | Persistent Chroma/SQLite memory application, guarded writes/retrieval and bearer-authenticated local ASGI routes. |
+| `benchmark.py` | Labelled adversarial end-to-end evaluation with residual and replay metrics. |
 | `mcp/server.py` | Tool registration plus the error guard that never leaks stack traces. |
 | `mcp/stdio_server.py`, `mcp/http_server.py` | The two transports. |
 | `cli.py` | Terminal application: seed, plan, approve, apply, verify, demo. |
@@ -221,10 +229,12 @@ sequenceDiagram
   identity and the size/mtime stamp to match before unlinking, and JSONL/vector rewrites
   re-read before replacing. A mismatch fails with `content_changed`; a missing fingerprint
   or key version fails `content_unverifiable`.
-- **Concurrent log writers**: the JSONL delete re-reads the file immediately before
+- **Concurrent log writers**: participating writers hold an OS-backed sidecar lock
+  across the entire read/check/rewrite operation. The JSONL delete re-reads the file before
   replacing it and recomputes from the new content if anything changed, so a concurrently
   appended line survives. If the file never settles the delete fails with
-  `delete_conflict` rather than silently dropping lines.
+  `delete_conflict` rather than silently dropping lines. External writers that ignore
+  the lock can still race after the final check; no distributed atomicity is claimed.
 - **Execution lease ownership**: the lease stores the token, PID, host and start time.
   Liveness uses `OpenProcess` on Windows (never `os.kill(pid, 0)`, which means Ctrl+C
   there) and `os.kill(pid, 0)` on POSIX. A live local owner is never stolen; a dead owner
@@ -250,9 +260,12 @@ sequenceDiagram
   record are review-only; above half the normal delete path applies. Low overlap raises
   risk to high. Source scans also detect shared
   8-word passages and raise them as suspected derivatives.
-- **Verification**: rescan reachable in-scope stores, check planned record IDs and
-  the keyed whole-target fingerprint, and report residuals. Unreachable stores are
-  reported as gaps, never as clean.
+- **Verification**: rescan reachable in-scope stores, check planned IDs and exact
+  payload fingerprints, and report residuals. Source/fact requests separately assess
+  every surviving scanned record using keyed anchors/shingles and compatible
+  embeddings. Suspected disclosures produce `NEEDS_REVIEW` and never authorize a
+  mutation. Unreachable/truncated/oversized coverage produces `PARTIAL`. Receipts
+  explicitly deny proof of semantic absence and carry an HMAC integrity signature.
 
 ## Lineage ingestion hook
 
@@ -269,12 +282,14 @@ its own claim into confirmed lineage.
 
 ## Revocation tombstones and the ingestion guard
 
-A verified revocation writes one tombstone per request. It stores the target's keyed
+A real apply activates a tombstone before releasing the shared application write
+boundary; enforcement does not wait for a later verification call. It stores the target's keyed
 HMAC fingerprint, keyed hashes of normalized 5-word shingles, weighted anchor hashes
 (proper nouns weight 1, numeric amounts weight 2), token hashes for fact/secret
 targets, the removed records' fingerprints, a derived embedding vector, the key
 version that produced the material, scope, policy and status. The revoked content is
-not stored and cannot be recovered from the tombstone.
+not stored as plaintext. Embeddings are sensitive derived data, not a cryptographic
+non-invertibility guarantee. Protect the graph database and keyring accordingly.
 
 ```mermaid
 flowchart TD
@@ -305,7 +320,9 @@ boundary.
 Embedding similarity is a **risk signal only**: it can quarantine, never block and
 never confirm lineage. Thresholds are calibrated on a labelled synthetic set (see
 `redacto calibrate-embeddings`); the local provider is a deterministic lexical-semantic
-embedding, not a neural model.
+embedding, not a neural model. Version 2 canonicalizes exact quantity scales
+(million/crore/thousand/dozen) before punctuation handling. Different model versions
+are never compared; older tombstones retain their other keyed checks.
 
 Records larger than `REDACTO_MAX_RECORD_BYTES` are skipped before matching and
 reported as `oversized_record`; they never enter the graph or a model prompt.

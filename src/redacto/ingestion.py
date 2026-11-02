@@ -4,9 +4,11 @@ A tombstone retains only:
 - a keyed HMAC fingerprint of the revoked content,
 - keyed HMACs of normalized 5-word shingles and distinctive anchors,
 - keyed HMACs of normalized tokens (for fact/secret targets),
+- optional model-versioned vectors (for source/fact targets, not credentials),
 - scope, policy and status.
 
-It never retains the revoked content. At ingestion, a candidate record is
+It never retains plaintext revoked content. Embeddings are sensitive derived
+data and are not a cryptographic privacy guarantee. At ingestion, a candidate record is
 compared against active tombstones and resolved to `allowed`, `quarantined` or
 `blocked`. Uncertain matches are quarantined for review, never silently dropped
 and never auto-deleted.
@@ -19,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from redacto.discovery.embeddings import EmbeddingProvider, cosine
-from redacto.discovery.normalization import fingerprint, normalize_loose
+from redacto.discovery.normalization import contains_normalized, fingerprint, normalize_loose
 
 SHINGLE_SIZE = 5
 MAX_SHINGLES = 400
@@ -151,7 +153,7 @@ def tokens(text: str) -> list[str]:
 
 @dataclass(frozen=True)
 class TombstoneMaterial:
-    """Everything a tombstone needs, derived so the content is not recoverable."""
+    """Derived matching material; embeddings require the same access controls as evidence."""
 
     fingerprint: str
     shingles: tuple[str, ...]
@@ -260,6 +262,9 @@ class TombstoneGuard:
                 if isinstance(entry, dict) and entry.get("version"):
                     required_versions.add(int(entry["version"]))
         self._missing_versions = sorted(v for v in required_versions if v not in self._keyring)
+        self._skipped_embedding_models = sorted({str(t.get("embedding_model") or "unknown")
+            for t in self._tombstones if t.get("embedding") and t.get("target_kind") != "secret"
+            and t.get("embedding_model") != getattr(self._embedder, "model_id", None)})
 
     @classmethod
     def from_repo(
@@ -272,7 +277,7 @@ class TombstoneGuard:
         embedding_threshold: float = 0.30,
     ) -> "TombstoneGuard":
         return cls(
-            repo.list_tombstones(statuses=("active",)),
+            repo.list_tombstones(statuses=("active",), limit=None),
             keyring,
             current_version,
             embedder=embedder,
@@ -290,6 +295,16 @@ class TombstoneGuard:
     @property
     def missing_versions(self) -> list[int]:
         return list(self._missing_versions)
+
+    @property
+    def skipped_embedding_models(self) -> list[str]:
+        return list(self._skipped_embedding_models)
+
+    def coverage(self) -> dict[str, Any]:
+        return {"active_tombstones": self.active_count, "protection_degraded": self.protection_degraded,
+                "missing_key_versions": self.missing_versions,
+                "semantic_protection_degraded": bool(self._skipped_embedding_models),
+                "skipped_embedding_models": self.skipped_embedding_models}
 
     def evaluate(self, *, record_id: str, content: str) -> GuardDecision:
         if not self._tombstones:
@@ -320,7 +335,8 @@ class TombstoneGuard:
             )
 
         record_embedding: list[float] = []
-        if self._embedder is not None and any(t.get("embedding") for t in self._tombstones):
+        if self._embedder is not None and any(t.get("embedding") and t.get("target_kind") != "secret"
+                                             and t.get("embedding_model") == self._embedder.model_id for t in self._tombstones):
             record_embedding = self._embedder.embed(content)
 
         best = _allowed()
@@ -333,6 +349,24 @@ class TombstoneGuard:
                 record_embedding=record_embedding,
                 fingerprints_by_version={v: material[0] for v, material in materials.items()},
             )
+            # Token containment misses single-token API keys and KEY=value.
+            # Length is captured before deletion; no plaintext is retained.
+            length = tombstone.get("normalized_len")
+            if (
+                tombstone["target_kind"] in {"fact", "secret"}
+                and decision.decision != BLOCKED
+                and length and length >= 8
+                and (
+                    contains_normalized(content, tombstone["fingerprint"], length, self._keyring[version])
+                    or (tombstone["target_kind"] == "secret"
+                        and contains_normalized("".join(normalize_loose(content).split()), tombstone["fingerprint"], length, self._keyring[version]))
+                )
+            ):
+                decision = GuardDecision(
+                    BLOCKED, "value_containment", 1.0,
+                    tombstone_id=tombstone["tombstone_id"], target_id=tombstone["target_id"],
+                    target_kind=tombstone["target_kind"], label_redacted=tombstone["label_redacted"],
+                )
             if _SEVERITY[decision.decision] > _SEVERITY[best.decision] or (
                 decision.decision == best.decision and decision.match_score > best.match_score
             ):
@@ -363,7 +397,7 @@ class TombstoneGuard:
             "label_redacted": tombstone["label_redacted"],
         }
         # 1. The revoked record reappearing under its original identity.
-        if record_id == tombstone["target_id"]:
+        if tombstone["target_kind"] == "source" and record_id == tombstone["target_id"]:
             return GuardDecision(BLOCKED, "same_target", 1.0, **base)
         if record_id in set(tombstone["related_record_ids"]):
             return GuardDecision(BLOCKED, "revoked_record_id", 1.0, **base)
@@ -413,7 +447,9 @@ class TombstoneGuard:
         # 7. Embedding similarity: a risk signal, never proof. It can only
         #    quarantine; exact copies and shared content are handled above.
         tombstone_embedding = tombstone.get("embedding") or []
-        if record_embedding and tombstone_embedding:
+        if tombstone["target_kind"] != "secret" and record_embedding and tombstone_embedding:
+            if tombstone.get("embedding_model") not in {None, "", getattr(self._embedder, "model_id", None)}:
+                return _allowed()  # vectors from different models are not comparable
             similarity = cosine(record_embedding, tombstone_embedding)
             if similarity >= self._embedding_threshold:
                 return GuardDecision(QUARANTINED, "embedding_similarity", similarity, **base)

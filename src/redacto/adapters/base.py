@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
+import os
+import time
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +24,25 @@ class AdapterError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+
+
+def checked_replace(temp: str, path: Path, unchanged, *, conflict_code: str = "content_changed") -> None:
+    """Retry transient Windows sharing failures, rechecking before EVERY attempt.
+
+    Windows can retain a short-lived file/AV handle even after cooperating readers
+    close. A stale temp must never replace data edited while the retry waited.
+    Normal permission errors and persistent locks still fail visibly.
+    """
+    for attempt in range(10):
+        if not unchanged():
+            raise AdapterError("store changed before replacement", code=conflict_code, retryable=True)
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 9:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def rewrite_temp_prefix(path: Path) -> str:

@@ -1,0 +1,13 @@
+{
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python": "3.12.0",
+  "records": 100000,
+  "adapter_scan_seconds": 1.219,
+  "adapter_records_per_second": 82013,
+  "adapter_peak_traced_bytes": 11395,
+  "bounded_workflow_seconds": 5.687,
+  "workflow_scan_cap": 1000,
+  "verification_status": "PARTIAL",
+  "sqlite_truncated": true,
+  "limitation": "Adapter iteration is streamed; engine scans remain bounded. This does not measure unbounded graph writes or distributed-store performance."
+}

@@ -46,3 +46,14 @@ def fingerprint(text: str, key: str) -> str:
     normalized = normalize_loose(text)
     digest = hmac.new(key.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256)
     return digest.hexdigest()
+
+
+def contains_normalized(content: str, target_fingerprint: str, normalized_len: int, key: str) -> bool:
+    """Match a keyed value inside a larger record without retaining plaintext."""
+    normalized = normalize_loose(content)
+    if normalized_len <= 0 or len(normalized) < normalized_len:
+        return False
+    return any(
+        fingerprint(normalized[start:start + normalized_len], key) == target_fingerprint
+        for start in range(len(normalized) - normalized_len + 1)
+    )

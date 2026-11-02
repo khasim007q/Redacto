@@ -14,7 +14,7 @@ from typing import Any, Iterable, Sequence
 
 from redacto.graph.schema import SCHEMA
 
-RECEIPT_VERSION = "1.0"
+RECEIPT_VERSION = "1.1"
 
 
 def now_iso() -> str:
@@ -129,6 +129,11 @@ class Repository:
             conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_json TEXT NOT NULL DEFAULT '[]'")
         if "embedding_model" not in tombstone_columns:
             conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_model TEXT")
+        if "normalized_len" not in tombstone_columns:
+            conn.execute("ALTER TABLE tombstones ADD COLUMN normalized_len INTEGER")
+            conn.execute("""UPDATE tombstones SET normalized_len = (
+                SELECT target_normalized_len FROM revocation_requests r
+                WHERE r.request_id = tombstones.request_id)""")
 
     # ---------------------------------------------------------------- records
     def upsert_record(
@@ -834,6 +839,41 @@ class Repository:
         return results
 
     # --------------------------------------------------------------- receipts
+    def historical_key_usage(self) -> dict[str, Any]:
+        """Count verification dependencies without returning receipt contents.
+
+        Include all retained requests/items, not just the latest receipt or plan.
+        A key is still needed to verify old evidence after its tombstone expires.
+        """
+        receipts: dict[int, int] = {}
+        unknown_receipts = 0
+        with self._connect() as conn:
+            requests = {int(row[0]): int(row[1]) for row in conn.execute(
+                "SELECT COALESCE(target_key_version, 1), COUNT(*) FROM revocation_requests "
+                "WHERE target_fingerprint IS NOT NULL GROUP BY COALESCE(target_key_version, 1)"
+            )}
+            items = {int(row[0]): int(row[1]) for row in conn.execute(
+                "SELECT COALESCE(fingerprint_key_version, 1), COUNT(*) FROM revocation_plan_items "
+                "WHERE expected_fingerprint IS NOT NULL GROUP BY COALESCE(fingerprint_key_version, 1)"
+            )}
+            for row in conn.execute("SELECT summary_json FROM receipts"):
+                try:
+                    summary = json.loads(row[0])
+                    if not isinstance(summary, dict):
+                        raise ValueError("invalid receipt")
+                    integrity = summary.get("integrity")
+                    if integrity is None:  # legacy unsigned receipt has no signing key
+                        continue
+                    version = integrity.get("key_version") if isinstance(integrity, dict) else None
+                    if type(version) is not int or version < 1:
+                        raise ValueError("unknown key version")
+                except (TypeError, ValueError):
+                    unknown_receipts += 1
+                    continue
+                receipts[version] = receipts.get(version, 0) + 1
+        return {"receipts_by_key_version": receipts, "requests_by_key_version": requests,
+                "plan_items_by_key_version": items, "unreadable_receipt_key_references": unknown_receipts}
+
     def save_receipt(self, *, request_id: str, summary: dict[str, Any]) -> str:
         receipt_id = new_id("rcpt")
         with self._connect() as conn:
@@ -886,6 +926,7 @@ class Repository:
         key_version: int = 1,
         embedding: Sequence[float] = (),
         embedding_model: str | None = None,
+        normalized_len: int | None = None,
     ) -> str:
         tombstone_id = new_id("tomb")
         with self._connect() as conn:
@@ -894,8 +935,8 @@ class Repository:
                    (tombstone_id, request_id, target_id, target_kind, label_redacted, fingerprint,
                     shingles_json, anchors_json, tokens_json, related_record_ids_json,
                     related_fingerprints_json, embedding_json, embedding_model,
-                    scope_json, policy_json, status, key_version, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    scope_json, policy_json, status, key_version, created_at, normalized_len)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     tombstone_id,
                     request_id,
@@ -915,6 +956,7 @@ class Repository:
                     status,
                     key_version,
                     now_iso(),
+                    normalized_len,
                 ),
             )
             conn.commit()
@@ -934,15 +976,16 @@ class Repository:
         return item
 
     def list_tombstones(
-        self, *, statuses: Sequence[str] = ("active",), limit: int = 200
+        self, *, statuses: Sequence[str] = ("active",), limit: int | None = 200
     ) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in statuses)
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM tombstones WHERE status IN ({placeholders}) "
-                "ORDER BY created_at DESC LIMIT ?",
-                (*statuses, limit),
-            ).fetchall()
+            sql = f"SELECT * FROM tombstones WHERE status IN ({placeholders}) ORDER BY created_at DESC"
+            params = tuple(statuses)
+            if limit is not None:
+                sql += " LIMIT ?"
+                params += (limit,)
+            rows = conn.execute(sql, params).fetchall()
         return [self._tombstone_row(row) for row in rows]
 
     def get_tombstone(self, tombstone_id: str) -> dict[str, Any] | None:

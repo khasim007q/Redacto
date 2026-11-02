@@ -7,8 +7,9 @@ Audited against `REDACTO_SPEC.md` v0.1 (26 October 2026). Status values:
 - **Not implemented** — absent, optional, or an accepted non-goal.
 - **N/A** — not required for the MVP.
 
-Test evidence: `python -m pytest` → **272 passed, 2 skipped**. Run `redacto evaluate` for the
-fixture metrics.
+Current executed evidence: [audit-remediation.md](audit-remediation.md). Run
+`redacto evaluate` for the original fixture and `redacto benchmark` for 400
+adversarial labelled records. Synthetic coverage is not a production recall claim.
 
 ## 1. Executive summary and core rule
 
@@ -69,7 +70,7 @@ fixture. All scope paths are explicit.
 | `read_record(locator)` | Compliant | adapter-specific, in-scope only |
 | `find_exact(fingerprints, variants)` | **Partial** | Matching is centralized in `discovery/exact.py` so normalization/HMAC handling is identical across stores. There is no per-adapter `find_exact` method. |
 | `delete_record(locator)` | Compliant | failure raises, never reported as success |
-| `redact_record(locator, spans)` | Partial | Interface exists; no adapter claims safe span editing, so it reports unsupported |
+| `redact_record(locator, spans)` | Partial | Filesystem, approved SQLite rows and JSONL support span editing; Chroma/vector/Redis entries are invalidated instead. |
 | `invalidate_derived(locator)` | Compliant | vector index and cache |
 | `verify_absent(target, scope)` | Compliant | implemented per adapter; engine uses a stronger rescan |
 | `capabilities()` | Compliant | scan/delete/redact/invalidate/verify |

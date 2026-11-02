@@ -13,6 +13,7 @@ from pathlib import Path
 from redacto.adapters.registry import build_adapters
 from redacto.config import Settings
 from redacto.errors import RedactoError
+from redacto.locking import is_lock_file
 from redacto.discovery.normalization import fingerprint
 from redacto.graph.repository import Repository
 
@@ -299,6 +300,8 @@ def _destructive_changes(settings: Settings) -> list[str]:
     if root.is_dir():
         for path in root.rglob("*"):
             if not path.is_file():
+                continue
+            if is_lock_file(path):
                 continue
             if path.name not in FIXTURE_FILES:
                 reasons.append(f"unrecognised file in workspace: {path.relative_to(root).as_posix()}")

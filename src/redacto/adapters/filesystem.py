@@ -19,8 +19,10 @@ from redacto.adapters.base import (
     StoreAdapter,
     redact_spans,
     rewrite_temp_prefix,
+    checked_replace,
 )
 from redacto.discovery.normalization import fingerprint
+from redacto.locking import locked_store
 
 SCAN_SUFFIXES = {".md", ".txt", ".rst"}
 
@@ -58,8 +60,17 @@ class FilesystemAdapter(StoreAdapter):
         if not raw:
             raise AdapterError("filesystem locator requires 'path'", code="invalid_locator")
         candidate = Path(raw)
-        if candidate.is_absolute():
+        if candidate.is_absolute() or candidate.drive or candidate.root or ".." in candidate.parts:
             raise AdapterError("absolute paths are outside scope", code="out_of_scope")
+        # Check the original components before resolve() erases link identity.
+        current = self._root
+        for part in candidate.parts:
+            current = current / part
+            if current.is_symlink() or current.is_junction():
+                raise AdapterError("links are outside scope", code="out_of_scope")
+            # Windows alternate streams and trailing aliases are not records.
+            if ":" in part or part.endswith((".", " ")):
+                raise AdapterError("ambiguous path is outside scope", code="out_of_scope")
         resolved = (self._root / candidate).resolve()
         try:
             resolved.relative_to(self._root)
@@ -74,7 +85,9 @@ class FilesystemAdapter(StoreAdapter):
         for path in sorted(self._root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES:
                 continue
-            if path.is_symlink():
+            try:
+                self._safe_path({"path": path.relative_to(self._root).as_posix()})
+            except AdapterError:
                 continue
             rel = path.relative_to(self._root).as_posix()
             yield Record(
@@ -82,7 +95,7 @@ class FilesystemAdapter(StoreAdapter):
                 record_type="doc",
                 store_id=self.store_id,
                 locator={"path": rel},
-                content=path.read_text(encoding="utf-8", errors="replace"),
+                content=self.read_record({"path": rel}).content,
                 sensitivity=["unknown"],
                 metadata={"suffix": path.suffix.lower()},
             )
@@ -95,16 +108,21 @@ class FilesystemAdapter(StoreAdapter):
         if not path.is_file() or path.suffix.lower() not in SCAN_SUFFIXES:
             raise AdapterError("record is not an in-scope file", code="not_found")
         rel = path.relative_to(self._root).as_posix()
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise AdapterError("filesystem record cannot be read", code="read_failed") from exc
         return Record(
             record_id=f"fs:{rel}",
             record_type="doc",
             store_id=self.store_id,
             locator={"path": rel},
-            content=path.read_text(encoding="utf-8", errors="replace"),
+            content=content,
             sensitivity=["unknown"],
             metadata={"suffix": path.suffix.lower()},
         )
 
+    @locked_store
     def delete_record(
         self,
         locator: dict[str, str],
@@ -149,6 +167,7 @@ class FilesystemAdapter(StoreAdapter):
         except OSError as exc:
             raise AdapterError(f"filesystem delete failed: {exc}", code="delete_failed") from exc
 
+    @locked_store
     def redact_record(
         self,
         locator: dict[str, str],
@@ -165,6 +184,7 @@ class FilesystemAdapter(StoreAdapter):
 
         self._rewrite(locator, transform, expected_fingerprint=expected_fingerprint, key=key)
 
+    @locked_store
     def replace_content(
         self,
         locator: dict[str, str],
@@ -201,16 +221,30 @@ class FilesystemAdapter(StoreAdapter):
         redacted = transform(content)
         tmp: str | None = None
         try:
-            current = path.stat()
-            if (current.st_size, current.st_mtime_ns) != (stats.st_size, stats.st_mtime_ns):
-                raise AdapterError("record was replaced during apply", code="content_changed")
             fd, tmp = tempfile.mkstemp(
                 dir=str(path.parent), prefix=rewrite_temp_prefix(path), suffix=".tmp"
             )
             with os.fdopen(fd, "wb") as handle:
                 handle.write(redacted.encode("utf-8"))
             os.chmod(tmp, stat.S_IMODE(stats.st_mode))
-            os.replace(tmp, path)
+            self._safe_path(locator)
+            current = path.stat()
+            if (
+                (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                != (stats.st_dev, stats.st_ino, stats.st_size, stats.st_mtime_ns)
+                or path.read_bytes() != data
+            ):
+                raise AdapterError("record was replaced during apply", code="content_changed")
+            def unchanged():
+                self._safe_path(locator)
+                latest = path.stat()
+                return (
+                    (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns)
+                    == (stats.st_dev, stats.st_ino, stats.st_size, stats.st_mtime_ns)
+                    and path.read_bytes() == data
+                )
+
+            checked_replace(tmp, path, unchanged)
             tmp = None
         except OSError as exc:
             raise AdapterError(f"filesystem rewrite failed: {exc}", code="write_failed") from exc
@@ -240,6 +274,7 @@ class FilesystemAdapter(StoreAdapter):
                 break
         return found
 
+    @locked_store
     def write_record(self, record: Record) -> None:
         path = self._safe_path(record.locator)
         if path.suffix.lower() not in SCAN_SUFFIXES:

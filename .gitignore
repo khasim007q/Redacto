@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 var/
 .env
+.redacto-lock-*
 *.egg-info/
 demo-video/node_modules/
 demo-video/build/

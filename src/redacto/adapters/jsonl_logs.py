@@ -22,8 +22,10 @@ from redacto.adapters.base import (
     leftover_rewrite_temps,
     redact_spans,
     rewrite_temp_prefix,
+    checked_replace,
 )
 from redacto.discovery.normalization import fingerprint
+from redacto.locking import locked_store
 
 
 class JsonlLogAdapter(StoreAdapter):
@@ -53,7 +55,7 @@ class JsonlLogAdapter(StoreAdapter):
     def _lines(self) -> list[str]:
         try:
             return self._path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             raise AdapterError(f"jsonl log unreadable: {exc}", code="store_unreadable") from exc
 
     def _events(self) -> list[dict]:
@@ -214,6 +216,7 @@ class JsonlLogAdapter(StoreAdapter):
                 return record
         raise AdapterError("record no longer exists", code="not_found")
 
+    @locked_store
     def delete_record(
         self,
         locator: dict[str, str],
@@ -262,8 +265,22 @@ class JsonlLogAdapter(StoreAdapter):
                 raise AdapterError(
                     "record content changed since planning", code="content_changed"
                 )
-        self._rewrite_line(event_id, preferred_line=target, transform=lambda line: None)
+        def remove(line: str) -> None:
+            # Recheck on EVERY retry, including after a concurrent edit that
+            # retained event_id. The earlier check alone can delete new content.
+            try:
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    payload = {"content": line}
+            except json.JSONDecodeError:
+                payload = {"content": line}
+            if expected_fingerprint and fingerprint(self._content(payload), key or self._key) != expected_fingerprint:
+                raise AdapterError("record content changed since planning", code="content_changed")
+            return None
 
+        self._rewrite_line(event_id, preferred_line=target, transform=remove)
+
+    @locked_store
     def redact_record(
         self,
         locator: dict[str, str],
@@ -351,7 +368,7 @@ class JsonlLogAdapter(StoreAdapter):
             current = self._path.read_text(encoding="utf-8")
             if current != original:
                 continue  # someone else changed the file; recompute from fresh state
-            self._atomic_write(new_content)
+            self._atomic_write(new_content, expected_original=original)
             return
         raise AdapterError(
             "jsonl log kept changing during delete; no line was removed",
@@ -359,7 +376,7 @@ class JsonlLogAdapter(StoreAdapter):
             retryable=True,
         )
 
-    def _atomic_write(self, content: str) -> None:
+    def _atomic_write(self, content: str, *, expected_original: str | None = None) -> None:
         tmp: str | None = None
         try:
             mode = stat.S_IMODE(self._path.stat().st_mode)
@@ -369,7 +386,11 @@ class JsonlLogAdapter(StoreAdapter):
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
             os.chmod(tmp, mode)
-            os.replace(tmp, self._path)
+            if expected_original is not None and self._path.read_text(encoding="utf-8") != expected_original:
+                raise AdapterError("jsonl log changed while preparing replacement", code="delete_conflict", retryable=True)
+            checked_replace(tmp, self._path,
+                            lambda: expected_original is None or self._path.read_text(encoding="utf-8") == expected_original,
+                            conflict_code="delete_conflict")
             tmp = None
         except OSError as exc:
             raise AdapterError(f"jsonl delete failed: {exc}", code="delete_failed") from exc
@@ -381,6 +402,7 @@ class JsonlLogAdapter(StoreAdapter):
                 except OSError:
                     pass
 
+    @locked_store
     def write_record(self, record: Record) -> None:
         event_id = record.locator.get("event_id")
         if not event_id:

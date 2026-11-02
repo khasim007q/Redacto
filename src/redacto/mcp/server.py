@@ -26,12 +26,14 @@ def _guard(callable_fn) -> dict[str, Any]:
     except RedactoError as exc:
         return exc.as_dict()
     except Exception as exc:  # pragma: no cover - defensive boundary
-        print(f"redacto internal error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        # Exception messages may include record contents, credentials or provider
+        # payloads. Type alone is enough for the transport's diagnostic boundary.
+        print(f"redacto internal error: {type(exc).__name__}", file=sys.stderr)
         return {
             "ok": False,
             "error": {
                 "code": "internal_error",
-                "message": "Unexpected server error; no action was taken.",
+                "message": "Unexpected server error; inspect operation state before retrying.",
                 "details": {"type": type(exc).__name__},
             },
         }

@@ -19,10 +19,11 @@ review, and what could not be checked.
 Hackathon MVP, working end to end on synthetic fixtures. Deterministic flow is
 complete (scan, trace, plan, approval, apply, verify, receipt, tombstones,
 quarantine resolution). Local embedding similarity is on by default for paraphrase
-candidates. External model-assisted discovery sits behind a replaceable interface and
+candidates. An optional pinned multilingual neural model runs locally on CPU; see
+[semantic discovery](docs/semantic-discovery.md). External model-assisted discovery sits behind a replaceable interface and
 is **off by default**; with no provider configured its candidates are unassessed.
 
-- 272 automated tests pass (`pytest`); two opt-in live-model tests are skipped by default.
+- Automated security, concurrency, real-store and integration tests are configured in CI; external assessor and neural-model integration tests are opt-in. Executed local evidence: [audit remediation](docs/audit-remediation.md).
 - Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
 - Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
   quarantined for review, never silently dropped and never auto-deleted.
@@ -55,6 +56,18 @@ is **off by default**; with no provider configured its candidates are unassessed
   runtime-only install.
 
 ## Quick start
+
+For a reproducible install, use the checked-in dependency lock:
+
+```powershell
+uv sync --frozen --extra dev --extra chroma --extra redis --python 3.12
+uv run --no-sync python -m pytest -q
+uv run --no-sync python -m redacto benchmark --out var/benchmark.json
+```
+
+The 400-record benchmark creates temporary stores and does not use your configured
+data. See [reference application](docs/reference-application.md) for a persistent
+Chroma/SQLite integration and [compatibility](docs/compatibility.md) for scope.
 
 ```powershell
 # 1. Environment (Python 3.12+, uv)
@@ -289,10 +302,15 @@ becomes `REGENERATE_FROM_ALLOWED_SOURCES`:
 3. The rewrite is checked against the revoked target's keyed material (fingerprint,
    shingles, anchors and embedding). Anything that resembles the target is refused and
    nothing is written; the plan ends `PARTIAL`.
+   A separate grounding gate requires every output sentence to occur in an allowed
+   source and at least 25% distinct-word retention from each source. Unsupported
+   paraphrases are refused too; this is deliberately conservative.
 4. The record keeps its id; its old lineage is marked revoked and a `REGENERATED_FROM`
    edge is recorded. Verify re-checks the rewrite.
 
 Fact and secret revocations never regenerate, because a model could write the value back.
+`REDACTO_MODEL_PROVIDER=extractive` selects a deterministic generator that retains all
+allowed source text without a network call. The reference application uses this mode.
 A live run with `llama3` rewrote the fixture summary from the remaining board minutes
 and passed the leak check.
 
@@ -417,8 +435,8 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 - Files under a configured root with other extensions are not scanned; `redacto_status`
   reports them per adapter so the gap is visible.
 - Tombstones retain keyed HMAC fingerprints, derived anchors and an embedding vector.
-  A different key or key version cannot match them, and the revoked content is
-  unrecoverable.
+  Their storage must be protected: embeddings are sensitive derived data and are
+  not guaranteed to be non-invertible. Ingestion enforces every active tombstone.
 - The ingestion guard fails closed: blocked records never reach the store or graph.
   If an active tombstone needs a missing key version, every ingestion is blocked
   (`key_unavailable_fail_closed`) and `redacto_status` reports degraded protection.
@@ -433,11 +451,9 @@ Full threat model with tests mapped per threat: [docs/threat-model.md](docs/thre
 
 ## Measured results
 
-Test suite (`python -m pytest`, Python 3.12.0):
-
-```
-272 passed, 2 skipped in 80s (Windows 11, Python 3.12)
-```
+Current executed results and reproduction commands are in
+[docs/audit-remediation.md](docs/audit-remediation.md). Machine-readable benchmark,
+reference-application and scale results are checked into [benchmarks/](benchmarks/).
 
 Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
 short-secret bounds, entity heuristics, model invalid-JSON/timeout →
@@ -572,17 +588,19 @@ Demo (`python -m redacto demo`) on the seeded fixture:
 - `find_exact` is implemented centrally in discovery rather than per adapter.
 - A spaced or rewritten form of a secret, or one inside a record over 256 KB, cannot be
   cut out precisely and still goes to review. There is no undo/trash window yet.
-- Regeneration quality depends on the configured model; Redacto only guarantees that a
-  rewrite resembling the revoked target is refused, not that the rewrite is good.
+- Regeneration must pass leak, extractive-grounding and per-source retention checks.
+  These conservative checks reject unsupported paraphrases; they do not establish
+  that every useful fact was retained or that allowed sources themselves are correct.
 - The Chroma adapter checks content and deletes in two calls (Chroma has no
   transactions); it re-reads right before the delete and confirms the item is gone.
-- The plan flags collateral risk but does not automatically regenerate a descendant
-  from its other parents (option 6 in the review).
 - Two revocation modes exist in code; both are tested. Fact/secret revocation deletes
   records containing the value (the anchor is preserved), and verification searches for
-  the value's tokens; the value is never stored, so a value embedded inside a longer token
-  and reworded traces are not proven absent.
-- Receipt integrity is evidence metadata, not proof of physical overwrite.
+  the value's tokens and normalized windows, including glued forms. Source/fact
+  verification also flags suspected semantic residuals separately. Neither check
+  proves absence of transformed or paraphrased disclosures.
+- JSON receipts carry an HMAC integrity signature. `redacto check-receipt <path>`
+  detects edits with the original keyring; it does not prove physical overwrite or
+  resist an attacker who can replace both receipts and signing keys.
 
 ## Repository layout
 
@@ -620,18 +638,12 @@ all P0 requirements are implemented; the remaining deviations are an editable dr
 plan stage, per-adapter `find_exact`, an undo/trash window, and Alan connector
 registration.
 
-## Next highest-value task
+## Remaining product work
 
-Implement safe **`REDACT_SPAN` editing** for Markdown, SQLite rows and JSONL content,
-then a short **undo/trash window** guarded by tombstones. That closes the remaining
-collateral options: a partial match can be redacted instead of deleting the whole
-record, and a mistaken deletion is recoverable during a development session.
-
-After that, replace the local hashing embedding with a **configurable neural embedding provider**
-and recalibrate on a larger labelled corpus, reporting false positives and missed
-paraphrases per provider. The provider interface and quarantine default already exist;
-the work is integration, cost/latency measurement and a corpus that is not synthetic.
-
-Then, in order: tombstone retention and expiry policy; a review UI over the quarantine
-queue; a benchmark of the optional model assessor on labelled siblings; and real vector
-store / cache adapters behind the same interface.
+The adversarial corpus exposes remaining recall and semantic-residual misses.
+Independent annotations, a neural/multilingual provider evaluated against a separate
+corpus, and production workload measurements are still required. The local reference
+application demonstrates one complete integration; it does not protect arbitrary direct
+writers, hosted stores, replicas or provider transcripts. Production identity/roles and
+external immutable audit storage remain deployment work. See the audit remediation
+document for the boundary between implemented fixes and remaining evidence gaps.

@@ -13,7 +13,7 @@ from redacto.adapters.registry import AdapterSlot, build_adapters
 from redacto.config import Settings, load_settings
 from redacto.discovery.embeddings import build_embedder, cosine
 from redacto.discovery.exact import MIN_SUBSTRING_LEN, ExactMatcher, shares_entity
-from redacto.discovery.normalization import fingerprint, normalize_loose, variants
+from redacto.discovery.normalization import contains_normalized, fingerprint, normalize_loose, variants
 from redacto.discovery.relationship_assessor import (
     CandidateContext,
     RelationshipAssessor,
@@ -44,9 +44,11 @@ from redacto.ingestion import (
 )
 from redacto.policy import authorization, classify
 from redacto.process import pid_alive
-from redacto.regeneration import RegenerationError, build_regenerator
+from redacto.regeneration import RegenerationError, build_regenerator, validate_regeneration
 from redacto.policy.plan import build_plan_items, compute_plan_hash, estimated_impact
 from redacto.status import collect_status
+from redacto.locking import coordinated, resource_lock
+from redacto.receipts import sign_receipt
 
 TARGET_KINDS = {"source", "fact", "secret"}
 MODES = {"source_revocation", "fact_revocation"}
@@ -68,7 +70,8 @@ RELATION_TO_CLASS = {
 GLOBAL_VERIFICATION_LIMITATIONS = [
     "Verification covers only configured, reachable stores; unreachable stores are reported, not assumed clean.",
     "Detection uses planned record IDs plus a keyed fingerprint of the whole target content.",
-    "Paraphrased remnants, backups, provider logs, replication queues and model weights are outside this scope.",
+    "Semantic residual checks are advisory and incomplete; a negative result is not proof of semantic absence.",
+    "External backups, provider logs, replication queues and model weights are outside this scope.",
     "SQLite deletes overwrite rows and attempt a WAL truncate checkpoint; another open writer can delay physical removal.",
     "Files are unlinked rather than overwritten, and files with other extensions under a configured root are not scanned.",
 ]
@@ -77,25 +80,6 @@ GLOBAL_VERIFICATION_LIMITATIONS = [
 # Shortest normalized value that can be verified by windowed hashing without
 # producing false matches from ordinary words.
 MIN_VERIFIABLE_VALUE_LEN = 8
-
-
-def contains_normalized(
-    content: str, target_fingerprint: str, normalized_len: int, key: str
-) -> bool:
-    """Whether the record contains the revoked value, separator-insensitively.
-
-    The plaintext value is never stored, so verification slides a window of the
-    value's normalized length over the record's normalized text and hashes each
-    window. This catches `STRIPE_KEY=sk-...`, `key:sk-...`, `?token=sk-...` and a
-    value glued to other text, which a whole-token comparison misses.
-    """
-    normalized = normalize_loose(content)
-    if normalized_len <= 0 or len(normalized) < normalized_len:
-        return False
-    for start in range(len(normalized) - normalized_len + 1):
-        if fingerprint(normalized[start : start + normalized_len], key) == target_fingerprint:
-            return True
-    return False
 
 
 def _statement_for(
@@ -385,6 +369,8 @@ class Engine:
             "related_fingerprints": [],
             "key_version": request.get("target_key_version") or 1,
             "embedding": request.get("target_embedding", []),
+            "embedding_model": request.get("target_embedding_model"),
+            "normalized_len": request.get("target_normalized_len"),
         }
         return TombstoneGuard(
             [material],
@@ -406,11 +392,10 @@ class Engine:
             source_slot = slots.get(source["store_id"]) if source else None
             if source is None or source_slot is None or source_slot.adapter is None:
                 raise AdapterError("an allowed source is unreachable", code="regenerate_unavailable")
-            texts.append(
-                source_slot.adapter.read_record(
-                    self._resolve_locator(source_slot.adapter, source["locator"])
-                ).content
-            )
+            source_record = source_slot.adapter.read_record(self._resolve_locator(source_slot.adapter, source["locator"]))
+            if self.guard().evaluate(record_id=source_id, content=source_record.content).decision != ALLOWED:
+                raise AdapterError("an allowed source is blocked by an active revocation", code="regenerate_leak")
+            texts.append(source_record.core_content or source_record.content)
         locator = self._resolve_locator(slot.adapter, record["locator"])
         current = slot.adapter.read_record(locator)
         try:
@@ -430,6 +415,10 @@ class Engine:
                 "nothing was written",
                 code="regenerate_leak",
             )
+        try:
+            validate_regeneration(text, texts)
+        except RegenerationError as exc:
+            raise AdapterError(str(exc), code=exc.code) from exc
         slot.adapter.replace_content(
             locator, text, expected_fingerprint=expected_fingerprint, key=expected_key
         )
@@ -493,7 +482,11 @@ class Engine:
         raise AdapterError("record no longer exists", code="not_found")
 
     def embedder(self):
-        return build_embedder(self.settings.embedding_provider)
+        if not hasattr(self, "_embedder"):
+            self._embedder = build_embedder(self.settings.embedding_provider, model=self.settings.embedding_model,
+                                            revision=self.settings.embedding_revision,
+                                            local_files_only=self.settings.embedding_local_files_only)
+        return self._embedder
 
     def guard(self) -> TombstoneGuard:
         """Active tombstones, rebuilt from stored keyed material only.
@@ -537,7 +530,23 @@ class Engine:
             )
 
     def _record_is_oversized(self, record: Record) -> bool:
-        return len(record.content.encode("utf-8")) > self.settings.max_record_bytes
+        return len(record.model_dump_json().encode("utf-8")) > self.settings.max_record_bytes
+
+    def _guard_record(self, guard: TombstoneGuard, record: Record):
+        """Guard payload plus every field that adapters may write or echo."""
+        payload = guard.evaluate(record_id=record.record_id, content=record.content)
+        envelope = json.dumps({"id": record.record_id, "locator": record.locator,
+                               "metadata": record.metadata, "sensitivity": record.sensitivity}, ensure_ascii=False)
+        identity = guard.evaluate(record_id=f"identity:{record.record_id}", content=envelope)
+        severity = {ALLOWED: 0, QUARANTINED: 1, BLOCKED: 2}
+        decision = identity if severity[identity.decision] > severity[payload.decision] else payload
+        if identity.decision != ALLOWED and identity.target_kind in {"fact", "secret"}:
+            record = record.model_copy(update={
+                "record_id": self._alias_id(record.record_id),
+                "locator": {self.REDACTED_LOCATOR: fingerprint(self._locator_text(record.locator), self.settings.current_hmac_key)},
+                "metadata": {}, "sensitivity": ["redacted"],
+            })
+        return decision, record
 
     def _skip_finding(self, record: Record, *, present_in_store: bool) -> dict[str, Any]:
         return {
@@ -676,7 +685,7 @@ class Engine:
         target_content = self._target_content(record, target_kind, target_text)
         embedder = self.embedder()
         target_embedding = (
-            embedder.embed(target_content) if embedder.model_id != "none" else []
+            embedder.embed(target_content) if embedder.model_id != "none" and target_kind != "secret" else []
         )
 
         traversal = traverse(self.repo, target_id, max_depth=depth)
@@ -905,7 +914,7 @@ class Engine:
                 continue
 
             edge = candidate_edges.get(record_id)
-            if edge is not None:
+            if edge is not None and edge["relation_guess"] not in {"unrelated", "related_but_not_disclosing"}:
                 evidence_class = RELATION_TO_CLASS.get(edge["relation_guess"], classify.UNKNOWN)
                 if edge["relation_guess"] == "unrelated":
                     unrelated_preserved += 1
@@ -1006,7 +1015,12 @@ class Engine:
                         }
                     continue
 
-            if shares_entity(target_content, scanned_record.content):
+            # Shared names alone cannot override a neural disclosure signal.
+            # Keep the lightweight provider's existing conservative entity rule.
+            neural_disclosure = (embedder.model_id.startswith("sentence-transformers:") and target_embedding
+                                 and cosine(target_embedding, embedder.embed(scanned_record.content))
+                                 >= self.settings.embedding_candidate_threshold)
+            if shares_entity(target_content, scanned_record.content) and not neural_disclosure:
                 evidence = "Shares a named entity with the target but shows no disclosure evidence."
                 candidates[record_id] = self._candidate(
                     record_id=record_id,
@@ -1149,6 +1163,7 @@ class Engine:
         model_meta = self._assess_candidates(
             target_id=target_id,
             target_kind=target_kind,
+            target_content=target_content,
             candidates=candidates,
             scanned=scanned,
             candidate_edges=candidate_edges,
@@ -1203,7 +1218,7 @@ class Engine:
                 "note": "Embedding similarity generates review candidates only; it never proves lineage.",
             },
             "guard": {
-                "active_tombstones": guard.active_count,
+                **guard.coverage(),
                 "counts": summarize_guard_findings(guard_findings),
                 "findings": guard_findings,
             },
@@ -1223,6 +1238,7 @@ class Engine:
         *,
         target_id: str,
         target_kind: str,
+        target_content: str,
         candidates: dict[str, dict[str, Any]],
         scanned: dict[str, Record],
         candidate_edges: dict[str, dict[str, Any]],
@@ -1290,6 +1306,7 @@ class Engine:
                 candidate_id=candidate["record_id"],
                 snippet_redacted=minimize_snippet(scanned[candidate["record_id"]].content),
                 record_type=candidate["record_type"],
+                target_snippet_redacted=minimize_snippet(target_content),
             )
             for candidate in eligible
         ]
@@ -1310,6 +1327,10 @@ class Engine:
             if assessment is None:
                 meta["errors"][record_id] = outcome.errors.get(record_id, "unassessed")
                 meta["unassessed"] += 1
+                continue
+            if candidate["evidence_class"] in {classify.SUSPECTED_DERIVATIVE, classify.UNKNOWN} and assessment.relationship in {"unrelated", "related_but_not_disclosing"}:
+                # An advisory model cannot erase an unresolved disclosure signal.
+                meta.setdefault("downgrades_held_for_review", []).append(record_id)
                 continue
             if assessment.relationship == "unrelated":
                 candidates.pop(record_id, None)
@@ -1532,7 +1553,7 @@ class Engine:
         target_content = self._target_content(target_record, target_kind, target_text)
         embedder = self.embedder()
         material = TombstoneMaterial.build(
-            target_content, self.settings.current_hmac_key, embedder
+            target_content, self.settings.current_hmac_key, embedder if target_kind != "secret" else None
         )
         if target_kind == "source":
             label_redacted = (
@@ -1686,6 +1707,7 @@ class Engine:
             key_version=request.get("target_key_version") or self.settings.hmac_key_version,
             embedding=request.get("target_embedding", []),
             embedding_model=request.get("target_embedding_model"),
+            normalized_len=request.get("target_normalized_len"),
         )
         self.repo.set_tombstone_status(tombstone_id, "active")
         return self.repo.get_tombstone(tombstone_id)
@@ -1706,7 +1728,7 @@ class Engine:
 
     def keyring_report(self, *, retire_version: int | None = None) -> dict[str, Any]:
         """Audit the versioned key ring and whether a version can be retired."""
-        active = self.repo.list_tombstones(statuses=("active",))
+        active = self.repo.list_tombstones(statuses=("active",), limit=None)
         by_version: dict[int, int] = {}
         required_versions: set[int] = set()
         for tombstone in active:
@@ -1718,11 +1740,17 @@ class Engine:
                     required_versions.add(int(entry["version"]))
         configured = sorted(self.settings.hmac_keys)
         missing = sorted(version for version in required_versions if version not in self.settings.hmac_keys)
-        # Never suggest retiring the current key or one still referenced by a tombstone.
+        history = self.repo.historical_key_usage()
+        verification_versions = set().union(*(set(history[name]) for name in (
+            "receipts_by_key_version", "requests_by_key_version", "plan_items_by_key_version")))
+        unreadable_references = history["unreadable_receipt_key_references"]
+        # Retained receipts and plans also need their original verification keys.
         unused_configured = [
             version
             for version in configured
-            if version != self.settings.hmac_key_version and version not in required_versions
+            if version != self.settings.hmac_key_version
+            and version not in required_versions | verification_versions
+            and not unreadable_references
         ]
         current_missing = self.settings.hmac_key_version not in self.settings.hmac_keys
 
@@ -1734,6 +1762,10 @@ class Engine:
             "tombstones_by_key_version": by_version,
             "in_use_key_versions": sorted(required_versions),
             "missing_key_versions": missing,
+            **history,
+            "verification_key_versions": sorted(verification_versions),
+            "missing_verification_key_versions": sorted(verification_versions - set(configured)),
+            "verification_degraded": bool(unreadable_references or verification_versions - set(configured)),
             "protection_degraded": bool(
                 self.settings.keyring_error or missing or current_missing
             ),
@@ -1743,7 +1775,7 @@ class Engine:
                 "Add the new key as a new version in REDACTO_HMAC_KEYS; keep the old key.",
                 "Raise REDACTO_HMAC_KEY_VERSION to the new version and restart.",
                 "Run `redacto keyring` and confirm missing_key_versions is empty.",
-                "Keep old keys until no active tombstone references them.",
+                "Keep old keys while tombstones, retained receipts, requests or plan items reference them.",
                 "Remove a key only when its version appears in retirable_versions.",
             ],
         }
@@ -1770,13 +1802,17 @@ class Engine:
                     "The current key version cannot be retired; rotate first.",
                     {"version": retire_version},
                 )
-            if retire_version in required_versions:
+            if retire_version in required_versions | verification_versions or unreadable_references:
                 raise RedactoError(
                     "version_still_in_use",
-                    "Active tombstones still reference this key version; keep the key.",
+                    "Tombstones or retained verification evidence may still need this key; keep it.",
                     {
                         "version": retire_version,
                         "active_tombstones": by_version.get(retire_version, 0),
+                        "receipts": history["receipts_by_key_version"].get(retire_version, 0),
+                        "requests": history["requests_by_key_version"].get(retire_version, 0),
+                        "plan_items": history["plan_items_by_key_version"].get(retire_version, 0),
+                        "unreadable_receipt_key_references": unreadable_references,
                     },
                 )
             report["retirement"] = {
@@ -1787,6 +1823,15 @@ class Engine:
         return report
 
     # --------------------------------------------------------------- ingestion
+    def write_boundary(self):
+        """Coordinate a multi-store application operation with apply and verify.
+
+        All participating processes must use the same graph DB and local lock
+        protocol. This is serialization, not a distributed transaction.
+        """
+        return resource_lock(self.settings.db_path)
+
+    @coordinated
     def ingest(
         self,
         records: Sequence[Record],
@@ -1827,11 +1872,11 @@ class Engine:
                 counts["skipped"] += 1
                 results.append(self._skip_finding(record, present_in_store=False))
                 continue
-            decision = guard.evaluate(record_id=record.record_id, content=record.content)
+            decision, guarded_record = self._guard_record(guard, record)
             if decision.decision != ALLOWED:
-                self._record_guard_decision(decision, record, present_in_store=False)
+                self._record_guard_decision(decision, guarded_record, present_in_store=False)
                 counts[decision.decision] += 1
-                results.append(self._guard_finding(decision, record, present_in_store=False))
+                results.append(self._guard_finding(decision, guarded_record, present_in_store=False))
                 continue
 
             if write_to_store:
@@ -1866,7 +1911,7 @@ class Engine:
             "ok": True,
             "counts": counts,
             "results": results,
-            "guard": {"active_tombstones": guard.active_count},
+            "guard": guard.coverage(),
             "limitations": [
                 "The guard blocks admission; it does not delete records already present in a store.",
                 "Quarantined records are held for review and are not added to the active graph.",
@@ -1904,11 +1949,11 @@ class Engine:
                     counts["skipped"] += 1
                     findings.append(self._skip_finding(record, present_in_store=True))
                     continue
-                decision = guard.evaluate(record_id=record.record_id, content=record.content)
+                decision, guarded_record = self._guard_record(guard, record)
                 if decision.decision != ALLOWED:
-                    self._record_guard_decision(decision, record, present_in_store=True)
+                    self._record_guard_decision(decision, guarded_record, present_in_store=True)
                     counts[decision.decision] += 1
-                    findings.append(self._guard_finding(decision, record, present_in_store=True))
+                    findings.append(self._guard_finding(decision, guarded_record, present_in_store=True))
                     continue
                 self._upsert_scanned(record, capabilities)
                 counts[ALLOWED] += 1
@@ -1919,7 +1964,7 @@ class Engine:
             "findings": findings,
             "unreachable_stores": unreachable,
             "truncated_stores": truncated_stores,
-            "guard": {"active_tombstones": guard.active_count},
+            "guard": guard.coverage(),
             "note": (
                 "Blocked and quarantined records were not admitted to the graph. "
                 "Records already present in a store are reported, not silently deleted."
@@ -1936,6 +1981,7 @@ class Engine:
             "note": "Quarantine entries hold a locator and redacted match reason, never record content.",
         }
 
+    @coordinated
     def resolve_quarantine(
         self,
         *,
@@ -2411,13 +2457,14 @@ class Engine:
                     {"plan_id": plan_id},
                 )
         try:
-            return self._apply(
-                plan_id=plan_id,
-                plan_version=plan_version,
-                approval_ref=approval_ref,
-                confirmation_token=confirmation_token,
-                dry_run=dry_run,
-            )
+            with self.write_boundary():
+                return self._apply(
+                    plan_id=plan_id,
+                    plan_version=plan_version,
+                    approval_ref=approval_ref,
+                    confirmation_token=confirmation_token,
+                    dry_run=dry_run,
+                )
         except RedactoError:
             raise
         except Exception as exc:
@@ -2813,6 +2860,10 @@ class Engine:
                 final_state = "VERIFYING"
             self.repo.set_plan_state(plan_id, final_state, applied_at=now_iso())
             self.repo.set_request_state(plan["request_id"], final_state)
+            # Enforce the approved revocation before releasing the write boundary.
+            # Waiting for a later verify left a window for guarded resurrection.
+            if final_state != "FAILED":
+                self.activate_tombstones(plan["request_id"], plan_id)
             message = "Apply completed; run redacto_verify for an honest, scoped result."
 
         return {
@@ -2829,6 +2880,7 @@ class Engine:
         }
 
     # ---------------------------------------------------------------- verify
+    @coordinated
     def verify(
         self,
         *,
@@ -2887,6 +2939,10 @@ class Engine:
             if item["proposed_action"] == classify.REGENERATE and item["state"] == "done"
         }
         leak_guard = self._leak_guard(request) if regenerated and request.get("target_fingerprint") else None
+        semantic_guard = self._leak_guard(request) if request.get("target_fingerprint") else None
+        skipped_embedding_models = semantic_guard.skipped_embedding_models if semantic_guard else []
+        semantic_findings: list[dict[str, Any]] = []
+        semantic_checked = 0
         planned_out_of_scope = {
             item["record_id"]
             for item in items
@@ -2951,6 +3007,7 @@ class Engine:
             limit = self.settings.max_scan_records
             try:
                 records = list(slot.adapter.list_records(limit=limit + 1))
+                outside_records = slot.adapter.out_of_scope_records(limit=limit + 1)
             except AdapterError as exc:
                 limitations = [f"rescan failed: {exc.code}"]
                 self.repo.add_verification(
@@ -2973,19 +3030,48 @@ class Engine:
                 continue
 
             truncated = len(records) > limit
+            outside_truncated = len(outside_records) > limit
+            truncated = truncated or outside_truncated
             if truncated:
                 records = records[:limit]
+                outside_records = outside_records[:limit]
             residuals: list[str] = []
             out_of_scope_residuals: list[str] = []
+            skipped_oversized = 0
+            semantic_store_findings: list[dict[str, Any]] = []
+
+            def assess_survivor(record: Record, shown: str) -> None:
+                nonlocal semantic_checked
+                if semantic_guard is None or key_unavailable or request["target_kind"] == "secret":
+                    return
+                semantic_checked += 1
+                decision = semantic_guard.evaluate(record_id=f"residual:{record.record_id}", content=record.content)
+                if decision.decision != ALLOWED:
+                    semantic_store_findings.append({
+                        "record_id": shown, "store_id": store,
+                        "reason_code": decision.reason_code,
+                        "score": round(decision.match_score, 4),
+                        "assessment": "suspected_disclosure", "resolution": "review_required",
+                    })
+
+            def shown_id(record: Record) -> str:
+                alias = self._alias_id(record.record_id)
+                identity = " ".join([record.record_id, *record.locator.values()])
+                bears_value = bool(target_fingerprint and verify_key and normalized_len
+                                   and request["target_kind"] in {"fact", "secret"}
+                                   and contains_normalized(identity, target_fingerprint, normalized_len, verify_key))
+                if alias in planned_removals or bears_value or self._identity_bears_tokens(record, secret_tokens, verify_key):
+                    return alias
+                return record.record_id
+
             for record in records:
                 # A record whose id carried the value was planned under an alias;
                 # report it by that alias so the receipt never echoes the value.
                 alias = self._alias_id(record.record_id)
-                shown = record.record_id
-                if alias in planned_removals or self._identity_bears_tokens(
-                    record, secret_tokens, verify_key
-                ):
-                    shown = alias
+                shown = shown_id(record)
+                if self._record_is_oversized(record):
+                    skipped_oversized += 1
+                    continue
                 if record.record_id in planned_removals or alias in planned_removals:
                     residuals.append(shown)
                     continue
@@ -2996,9 +3082,10 @@ class Engine:
                     ).decision != ALLOWED:
                         residuals.append(shown)
                     continue
-                if target_fingerprint and verify_key and fingerprint(
-                    record.content, verify_key
-                ) == target_fingerprint:
+                if target_fingerprint and verify_key and any(
+                    fingerprint(text, verify_key) == target_fingerprint
+                    for text in {record.content, record.core_content or record.content}
+                ):
                     residuals.append(shown)
                     continue
                 if secret_tokens and verify_key:
@@ -3020,13 +3107,20 @@ class Engine:
                         record.content, target_fingerprint, normalized_len, verify_key
                     ):
                         residuals.append(shown)
+                        continue
+                assess_survivor(record, shown)
             # Rows of tables Redacto may read but never modify: a copy found there
             # at plan time, or the value itself, is a residual the operator must
             # remove with the owning application.
-            for record in slot.adapter.out_of_scope_records(limit=limit):
+            for record in outside_records:
+                if self._record_is_oversized(record):
+                    skipped_oversized += 1
+                    continue
+                shown = shown_id(record)
                 hit = record.record_id in planned_out_of_scope
                 if not hit and target_fingerprint and verify_key:
-                    hit = fingerprint(record.content, verify_key) == target_fingerprint
+                    hit = any(fingerprint(text, verify_key) == target_fingerprint
+                              for text in {record.content, record.core_content or record.content})
                 if not hit and secret_tokens and verify_key:
                     hit = secret_tokens.issubset(
                         {fingerprint(value, verify_key) for value in token_set(record.content)}
@@ -3043,8 +3137,11 @@ class Engine:
                         record.content, target_fingerprint, normalized_len, verify_key
                     )
                 if hit:
-                    residuals.append(record.record_id)
-                    out_of_scope_residuals.append(record.record_id)
+                    residuals.append(shown)
+                    out_of_scope_residuals.append(shown)
+                else:
+                    assess_survivor(record, shown)
+            semantic_findings.extend(semantic_store_findings)
             # A temp copy left by an interrupted rewrite holds the store as it was
             # before the delete. It is not a record, so it cannot be rescanned like
             # one, and absence is never claimed while it exists.
@@ -3057,7 +3154,7 @@ class Engine:
             residuals.extend(f"tempfile:{path.name}" for path in leftover_temps)
             residual_total += len(residuals)
             outcome = "verified" if not residuals else "residual"
-            if key_unavailable or truncated:
+            if key_unavailable or truncated or skipped_oversized:
                 outcome = "not_verifiable"
             limitations = [
                 "Rescan checks planned record IDs and exact/normalized copies of the target content.",
@@ -3074,6 +3171,8 @@ class Engine:
                     f"Record cap reached ({limit}); some records were not rescanned and "
                     "absence is not claimed for them."
                 )
+            if skipped_oversized:
+                limitations.append(f"{skipped_oversized} oversized record(s) were not checked; absence is not claimed.")
             if out_of_scope_residuals:
                 limitations.append(
                     "Copies remain in tables outside the approved scope, which Redacto reads "
@@ -3106,6 +3205,9 @@ class Engine:
                     "residual_count": len(residuals),
                     "residual_record_ids": residuals,
                     "records_scanned": len(records),
+                    "out_of_scope_records_scanned": len(outside_records),
+                    "oversized_records_skipped": skipped_oversized,
+                    "semantic_findings": semantic_store_findings,
                     "truncated": truncated,
                     "limit": limit,
                     "limitations": limitations,
@@ -3121,9 +3223,9 @@ class Engine:
         unreachable_stores = [s["store_id"] for s in store_results if s["outcome"] == "unreachable"]
         not_verifiable = [s["store_id"] for s in store_results if s["outcome"] == "not_verifiable"]
 
-        if failed or residual_total or unreachable_stores or not_verifiable or partial_scope:
+        if failed or residual_total or unreachable_stores or not_verifiable or partial_scope or skipped_embedding_models:
             status = "PARTIAL"
-        elif review_pending:
+        elif review_pending or semantic_findings:
             status = "NEEDS_REVIEW"
         elif succeeded + already_absent == 0 and dry_run_actions:
             raise RedactoError("plan_not_applied", "Only a dry run exists; nothing was applied.")
@@ -3131,6 +3233,10 @@ class Engine:
             status = "VERIFIED_WITHIN_SCOPE"
 
         limitations = list(GLOBAL_VERIFICATION_LIMITATIONS)
+        if skipped_embedding_models:
+            limitations.append("Stored embedding models are incompatible with the configured provider; semantic coverage is incomplete. Restore the original provider/model revision to compare those vectors.")
+        if semantic_findings:
+            limitations.append(f"{len(semantic_findings)} surviving record(s) may disclose revoked information and require review.")
         if partial_scope:
             limitations.append(
                 "Verification was limited to a subset of the approved scope: "
@@ -3184,15 +3290,38 @@ class Engine:
             "target_kind": request["target_kind"],
             "status": status,
             "counts": {
-                "records_removed": succeeded,
+                "records_removed": sum(1 for a in real_actions if a["result"] == "success"
+                                       and a["operation"] not in {classify.REDACT_SPAN, classify.REGENERATE}),
+                "records_redacted": sum(1 for a in real_actions if a["result"] == "success" and a["operation"] == classify.REDACT_SPAN),
+                "records_regenerated": sum(1 for a in real_actions if a["result"] == "success" and a["operation"] == classify.REGENERATE),
                 "already_absent": already_absent,
                 "failed": failed,
                 "review_pending": review_pending,
                 "preserved": preserved,
                 "residual_matches": residual_total,
+                "semantic_residual_candidates": len(semantic_findings),
             },
             "scope": {"stores": scope_stores, "verified_stores": verify_stores, "max_depth": plan["scope"].get("max_depth")},
             "stores": store_results,
+            "semantic_verification": {
+                "method": "keyed_anchors_shingles_and_embedding_similarity",
+                "status": (
+                    "not_applicable" if request["target_kind"] == "secret"
+                    else "unavailable" if key_unavailable or semantic_guard is None
+                    else "incomplete" if unreachable_stores or not_verifiable or partial_scope or skipped_embedding_models
+                    else "review_required" if semantic_findings
+                    else "no_candidates_detected"
+                ),
+                "records_checked": semantic_checked,
+                "findings": semantic_findings,
+                "skipped_embedding_models": skipped_embedding_models,
+                "proves_semantic_absence": False,
+                "limitations": [
+                    "Checks every surviving scanned record, including records written after planning.",
+                    "Scores flag uncertainty, do not prove lineage, and never authorize deletion.",
+                    "Translations, transformed quantities and heavily reformulated facts may be missed.",
+                ],
+            },
             "unreachable_stores": unreachable_stores,
             "limitations": limitations,
             "model": request["policy"].get("model", {}),
@@ -3205,8 +3334,10 @@ class Engine:
             },
             "tombstone": self._tombstone_public(tombstone),
             "checked_at": now_iso(),
-            "statement": _statement_for(status, review_pending, unreachable_stores, not_verifiable),
+            "statement": _statement_for(status, len({i["record_id"] for i in items if i["proposed_action"] == classify.REVIEW_REQUIRED}
+                                                    | {f["record_id"] for f in semantic_findings}), unreachable_stores, not_verifiable),
         }
+        summary = sign_receipt(summary, key=self.settings.current_hmac_key, key_version=self.settings.hmac_key_version)
         receipt_id = self.repo.save_receipt(request_id=request_id, summary=summary)
         self.repo.set_plan_state(plan["plan_id"], status)
         self.repo.set_request_state(request_id, status)

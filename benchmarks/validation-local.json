@@ -1,0 +1,35 @@
+{
+  "date_local": "2026-10-28",
+  "timezone": "Asia/Calcutta",
+  "platform": "Windows 11",
+  "uv_lock_sha256": "8c94275e824063eb9d9b250f68c6614a4025bb1ba8d0c1142888f3da032e38bd",
+  "frozen_all_extras": true,
+  "test_runs": [
+    {
+      "python": "3.12.0",
+      "tests": 320,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 2,
+      "passed": 318,
+      "seconds": 96.727
+    },
+    {
+      "python": "3.14.2",
+      "tests": 320,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 2,
+      "passed": 318,
+      "seconds": 99.651
+    }
+  ],
+  "extra_concurrency_runs": 5,
+  "extra_concurrency_tests_passed": 20,
+  "stdio_mcp_smoke": "passed",
+  "http_mcp_smoke": "passed; unauthenticated request returned 401",
+  "runtime_only_import": "passed; pytest/chromadb/fakeredis absent",
+  "hosted_ci_executed": false,
+  "live_model_tests": "2 skipped; no configured live provider",
+  "redis": "fakeredis; no external Redis server exercised"
+}
