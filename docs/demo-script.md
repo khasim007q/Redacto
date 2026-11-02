@@ -12,13 +12,18 @@ are marked unassessed.
 
 That single command seeds the fixture, prints the graph, creates a plan, issues an
 application approval, rehearses with a dry run, applies, verifies and writes
-`var/demo_receipt.json` plus `var/demo_receipt.md`.
+`demo_receipt.json`, `demo_receipt.md` and `demo_report.html` into a fresh temp folder
+(the path is printed at the end). It never touches your configured stores.
 
 ## Step-by-step version (better for narration)
 
 ```powershell
-# 1. Reset to the known fixture state
-.venv\Scripts\python.exe -m redacto seed
+# 1. Reset to the known fixture state. The first run can use plain `seed`; after any
+#    earlier run seed refuses (it has tombstones to protect), so remove leftover demo
+#    files and use --force. Keep a copy of the target for the re-ingestion step.
+Remove-Item fixtures\workspace\restored.md, fixtures\workspace\leaked-key.txt -ErrorAction SilentlyContinue
+.venv\Scripts\python.exe -m redacto seed --force
+Copy-Item fixtures\workspace\acquisition-plan.md $env:TEMP\acquisition-plan.backup.md
 
 # 2. Show what Redacto can reach
 .venv\Scripts\python.exe -m redacto status
@@ -42,9 +47,10 @@ application approval, rehearses with a dry run, applies, verifies and writes
 # 8. Verify and export the receipt
 .venv\Scripts\python.exe -m redacto verify --request-id <REQUEST_ID> --out var\receipt.json --markdown var\receipt.md
 
-# 9. Show the tombstone, then re-ingest a restored copy
+# 9. Show the tombstone, then re-ingest a restored copy (from the step 1 backup:
+#    apply has already deleted the original)
 .venv\Scripts\python.exe -m redacto tombstones
-Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
+Copy-Item $env:TEMP\acquisition-plan.backup.md fixtures\workspace\restored.md
 .venv\Scripts\python.exe -m redacto ingest --stores filesystem
 .venv\Scripts\python.exe -m redacto quarantine
 ```
@@ -93,7 +99,7 @@ The JSONL store is reported unreachable, its confirmed descendants become
 
 ```powershell
 .venv\Scripts\python.exe -m redacto tombstones
-Copy-Item fixtures\workspace\acquisition-plan.md fixtures\workspace\restored.md
+Copy-Item $env:TEMP\acquisition-plan.backup.md fixtures\workspace\restored.md
 .venv\Scripts\python.exe -m redacto ingest --stores filesystem
 .venv\Scripts\python.exe -m redacto quarantine
 ```
@@ -104,13 +110,17 @@ the guard: blocking admission is not the same as a new destructive action.
 ## Optional: secret revocation (20 seconds)
 
 ```powershell
-$secret = "sk-synthetic-DEMO-KEY-1234567890"
-"$secret" | Set-Content fixtures\workspace\leaked-key.txt
-.venv\Scripts\python.exe -m redacto plan --target-id "fs:acquisition-plan.md" --kind secret --target-text $secret
+# The value goes in through an env var (or --text-stdin), never on the command line.
+$env:LEAKED_KEY = "sk-synthetic-DEMO-KEY-1234567890"
+Set-Content fixtures\workspace\leaked-key.txt $env:LEAKED_KEY
+Add-Content fixtures\workspace\eng-notes.md "- Payments config: STRIPE_KEY=$env:LEAKED_KEY"
+.venv\Scripts\python.exe -m redacto plan --target-id "fs:leaked-key.txt" --kind secret --text-env LEAKED_KEY
 ```
 
-Point out that `fixtures/workspace/leaked-key.txt` is planned for deletion while the anchor
-document is preserved, and that verify rescans the stores for the value itself.
+Point out that `leaked-key.txt` is planned for deletion (`DELETE_RECORD`) while
+`eng-notes.md` only has the value cut out (`REDACT_SPAN`, becomes `[REDACTED]`), and that
+verify and the re-ingestion guard both look for the value itself. Remove the added
+`eng-notes.md` line (or re-seed) before the next run.
 
 ## Optional: key rotation and embedding calibration (20 seconds)
 
@@ -128,6 +138,6 @@ lineage coverage and unrelated records touched."
 
 ## What to point at when someone asks "did it really work?"
 
-- `var/demo_receipt.json` — counts, per-store outcomes, limitations.
-- `tests/` — 53 tests including the failure, injection, idempotency and redaction cases.
+- The receipt (`demo_receipt.json` from the one-command demo, or `var\receipt.json` from step 8) — counts, per-store outcomes, limitations.
+- `tests/` — the full suite, including the failure, injection, idempotency and redaction cases.
 - `docs/threat-model.md` — the exact residual risks that stop Redacto claiming universal erasure.

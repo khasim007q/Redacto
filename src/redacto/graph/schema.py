@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS tombstones (
     policy_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     key_version INTEGER NOT NULL DEFAULT 1,
+    normalized_len INTEGER,
     created_at TEXT NOT NULL,
     activated_at TEXT
 );

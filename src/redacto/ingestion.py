@@ -36,6 +36,9 @@ PARTIAL_COPY_BLOCK_RATIO = 0.5
 SIMILAR_CONTENT_REVIEW_RATIO = 0.2
 MIN_ANCHOR_SCORE_FOR_REVIEW = 3
 MIN_FACT_TOKENS = 3
+# Shortest normalized value that can be verified by windowed hashing without
+# producing false matches from ordinary words.
+MIN_VERIFIABLE_VALUE_LEN = 8
 
 ALLOWED = "allowed"
 QUARANTINED = "quarantined"
@@ -348,25 +351,9 @@ class TombstoneGuard:
                 *materials[version],
                 record_embedding=record_embedding,
                 fingerprints_by_version={v: material[0] for v, material in materials.items()},
+                content=content,
+                key=self._keyring[version],
             )
-            # Token containment misses single-token API keys and KEY=value.
-            # Length is captured before deletion; no plaintext is retained.
-            length = tombstone.get("normalized_len")
-            if (
-                tombstone["target_kind"] in {"fact", "secret"}
-                and decision.decision != BLOCKED
-                and length and length >= 8
-                and (
-                    contains_normalized(content, tombstone["fingerprint"], length, self._keyring[version])
-                    or (tombstone["target_kind"] == "secret"
-                        and contains_normalized("".join(normalize_loose(content).split()), tombstone["fingerprint"], length, self._keyring[version]))
-                )
-            ):
-                decision = GuardDecision(
-                    BLOCKED, "value_containment", 1.0,
-                    tombstone_id=tombstone["tombstone_id"], target_id=tombstone["target_id"],
-                    target_kind=tombstone["target_kind"], label_redacted=tombstone["label_redacted"],
-                )
             if _SEVERITY[decision.decision] > _SEVERITY[best.decision] or (
                 decision.decision == best.decision and decision.match_score > best.match_score
             ):
@@ -389,6 +376,8 @@ class TombstoneGuard:
         record_tokens: set[str],
         record_embedding: list[float] | None = None,
         fingerprints_by_version: dict[int, str] | None = None,
+        content: str | None = None,
+        key: str | None = None,
     ) -> GuardDecision:
         base = {
             "tombstone_id": tombstone["tombstone_id"],
@@ -426,6 +415,19 @@ class TombstoneGuard:
             tombstone_tokens = set(tombstone["tokens"])
             if len(tombstone_tokens) >= MIN_FACT_TOKENS and tombstone_tokens.issubset(record_tokens):
                 return GuardDecision(BLOCKED, "fact_containment", 1.0, **base)
+            # A short value (one token, such as an API key) cannot meet the token
+            # minimum, so look for the value itself anywhere in the record, the same
+            # way verification does.
+            normalized_len = int(tombstone.get("normalized_len") or 0)
+            if (
+                content is not None
+                and key is not None
+                and normalized_len >= MIN_VERIFIABLE_VALUE_LEN
+                and (contains_normalized(content, tombstone["fingerprint"], normalized_len, key)
+                     or (tombstone["target_kind"] == "secret" and contains_normalized(
+                         "".join(normalize_loose(content).split()), tombstone["fingerprint"], normalized_len, key)))
+            ):
+                return GuardDecision(BLOCKED, "value_containment", 1.0, **base)
 
         # 5. Weighted distinctive anchors: uncertain, hold for review.
         weights = _anchor_weights(tombstone["anchors"])

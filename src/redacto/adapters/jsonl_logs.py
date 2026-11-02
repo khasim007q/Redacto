@@ -28,6 +28,10 @@ from redacto.discovery.normalization import fingerprint
 from redacto.locking import locked_store
 
 
+
+class _LogChanged(Exception):
+    """The log was rewritten (not just appended to) while an edit was prepared."""
+
 class JsonlLogAdapter(StoreAdapter):
     adapter_id = "jsonl_logs"
     store_id = "jsonl_logs"
@@ -368,7 +372,10 @@ class JsonlLogAdapter(StoreAdapter):
             current = self._path.read_text(encoding="utf-8")
             if current != original:
                 continue  # someone else changed the file; recompute from fresh state
-            self._atomic_write(new_content, expected_original=original)
+            try:
+                self._atomic_write(new_content, expected_original=original)
+            except _LogChanged:
+                continue
             return
         raise AdapterError(
             "jsonl log kept changing during delete; no line was removed",
@@ -377,20 +384,40 @@ class JsonlLogAdapter(StoreAdapter):
         )
 
     def _atomic_write(self, content: str, *, expected_original: str | None = None) -> None:
+        """Replace the log with `content`.
+
+        With `expected_original`, lines another writer appended after that snapshot
+        are carried over into the new file right before the replace, so a concurrent
+        append is not lost. Any other change raises `_LogChanged` so the caller can
+        recompute the edit.
+        """
         tmp: str | None = None
         try:
             mode = stat.S_IMODE(self._path.stat().st_mode)
             fd, tmp = tempfile.mkstemp(
                 dir=str(self._path.parent), prefix=rewrite_temp_prefix(self._path), suffix=".tmp"
             )
+            expected_snapshot = expected_original
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(content)
+                if expected_original is not None:
+                    current = self._path.read_text(encoding="utf-8")
+                    if current != expected_original:
+                        if not current.startswith(expected_original):
+                            raise _LogChanged()
+                        appended = current[len(expected_original) :]
+                        if expected_original and not expected_original.endswith("\n") and not appended.startswith("\n"):
+                            raise _LogChanged()  # continuation of the planned event, not a new event
+                        if content and not content.endswith("\n") and not appended.startswith("\n"):
+                            handle.write("\n")
+                        handle.write(appended)
+                        expected_snapshot = current
             os.chmod(tmp, mode)
-            if expected_original is not None and self._path.read_text(encoding="utf-8") != expected_original:
-                raise AdapterError("jsonl log changed while preparing replacement", code="delete_conflict", retryable=True)
-            checked_replace(tmp, self._path,
-                            lambda: expected_original is None or self._path.read_text(encoding="utf-8") == expected_original,
-                            conflict_code="delete_conflict")
+            def unchanged():
+                if expected_snapshot is not None and self._path.read_text(encoding="utf-8") != expected_snapshot:
+                    raise _LogChanged()
+                return True
+            checked_replace(tmp, self._path, unchanged, conflict_code="delete_conflict")
             tmp = None
         except OSError as exc:
             raise AdapterError(f"jsonl delete failed: {exc}", code="delete_failed") from exc

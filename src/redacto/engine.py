@@ -35,7 +35,9 @@ from redacto.ingestion import (
     token_set,
     ALLOWED,
     BLOCKED,
+    MIN_VERIFIABLE_VALUE_LEN,
     QUARANTINED,
+    contains_normalized,
     contains_verbatim_passage,
     overlap_ratio,
     TombstoneGuard,
@@ -75,11 +77,6 @@ GLOBAL_VERIFICATION_LIMITATIONS = [
     "SQLite deletes overwrite rows and attempt a WAL truncate checkpoint; another open writer can delay physical removal.",
     "Files are unlinked rather than overwritten, and files with other extensions under a configured root are not scanned.",
 ]
-
-
-# Shortest normalized value that can be verified by windowed hashing without
-# producing false matches from ordinary words.
-MIN_VERIFIABLE_VALUE_LEN = 8
 
 
 def _statement_for(
@@ -1609,6 +1606,15 @@ class Engine:
             )
         if any(item["proposed_action"] == classify.REVIEW_REQUIRED for item in items):
             warnings.append("Some candidates require human review and are excluded from execution.")
+        if (
+            self.settings.regenerate_derivatives
+            and target_kind == "source"
+            and self.regenerator().model_id == "none"
+        ):
+            warnings.append(
+                "REDACTO_REGENERATE is on but no model is configured (REDACTO_MODEL_*), so "
+                "derivatives are deleted instead of regenerated."
+            )
 
         return {
             "ok": True,
@@ -2229,7 +2235,10 @@ class Engine:
                 self.repo, plan_id=plan_id, approval_ref=approval_ref, ttl_seconds=ttl_seconds
             )
         except ValueError as exc:
-            raise RedactoError(str(exc), f"Approval could not be issued: {exc}") from exc
+            # The text before the first colon is the machine-readable code; anything
+            # after it is detail for the human message.
+            code = str(exc).split(":", 1)[0].strip()
+            raise RedactoError(code, f"Approval could not be issued: {exc}") from exc
         result = {"ok": True, **issued, "recovery": recovery}
         if recovery:
             result["note"] = (
@@ -3162,9 +3171,10 @@ class Engine:
             ]
             if request["target_kind"] in {"fact", "secret"}:
                 limitations.append(
-                    "Fact/secret verification rescans every reachable store for the value's "
-                    "distinctive tokens. The value is never stored, so a value embedded inside "
-                    "a longer token and reworded traces are not proven absent."
+                    "Fact/secret verification hashes a sliding window of the value's normalized "
+                    "length over every reachable record, so separators and surrounding text do "
+                    "not hide it. Values shorter than 8 normalized characters fall back to token "
+                    "matching, and reworded traces are not proven absent."
                 )
             if truncated:
                 limitations.append(
@@ -3215,6 +3225,16 @@ class Engine:
             )
 
         succeeded = sum(1 for a in real_actions if a["result"] == "success")
+        # A redacted or regenerated record still exists without the revoked value, so
+        # it is reported separately rather than as removed.
+        redacted = sum(
+            1 for a in real_actions
+            if a["result"] == "success" and a["operation"] == classify.REDACT_SPAN
+        )
+        regenerated = sum(
+            1 for a in real_actions
+            if a["result"] == "success" and a["operation"] == classify.REGENERATE
+        )
         already_absent = sum(1 for a in real_actions if a["result"] == "already_absent")
         failed = sum(1 for a in real_actions if a["result"] == "failed")
         dry_run_actions = sum(1 for a in actions if a["result"] == "dry_run")
@@ -3290,10 +3310,9 @@ class Engine:
             "target_kind": request["target_kind"],
             "status": status,
             "counts": {
-                "records_removed": sum(1 for a in real_actions if a["result"] == "success"
-                                       and a["operation"] not in {classify.REDACT_SPAN, classify.REGENERATE}),
-                "records_redacted": sum(1 for a in real_actions if a["result"] == "success" and a["operation"] == classify.REDACT_SPAN),
-                "records_regenerated": sum(1 for a in real_actions if a["result"] == "success" and a["operation"] == classify.REGENERATE),
+                "records_removed": succeeded - redacted - regenerated,
+                "records_redacted": redacted,
+                "records_regenerated": regenerated,
                 "already_absent": already_absent,
                 "failed": failed,
                 "review_pending": review_pending,

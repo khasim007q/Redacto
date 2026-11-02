@@ -131,9 +131,9 @@ class Repository:
             conn.execute("ALTER TABLE tombstones ADD COLUMN embedding_model TEXT")
         if "normalized_len" not in tombstone_columns:
             conn.execute("ALTER TABLE tombstones ADD COLUMN normalized_len INTEGER")
-            conn.execute("""UPDATE tombstones SET normalized_len = (
-                SELECT target_normalized_len FROM revocation_requests r
-                WHERE r.request_id = tombstones.request_id)""")
+        conn.execute("""UPDATE tombstones SET normalized_len = (
+            SELECT target_normalized_len FROM revocation_requests r
+            WHERE r.request_id = tombstones.request_id) WHERE normalized_len IS NULL""")
 
     # ---------------------------------------------------------------- records
     def upsert_record(
@@ -935,7 +935,7 @@ class Repository:
                    (tombstone_id, request_id, target_id, target_kind, label_redacted, fingerprint,
                     shingles_json, anchors_json, tokens_json, related_record_ids_json,
                     related_fingerprints_json, embedding_json, embedding_model,
-                    scope_json, policy_json, status, key_version, created_at, normalized_len)
+                    scope_json, policy_json, status, key_version, normalized_len, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     tombstone_id,
@@ -955,8 +955,8 @@ class Repository:
                     _json(policy),
                     status,
                     key_version,
-                    now_iso(),
                     normalized_len,
+                    now_iso(),
                 ),
             )
             conn.commit()
