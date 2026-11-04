@@ -72,3 +72,9 @@ The tests also exercise multi-process JSONL/vector mutations, process death whil
 holding a lock, a write racing apply, malformed API requests and bearer rejection.
 Use a dedicated single-host data directory with restrictive permissions. This example
 does not cover distributed transactions, arbitrary direct writers or external replicas.
+
+The evidence script runs the journey in a short-lived worker process. The parent
+owns its temporary directory and deletes it after that worker exits, so retained
+native Chroma/SQLite handles cannot race Windows cleanup. Application close runs
+on failures too. Worker failures, timeouts and directory-cleanup errors still fail
+the script; it does not ignore cleanup errors or retry a failed revocation.

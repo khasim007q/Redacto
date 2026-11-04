@@ -3,6 +3,8 @@
 import argparse
 import json
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from contextlib import closing
 from pathlib import Path
@@ -13,8 +15,20 @@ from redacto.discovery.embeddings import HashingEmbeddingProvider
 
 
 def run():
+    # Chroma's native SQLite workers can outlive client.close() on Windows.
+    # The parent owns cleanup; process exit releases every worker handle before
+    # TemporaryDirectory removes files. Keep cleanup errors and child failures
+    # visible rather than ignoring locked files or retrying the whole journey.
     with tempfile.TemporaryDirectory(prefix="redacto-reference-") as temp:
-        app = MemoryApplication(Path(temp))
+        worker = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--worker-root", temp],
+            stdout=subprocess.PIPE, text=True, encoding="utf-8", check=True, timeout=180,
+        )
+        return json.loads(worker.stdout)
+
+
+def _run_in_workspace(root: Path):
+    with closing(MemoryApplication(root)) as app:
         confidential = "Aster will acquire Lumen for 48 million dollars in November. The confidential closing date is November 14."
         public = "The public SDK supports Linux and Windows. Accessibility testing runs on Fridays."
         app.document("private", confidential)
@@ -48,7 +62,6 @@ def run():
         bypass_answer = app.query("Aster Lumen acquisition")
         reconciliation = app.reconcile()
         bypass_receipt = app.engine.verify(request_id=plan["request_id"])
-        app.close()
         return {"stores": ["filesystem", "sqlite_memory", "jsonl_logs", "chroma"],
                 "before_query_disclosed": "48 million" in before["answer"],
                 "after_query_disclosed": "48 million" in after["answer"],
@@ -68,8 +81,15 @@ def run():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--out")
+    parser.add_argument("--worker-root", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
-    result = run()
+    if args.worker_root is not None:
+        root = args.worker_root.resolve()
+        if args.out or not root.is_dir() or any(root.iterdir()):
+            parser.error("The evidence worker requires an existing empty temporary directory and no --out.")
+        result = _run_in_workspace(root)
+    else:
+        result = run()
     if args.out:
         Path(args.out).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))
