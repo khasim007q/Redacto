@@ -15,7 +15,7 @@ import pytest
 
 from helpers import seeded_settings
 from redacto.engine import Engine
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 URL = os.environ.get("REDACTO_LIVE_MODEL_URL")
 NAME = os.environ.get("REDACTO_LIVE_MODEL_NAME")

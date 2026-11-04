@@ -139,7 +139,7 @@ def test_dependency_initialization_errors_are_structured(monkeypatch):
 def test_secret_revocation_does_not_require_neural_weights(engine, monkeypatch):
     from conftest import approve_and_apply
     from redacto.engine import Engine
-    from redacto.fixtures import SOURCE_ID
+    from test_support.fixtures import SOURCE_ID
 
     def must_not_load(*args):
         pytest.fail("Credentials must not be assessed with an embedding model")
@@ -158,6 +158,7 @@ def test_neural_configuration_uses_separate_threshold_defaults(tmp_path, monkeyp
     monkeypatch.setenv("REDACTO_EMBEDDING_PROVIDER", "sentence_transformers")
     monkeypatch.delenv("REDACTO_EMBEDDING_CANDIDATE_THRESHOLD", raising=False)
     monkeypatch.delenv("REDACTO_EMBEDDING_QUARANTINE_THRESHOLD", raising=False)
+    monkeypatch.setenv("REDACTO_WORKSPACE_ROOT", str(tmp_path))
     settings = load_settings()
     assert settings.embedding_candidate_threshold == 0.55
     assert settings.embedding_quarantine_threshold == 0.60

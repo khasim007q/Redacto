@@ -1,667 +1,75 @@
 # Redacto
 
-**Provenance-aware revocation engine for AI context.** When a user asks an AI
-system to forget a document, fact or secret, Redacto locates known descendants,
-discovers historical traces that lineage missed, previews collateral damage,
-deletes or invalidates only approved records, and verifies what remains in the
-data stores it can actually reach.
+Provenance-aware revocation for AI application context. Find source copies and
+known derivatives, review uncertain matches, approve a versioned plan, remove or
+redact supported records, and verify the configured scope.
 
-> Confirmed provenance establishes known lineage. Discovery finds what lineage
-> missed. Policy determines what may be erased. Verification determines what
-> Redacto can honestly claim was removed.
+## Install and connect
 
-Redacto is **not** a universal "erase from existence" button. It produces an
-evidence-backed account of what was removed, what was preserved, what needs
-review, and what could not be checked.
-
-## Status
-
-Hackathon MVP, working end to end on synthetic fixtures. Deterministic flow is
-complete (scan, trace, plan, approval, apply, verify, receipt, tombstones,
-quarantine resolution). Local embedding similarity is on by default for paraphrase
-candidates. An optional pinned multilingual neural model runs locally on CPU; see
-[semantic discovery](docs/semantic-discovery.md). External model-assisted discovery sits behind a replaceable interface and
-is **off by default**; with no provider configured its candidates are unassessed.
-
-- Automated security, concurrency, real-store and integration tests are configured in CI; external assessor and neural-model integration tests are opt-in. Executed local evidence: [audit remediation](docs/audit-remediation.md).
-- Two MCP transports verified with real MCP clients: stdio and Streamable HTTP with bearer auth.
-- Revocation tombstones block re-ingestion of exact and near copies. Uncertain matches are
-  quarantined for review, never silently dropped and never auto-deleted.
-- Quarantine approval is an audited application action that rechecks active tombstones and
-  policy; rejection records the decision without admitting anything.
-- Versioned HMAC keys keep active tombstones enforceable during rotation and fail closed if
-  a required key is missing.
-- Local embedding similarity generates paraphrase candidates and risk scores. It is advisory:
-  embeddings never prove lineage and never block on their own.
-- Optional hybrid discovery keeps independent hashing and multilingual neural signals,
-  preserves matching older tombstone spaces, and holds exact replays of review-only
-  candidates. See [semantic discovery](docs/semantic-discovery.md) for measured recall,
-  false-positive costs and remaining limits.
-- Secret/fact revocation deletes only records that contain the value; the anchor record is
-  a lookup handle and is preserved unless it holds the value. When the value is a small part
-  of a useful file, memory row or log event, the plan redacts just the value (`REDACT_SPAN`)
-  instead of deleting the record.
-- Secret verification rescans every reachable store for the value itself, not the anchor,
-  using separator-insensitive windowed matching, so `STRIPE_KEY=...`, `key:...`,
-  `?token=...` and a value glued to other text are all detected.
-- Every field is scanned: JSONL events (all keys and values at any depth, including
-  nested tool-call arguments), vector chunks (`text`, `content`, `page_content`, nested
-  metadata, any other field) and every column of the approved SQLite tables.
-- A whole-document copy carrying extra metadata (a chunk with `metadata.source`, a
-  `read_file` event) is a `DIRECT_MATCH`, not a review item.
-- A revoked value sitting in a record id, locator, sensitivity label or `created_at` is
-  replaced by an opaque alias, so it never appears in plans, results, receipts or the
-  graph DB.
-- Verification is scoped and enforced by code, not by wording in a prompt.
-- Plans show blast radius (record bytes, match share, collateral risk). A substring
-  match inside a larger record is held for review instead of auto-deleted, and a
-  verbatim passage buried in other notes is never labelled non-disclosing.
-- Runtime dependencies install without dev extras; CI covers Linux + Windows and a
-  runtime-only install.
-
-## Quick start
-
-To connect an ordinary folder to Claude, use the [saved workspace setup](docs/workspace-setup.md):
+Python 3.12+ is required. From this repository:
 
 ```powershell
 uv sync --frozen --python 3.12
-.\.venv\Scripts\python.exe -m redacto setup --workspace "C:\path\to\Agent Notes"
+.\.venv\Scripts\python.exe -m redacto setup --workspace "C:\path\to\notes" --client claude-desktop
 ```
 
-Paste the printed `mcp_config` into your client's local MCP settings. The documents
-folder needs no `pyproject.toml`. Add `--demo` for explicit synthetic data in a new
-folder, or `--managed-memory` for owned SQLite memory/cache and JSONL stores plus
-the guarded `WorkspaceClient` application API. Use the printed profile for operator
-commands. Reviewed source-passage edits can now preserve public content inside
-mixed files, memory rows and logs; uncertain paraphrases still need assessment.
+The notes folder must exist. It needs no Python project file. Setup generates a
+private profile and random keys, then registers the MCP server. Existing client
+settings are merged with a backup; conflicting server entries require `--replace`
+or another `--name`. Restart the client and call `redacto_status`.
 
-For a reproducible install, use the checked-in dependency lock:
+Other clients: `--client claude-code`, `cursor`, or `vscode`. Use `--config PATH`
+for an explicit client JSON file, or `--print-only` to inspect the generated entry.
+With no client selected, setup prints a generic MCP configuration.
+
+Linux/macOS: replace `.venv\Scripts\python.exe` with `.venv/bin/python`.
+An installed wheel also provides the `redacto` command; launch from any directory.
+
+## Workflow
+
+1. Check `redacto_status` and its configured stores.
+2. Use `redacto_scan`, `redacto_trace` and `redacto_plan` to assess the request.
+3. Review uncertain items through the operator CLI. Approve the exact plan:
+
+   ```powershell
+   redacto approve --profile "C:\path\to\profile.json" --plan-id PLAN_ID --ref "operator-ticket"
+   ```
+
+4. Supply that approval reference, version and single-use token to `redacto_apply`.
+5. Use `redacto_verify` for a signed scoped receipt. Inspect remaining review items,
+   residual findings and unavailable stores.
+
+MCP exposes eight tools: status, scan, trace, plan, apply, verify, tombstones and
+quarantine. Approval and item review remain operator actions. A client with shell
+access can run the operator CLI; this is not OS-level role isolation.
+
+## Integration
+
+Add `--managed-memory` at setup to create owned SQLite memory/cache and JSONL
+stores. `WorkspaceClient(profile)` guards application writes and reads, and
+records instrumented lineage when sources are supplied. External Chroma and Redis
+adapters are optional. Other databases require explicit integration.
+
+[Setup and connectivity](docs/workspace-setup.md) ·
+[Compatibility and limits](docs/compatibility.md) ·
+[Architecture](docs/architecture.md) · [Semantic discovery](docs/semantic-discovery.md) ·
+[Key rotation](docs/key-rotation.md) · [Threat model](docs/threat-model.md)
+
+## Development
 
 ```powershell
 uv sync --frozen --extra dev --extra chroma --extra redis --python 3.12
 uv run --no-sync python -m pytest -q
-uv run --no-sync python -m redacto benchmark --out var/benchmark.json
+uv run --no-sync python tests/run_benchmark.py --out var/benchmark.json
+uv run --no-sync python scripts/profile_smoke.py
+uv run --no-sync python scripts/mcp_http_smoke.py
 ```
 
-The 400-record benchmark creates temporary stores and does not use your configured
-data. See [reference application](docs/reference-application.md) for a persistent
-Chroma/SQLite integration and [compatibility](docs/compatibility.md) for scope.
-
-```powershell
-# 1. Environment (Python 3.12+, uv)
-uv venv --python 3.12 .venv
-uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
-
-# 2. Seed the synthetic workspace + provenance graph (refuses to overwrite real data)
-.venv\Scripts\python.exe -m redacto seed
-
-# 3. Test suite
-.venv\Scripts\python.exe -m pytest
-
-# 4. The full 90–120 second demo (seeds, plans, approves, applies, verifies)
-.venv\Scripts\python.exe -m redacto demo
-```
-
-On Linux/macOS use `.venv/bin/python` in place of `.venv\Scripts\python.exe`.
-
-The demo runs in a fresh temp workspace and never touches your configured stores
-(`--use-configured` opts in). It writes `demo_receipt.json`, `demo_receipt.md` and
-`demo_report.html` (the read-only report described below) next to the demo's graph DB and
-prints the path (`var/` with `--use-configured`).
-
-A narrated, motion-designed walkthrough of the same story (about 4.5 minutes, 1080p) is
-built from [demo-video/](demo-video/README.md): the script, the scenes and the render pipeline
-are all in the repo, so the video can be regenerated after any change.
-
-`seed` refuses with `seed_would_destroy_data` when the workspace holds files it did not
-create, the memory store has extra tables, or the graph has tombstones or revocation
-history. `seed --force` overrides that. It writes the memory store to
-`REDACTO_SQLITE_PATH` and `expected_results.json` next to the graph DB.
-
-Settings come from `REDACTO_*` environment variables. A `.env` file in the working
-directory (copy `.env.example`) is read at startup; real environment variables win.
-
-### Using your own workspace
-
-No seed or ingest step is needed: point the `REDACTO_*` paths at your stores and plan
-against a record id (`fs:<relative path>`, `mem:<id>`, `cache:<id>`, `log:<event_id>`,
-`vec:<chunk id>`). An id that is not in the graph yet is looked up in the stores.
-
-| Store | Format Redacto reads |
-|---|---|
-| Filesystem | `.md` / `.txt` files under `REDACTO_WORKSPACE_ROOT` |
-| SQLite | tables `memories` and/or `response_cache`, each with an `id` column; every column is scanned. Other tables are searched read-only: a copy there is an `UNREACHABLE` plan item and a residual in the receipt, never modified. |
-| JSONL log | one JSON object per line; `event_id` is the id (a keyed line hash when absent) |
-| Vector fixture | `{"chunks": [{"id": ..., "text": ..., "metadata": {...}}, ...]}` |
-
-Review items are approved with `review-item` before or after apply; an approved item
-bumps the plan version, so approve the plan again and re-run apply.
-
-### Other commands
-
-```powershell
-python -m redacto status
-python -m redacto trace  --source-id "fs:acquisition-plan.md"
-python -m redacto scan   --target-id "fs:acquisition-plan.md"
-python -m redacto plan   --target-id "fs:acquisition-plan.md"
-# fact/secret: the value comes from stdin or an env var, never the command line
-python -m redacto plan   --target-id "fs:eng-notes.md" --kind secret --text-env LEAKED_KEY
-python -m redacto approve --plan-id <PLAN_ID> --ref "operator approval"
-python -m redacto review-item --plan-id <PLAN_ID> --item-id <ITEM_ID> --decision approved|rejected --reviewer "reviewer-id"
-python -m redacto cancel --plan-id <PLAN_ID> --reason "operator stopped"
-python -m redacto apply  --plan-id <PLAN_ID> --version 1 --ref "operator approval" --token <TOKEN> [--dry-run | --no-dry-run]
-# without a flag, apply follows REDACTO_DRY_RUN, exactly like MCP redacto_apply
-python -m redacto verify --request-id <REQUEST_ID> --out var\receipt.json --markdown var\receipt.md
-python -m redacto tombstones                       # active tombstones, no content
-python -m redacto ingest                           # re-run the guard over configured stores
-python -m redacto quarantine                       # records held for review
-python -m redacto resolve-quarantine --id <ID> --decision approved|rejected \
-  --reviewer "reviewer-id" --note "why"
-python -m redacto keyring                          # key versions + rotation safety
-python -m redacto calibrate-embeddings             # FP / missed-paraphrase metrics
-python -m redacto evaluate                         # metrics; run after `seed` on a pristine fixture
-python -m redacto report [--request-id <REQUEST_ID>] [--out var\report.html]   # HTML report; default: latest request
-python -m redacto clean-temps [--delete]           # temp copies left by an interrupted rewrite
-python -m redacto serve  --transport stdio   # or: --transport http
-```
-
-## Compatibility
-
-**MCP clients.** Redacto speaks standard MCP over stdio and Streamable HTTP, so any MCP
-client can use it, whatever language the client is written in: Claude Code, Claude
-Desktop, the Python and TypeScript MCP SDKs, and other MCP-capable agents. Tested here:
-the Python MCP SDK client (stdio and HTTP) and Claude Code.
-
-**Your project's language does not matter.** Redacto does not read source code. It reads
-the context an agent keeps, wherever the project lives:
-
-| Scanned | Not scanned |
-|---|---|
-| `.md`, `.txt`, `.rst` files under `REDACTO_WORKSPACE_ROOT` | Source files (`.py`, `.js`, `.go`, ...), `.env`, `.json` and other suffixes. `status` lists them so the gap is visible |
-| SQLite `memories` / `response_cache` tables (other tables read-only) | Other databases (Postgres, MySQL, ...) |
-| A JSONL log, a JSON vector fixture, Chroma collections, Redis keys | Other vector stores and caches |
-
-So a Python backend, a Node app or a Go service all work the same way: point the
-`REDACTO_*` paths at the agent's notes, memory DB, logs and index for that project.
-Redacto itself runs on Python 3.12+ and is installed from this repo, not into the
-project it protects.
-
-**Natural language.** Exact and normalized matching is Unicode-aware, so copies and
-secrets are found in any language. Paraphrase signals (capitalised anchors, 5-word
-shingles) are tuned for English and other space-separated languages; for Chinese or
-Japanese text, expect paraphrases to be missed more often.
-
-## MCP tools
-
-| Tool | Destructive? | Purpose |
-|---|---|---|
-| `redacto_status` | no | Adapter health, configured scope, model availability, safety mode |
-| `redacto_scan` | no | Candidates with evidence class, redacted reasons, coverage gaps |
-| `redacto_trace` | no | Confirmed descendants vs weak exposure vs candidate relationships |
-| `redacto_plan` | no | Draft plan with per-record actions, risks, estimated impact |
-| `redacto_apply` | **yes** | Executes an approved plan version; requires an application-issued token |
-| `redacto_verify` | no | Rescans in-scope stores and writes a scoped receipt |
-| `redacto_tombstones` | no | Active tombstones: scope, policy, status (no content, no fingerprints) |
-| `redacto_quarantine` | no | Records held by the ingestion guard for human review |
-
-There is deliberately **no approve tool and no quarantine-resolution tool**.
-Both are application actions (`redacto approve`, `redacto resolve-quarantine`),
-so an agent can neither authorize its own deletion nor admit a record it was
-warned about. Quarantine approval rechecks the guard at resolution time.
-
-### Client configuration
-
-stdio (any MCP client that supports a local process):
-
-```json
-{
-  "mcpServers": {
-    "redacto": {
-      "command": "redacto-stdio",
-      "cwd": "C:\\path\\to\\Redacto",
-      "env": {
-        "REDACTO_WORKSPACE_ROOT": "C:\\path\\to\\Redacto\\fixtures\\workspace",
-        "REDACTO_DB_PATH": "C:\\path\\to\\Redacto\\var\\redacto.sqlite3",
-        "REDACTO_SQLITE_PATH": "C:\\path\\to\\Redacto\\fixtures\\workspace\\agent_memory.sqlite3",
-        "REDACTO_JSONL_PATH": "C:\\path\\to\\Redacto\\fixtures\\workspace\\agent_events.jsonl",
-        "REDACTO_VECTOR_PATH": "C:\\path\\to\\Redacto\\fixtures\\workspace\\vector_chunks.json"
-      }
-    }
-  }
-}
-```
-
-`cwd` and the `REDACTO_*` paths matter: without them the server resolves defaults
-relative to whatever folder the client launches it from and sees no stores. Replace
-`C:\path\to\Redacto` with the actual clone path. If `redacto-stdio` is not on the
-client's PATH, use the absolute interpreter path plus `-m redacto.mcp.stdio_server`
-and keep the same `cwd`/`env`.
-
-The repo also ships a Claude Code style plugin layout: `.claude-plugin/plugin.json`
-plus `.mcp.json`. The MCP entry uses `${CLAUDE_PLUGIN_ROOT}` for every store path and
-`uv run --project`, so it does not depend on the shell's working directory. `uv` must
-be installed. `cwd` is deliberately absent: it is not a supported stdio MCP field.
-The graph database and every store live under `${CLAUDE_PLUGIN_DATA}`, never in the
-plugin's shipped fixtures, so an apply cannot edit files inside the plugin. On first
-launch the demo workspace is seeded there (`REDACTO_DEMO_SEED_IF_MISSING=true`); point the
-`REDACTO_*` store paths at your own data for real use.
-This layout is **not verified against Alan's plugin format**; for Alan, register the
-connector manually with the stdio or HTTP configuration above.
-
-Streamable HTTP (for connectors that expect a URL). A bearer token is mandatory:
-
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(32))"   # set REDACTO_HTTP_TOKEN
-$env:REDACTO_HTTP_TOKEN = "<token>"
-$env:REDACTO_HTTP_HOST  = "127.0.0.1"
-$env:REDACTO_HTTP_PORT  = "8765"
-.venv\Scripts\python.exe -m redacto.cli serve --transport http
-```
-
-Endpoint: `http://127.0.0.1:8765/mcp`, header `Authorization: Bearer <token>`.
-The server refuses to start without `REDACTO_HTTP_TOKEN` and binds localhost by
-default. Do not expose it publicly.
-
-## Tested transports (exact)
-
-| Check | Command | Result |
-|---|---|---|
-| stdio, real MCP client session | `.venv\Scripts\python.exe scripts\mcp_smoke.py` | PASS — discovers all 8 tools, `redacto_status` returns adapter health |
-| stdio, full cycle in pytest | `.venv\Scripts\python.exe -m pytest tests/test_mcp_tools.py` | PASS — scan → plan → denied self-approval → approved apply → verify |
-| Streamable HTTP + bearer auth | `.venv\Scripts\python.exe scripts\mcp_http_smoke.py` | PASS — 401 without token, discovery + status with token |
-
-SDK: `mcp` 2.3.0 (`mcp.server.mcpserver.MCPServer`; the 2.x rename from FastMCP).
-Tool logic is transport-independent, so both entry points share the same engine.
-
-## Alan integration status
-
-**Partial / blocked at the platform gate, not at the code gate.**
-
-- This implementation was executed by the local coding-agent harness in this
-  session against the real repository, with real test runs.
-- The Alan desktop gate from the brief ("No agent CLIs detected") is **not resolved
-  from here**: a PATH scan found only `aider` among common agent CLIs
-  (`claude`, `codex`, `cursor-agent`, `droid`, `opencode`, `gemini`, `qwen`, `kimi`,
-  `amp` are absent). Enabling a CLI in Alan Settings → Computers is a user action.
-- The repo now contains a working MCP server and two verified transports. The
-  remaining Alan step is registering a connector:
-  - if Settings → Plugins → MCP → *Add custom connector* expects a URL, use
-    Streamable HTTP with the bearer token above;
-  - if the selected local agent supports stdio, add the stdio command above.
-- No assumption is made that an Alan-managed model (DeepSeek, GLM, Qwen, Kimi,
-  Nemotron, …) is callable as an inference API by an external process. Runtime
-  assessment requires an explicitly configured OpenAI-compatible endpoint or local
-  Ollama; otherwise the deterministic path runs and candidates stay unassessed.
-
-## Real stores: Chroma and Redis
-
-Beyond the four local adapters, Redacto can reach a real vector database and a real cache.
-Each joins the scope only when configured, and only for what you list:
-
-| Store | Install | Configure | What Redacto does |
-|---|---|---|---|
-| Chroma (persistent) | `pip install 'redacto[chroma]'` | `REDACTO_CHROMA_PATH`, `REDACTO_CHROMA_COLLECTIONS` | Scans each item's document and metadata. A match is `INVALIDATE_INDEX`, which deletes the item and its embedding after re-checking its content. |
-| Redis cache | `pip install 'redacto[redis]'` | `REDACTO_REDIS_URL`, `REDACTO_REDIS_KEY_PATTERNS` | Scans string (JSON-aware), hash and list keys that match the patterns. A match is `INVALIDATE_CACHE`, deleted under `WATCH`/`MULTI`, so a concurrent change aborts it. |
-
-A fact or secret that is only a small part of an index entry or cached answer invalidates it
-too: both are derived data the system rebuilds, and an embedding keeps the value even if
-the text were edited. Tests run against a real Chroma database and fakeredis; set
-`REDACTO_TEST_REDIS_URL` to run them against a Redis server.
-
-## Regenerating derivatives from allowed sources
-
-A summary or memory built from several sources does not have to be lost when one source
-is revoked. With `REDACTO_REGENERATE=true` and a model configured (`REDACTO_MODEL_*`, a
-local Ollama for example), a confirmed derivative whose other parents are not being revoked
-becomes `REGENERATE_FROM_ALLOWED_SOURCES`:
-
-1. The plan lists the allowed sources for the item, and the plan hash binds them.
-2. At apply, only those sources are sent to the model. The revoked source never is.
-3. The rewrite is checked against the revoked target's keyed material (fingerprint,
-   shingles, anchors and embedding). Anything that resembles the target is refused and
-   nothing is written; the plan ends `PARTIAL`.
-   A separate grounding gate requires every output sentence to occur in an allowed
-   source and at least 25% distinct-word retention from each source. Unsupported
-   paraphrases are refused too; this is deliberately conservative.
-4. The record keeps its id; its old lineage is marked revoked and a `REGENERATED_FROM`
-   edge is recorded. Verify re-checks the rewrite.
-
-Fact and secret revocations never regenerate, because a model could write the value back.
-`REDACTO_MODEL_PROVIDER=extractive` selects a deterministic generator that retains all
-allowed source text without a network call. The reference application uses this mode.
-A live run with `llama3` rewrote the fixture summary from the remaining board minutes
-and passed the leak check.
-
-## Report and model evaluation
-
-`redacto report --request-id <id>` writes one self-contained HTML page: store health,
-a lineage drawing (confirmed, exposure-only and candidate edges in distinct styles), the plan
-preview with filters, the execution timeline and the receipt. It holds ids, counts and
-redacted reasons only.
-
-Model-assisted discovery was run against a local Ollama `llama3` (8B): 6/6 schema-valid
-answers and no change to any approved action. It flagged one unrelated note for review.
-Details and the opt-in live test are in [docs/model-evaluation.md](docs/model-evaluation.md).
-
-## Architecture
-
-Short version: one engine, two transports, four scoped adapters, one SQLite graph.
-Full diagrams (component flow, ER model, revocation sequence) are in
-[docs/architecture.md](docs/architecture.md).
-
-- **Adapters**: filesystem (markdown/text under a configured root), SQLite agent
-  memories **and** response cache (approved tables only), JSONL logs, and a local
-  vector-index fixture. Each declares capabilities (scan/delete/redact/invalidate/verify).
-- **Graph semantics**: `DERIVED_FROM`, `EXTRACTED_FROM`, `SUMMARIZED_FROM`,
-  `INDEXED_AS`, `CACHED_AS`, `REGENERATED_FROM` can be confirmed by policy
-  (instrumented / imported metadata / human verified). `READ_FROM` is **exposure
-  only** and never authorizes deletion by itself. Model output creates
-  `candidate_edges` only.
-- **Evidence classes**: `DIRECT_MATCH`, `CONFIRMED_DESCENDANT`,
-  `SUSPECTED_DERIVATIVE`, `RELATED_NONDISCLOSING`, `UNKNOWN`.
-- **Plan lifecycle**: `READY_FOR_APPROVAL → APPROVED → EXECUTING → VERIFYING →
-  VERIFIED_WITHIN_SCOPE`, with `PARTIAL`, `NEEDS_REVIEW`, `FAILED` used honestly.
-- **Lineage hook**: `Engine.record_lineage` is internal-only. Instrumented, imported
-  or human-verified evidence can confirm an edge; model/heuristic claims become
-  candidates. It is not exposed as an MCP tool.
-- **Plan states**: `READY_FOR_APPROVAL -> APPROVED -> EXECUTING -> VERIFYING` then
-  `VERIFIED_WITHIN_SCOPE`, `PARTIAL` or `NEEDS_REVIEW`. `EXECUTING` is set before the
-  first mutation. `CANCELLED` is available before execution and cannot be applied.
-  `FAILED` is set when every approved action fails; a FAILED plan can be re-approved
-  and retried, with failed action rows cleared for a safe retry. There is no editable
-  `DRAFT` stage.
-- **Recovery**: a crashed `EXECUTING` plan can be re-approved with a new single-use
-  token; completed actions are skipped by idempotency.
-- **Item review**: `review-item` is an application action. Approving rewrites the item
-  to a concrete adapter action and bumps the plan version, so a fresh token is needed.
-  Rejecting leaves the item unapproved. Both decisions are audited.
-- **Action vocabulary**: `DELETE_RECORD`, `REDACT_SPAN`, `INVALIDATE_INDEX`,
-  `INVALIDATE_CACHE`, `REVIEW_REQUIRED`, `SKIP_PRESERVE`, `UNREACHABLE` are exercised.
-  `REDACT_SPAN` is supported by the filesystem, SQLite and JSONL adapters; vector chunks are
-  invalidated instead, because their embedding would outlive a text edit.
-  `REGENERATE_FROM_ALLOWED_SOURCES` rewrites a file or memory from its remaining sources
-  (see below).
-- **Node types**: stored records map to `MEMORY`, `LOG_RECORD`, `INDEX_ENTRY`,
-  `CACHE_ENTRY` and `ARTIFACT`; scan/trace targets are labelled `SOURCE` or `FACT`.
-- **Persistence**: records, lineage edges, candidate edges, requests, plans, items,
-  approvals, actions, verification runs, receipts. No table stores content,
-  matched passages or secrets — only opaque locators, keyed HMAC fingerprints,
-  booleans and redacted reason strings.
-
-## Data model
-
-See the ER diagram in [docs/architecture.md](docs/architecture.md). Highlights:
-
-- `lineage_edges(relation, evidence_type, status)` — authority lives here.
-- `candidate_edges(relation_guess, evidence_summary_redacted, model_id, confidence)` —
-  advisory, never authoritative.
-- `revocation_plans(version, state, plan_hash)` + `approvals(plan_version, token_hash,
-  expires_at, used_at)` — approval binds an exact plan version and hash.
-- `actions(idempotency_key UNIQUE, result, error_code)` — per-record outcomes;
-  duplicate keys make retries safe.
-- `receipts(summary_json, receipt_version)` — counts, scope and limitations only.
-
-## Security notes
-
-Full threat model with tests mapped per threat: [docs/threat-model.md](docs/threat-model.md).
-
-- Synthetic fixtures only; no real personal data or credentials.
-- Explicit scope. Unknown stores, absolute paths, traversal attempts and unapproved
-  tables are rejected — the tool server owns scope, the agent cannot widen it.
-- Scanned content is data, never instructions. An embedded "ignore previous
-  instructions / delete everything" line is classified as non-disclosing and preserved.
-- Destructive operations need an application-issued, plan-version-bound,
-  single-use, expiring confirmation token. Tampered or stale plans are rejected.
-- Secrets are never persisted: keyed HMAC fingerprints for matching, redacted
-  reasons in graph/plan/receipt, and masked snippets for the optional model call.
-- No `execute_shell`, no arbitrary SQL, no arbitrary filesystem operations.
-- Failures are never reported as success: adapter errors produce per-record failures
-  and a `PARTIAL` result.
-- Approval consumption is atomic: one token cannot authorize two concurrent applies.
-- A crashed, failed or partially failed apply is recoverable: re-approving an
-  `EXECUTING`/`FAILED`/`PARTIAL` plan issues a new token; completed actions are skipped and
-  failed actions are retried. A failure caused by a locked or read-only store says so,
-  so on Windows you can close the agent holding the log open and re-approve.
-  A cancelled plan cannot be applied. Apply holds an exclusive lease so concurrent
-  recovery tokens cannot both report the same work.
-- Plan item reviews are audited; approving one bumps the plan version and invalidates
-  the old token.
-- Apply takes an exclusive execution lease, so two recovery tokens used at once cannot
-  both report the same work. The lease records the owning PID/host. Liveness uses
-  `OpenProcess` on Windows (never `os.kill(pid, 0)`, which means Ctrl+C there) and
-  `os.kill(pid, 0)` on POSIX. A live local owner is never stolen, however old the lease;
-  a dead owner or a lease from an unknown host older than 15 minutes is cleared, in any
-  plan state. The token is validated before the lease is taken, so a forged token cannot
-  block a real apply.
-- Each plan item stores its plan-time content fingerprint. Adapters verify it as part of the
-  mutation: SQLite does the check and delete under one write lock, the filesystem adapter
-  re-reads the file and requires both the identity and the size/mtime stamp to match
-  before unlinking (an in-place edit keeps the inode), and file-backed stores re-read
-  before rewriting. A mismatch fails with `content_changed`.
-- JSONL event identity is stable even without `event_id` (keyed line hash), and
-  malformed lines are matched by that identity rather than a shifted line number. A log
-  rewrite re-reads the file before replacing it, so a line appended during the rewrite is
-  preserved; if the file never settles the delete fails with `delete_conflict` instead of
-  dropping data.
-- Record-cap truncation is reported in scan coverage and verification; absence is not
-  claimed for unscanned records.
-- SQLite deletes set `PRAGMA secure_delete=ON` and attempt a WAL truncate checkpoint.
-  Files are unlinked, not overwritten, and JSONL/vector rewrites keep the original mode
-  and LF line endings. A rewrite that fails removes its temp file. Leftover temp copies
-  (`.<store>.redacto-*.tmp`, or `tmp*.tmp` from older versions) are listed by `status` and
-  counted as residuals by `verify` until you delete them.
-- Files under a configured root with other extensions are not scanned; `redacto_status`
-  reports them per adapter so the gap is visible.
-- Tombstones retain keyed HMAC fingerprints, derived anchors and an embedding vector.
-  Their storage must be protected: embeddings are sensitive derived data and are
-  not guaranteed to be non-invertible. Ingestion enforces every active tombstone.
-- The ingestion guard fails closed: blocked records never reach the store or graph.
-  If an active tombstone needs a missing key version, every ingestion is blocked
-  (`key_unavailable_fail_closed`) and `redacto_status` reports degraded protection.
-- Quarantine is a pointer, not a copy. Approval re-reads the record from its store,
-  rechecks tombstones and policy, records the recheck, and only then admits it.
-  Rejection preserves the decision without admitting anything.
-- Embeddings are a risk signal, never proof. They can only quarantine; a high score
-  never authorizes deletion or confirms lineage.
-- Records larger than `REDACTO_MAX_RECORD_BYTES` (default 1 MB) are skipped before
-  matching and reported, so oversized input cannot enter the graph or model path.
-- HTTP mode requires a bearer token and refuses to start without one.
-
-## Measured results
-
-Current executed results and reproduction commands are in
-[docs/audit-remediation.md](docs/audit-remediation.md). Machine-readable benchmark,
-reference-application and scale results are checked into [benchmarks/](benchmarks/).
-
-Covering: graph traversal and `READ_FROM` semantics, normalized exact matching,
-short-secret bounds, entity heuristics, model invalid-JSON/timeout →
-`unassessed`, policy mapping, plan hashing, approval rejection (unapproved, stale
-version, tampered plan), dry run, per-record outcomes, idempotent re-apply,
-adapter failure and disappearing stores, unreachable-store reporting, receipt
-redaction, scope enforcement, traversal rejection, SQL table rejection, embedded
-instruction containment, secret non-persistence, HTTP auth, and re-ingestion
-protection, store-write blocking, quarantine approval/rejection and rechecks,
-key-ring rotation and fail-closed behaviour, and embedding calibration with
-measured false positives and missed paraphrases.
-
-### Fixture evaluation (`redacto evaluate`)
-
-The spec asks for counts rather than one accuracy score:
-
-| Metric | Result |
-|---|---|
-| Direct-match precision / recall | 1.0 / 1.0 (2 TP, 0 FP, 0 FN) |
-| Confirmed-descendant coverage | 5 / 5 (1.0) |
-| Semantic candidate precision / recall | 1.0 / 1.0 (2 TP, 0 FP, 0 FN) |
-| Preserved-related recall | 4 / 4 (1.0) |
-| Unrelated records touched | 0 |
-| Destructive actions blocked by policy | 2 |
-| Model JSON-schema validity | not measured while the model provider is disabled |
-
-These are fixture-level engineering targets, not production accuracy claims.
-
-### Collateral risk controls
-
-- **Blast radius:** every plan item carries `size_bytes`, `matched_bytes`,
-  `match_ratio`, `match_kind`, `partial_match` and a `collateral_note`. Approved
-  actions whose match covers less than 34% of the record are marked `risk: high`.
-- **Partial matches:** a fact/secret found as a substring covering less than half of a
-  record is `REVIEW_REQUIRED`. At or above half, the normal delete path still applies,
-  so a leaked key that dominates its record is removable. Reviewers can approve or
-  reject a review item with `review-item`; approval bumps the plan version and requires
-  a new token.
-- **Buried verbatim copies:** source-mode scans compare 8-word shingles against the
-  target. A record quoting a target passage inside other notes becomes
-  `SUSPECTED_DERIVATIVE` for review, never `RELATED_NONDISCLOSING`.
-- **Distinctive amounts/dates:** a record that shares a numeric amount or date with the
-  target (score >= 4 on weighted anchors) is `SUSPECTED_DERIVATIVE` for review, so a
-  reworded price+closing-date note is never labelled harmless.
-- **Small mentions go to review:** a short secret inside a large record is held for review
-  rather than deleting the whole file. Verification honestly reports `PARTIAL` until a
-  reviewer resolves it with `review-item`, and `review-item` is accepted even after the
-  plan has applied its other items.
-- **Redaction and regeneration:** a secret that is a small part of a file, memory row or
-  log event is redacted in place; a derivative with other sources can be regenerated from
-  them. A timed undo/trash window is still missing.
-
-### Embedding calibration (synthetic labelled set)
-
-Thresholds are chosen from measurement, not guesswork. On the labelled synthetic
-set (5 paraphrases, 5 unrelated/related-non-disclosing records):
-
-| Threshold | False positives | Missed paraphrases |
-|---|---|---|
-| 0.25 (candidate generation) | 0 / 5 | 0 / 5 |
-| 0.30 (ingestion quarantine) | 0 / 5 | 0 / 5 |
-| 0.01 (deliberately low) | 5 / 5 | 0 / 5 |
-| 0.60 (deliberately high) | 0 / 5 | 5 / 5 |
-
-Observed scores: paraphrases 0.31?0.40, negatives ? 0.17. The local provider is a
-deterministic lexical-semantic embedding (number-word normalization plus a small
-domain concept map), not a neural model; `redacto calibrate-embeddings` reproduces
-these numbers.
-
-### Re-ingestion attack matrix (test-suite counts)
-
-The suite exercises **9 scenarios: 6 blocked, 2 quarantined, 1 allowed**.
-
-| # | Scenario | Expected decision | Reason code |
-|---|---|---|---|
-| 1 | Restore the original file | blocked | `same_target` |
-| 2 | Restore under a new filename | blocked | `exact_fingerprint` |
-| 3 | Replay an old JSONL event with a new id | blocked | `exact_fingerprint` |
-| 4 | Replay with the original event id | blocked | `revoked_record_id` |
-| 5 | Rebuild a vector chunk with copied text | blocked | `exact_derivative_fingerprint` |
-| 6 | Rebuild a vector chunk with edited wording | blocked | `partial_copy` |
-| 7 | Reintroduce a paraphrase with shared anchors | quarantined | `anchor_overlap` |
-| 8 | Reintroduce a paraphrase with no shared anchors | quarantined | `embedding_similarity` |
-| 9 | Introduce an unrelated record | allowed | `no_match` |
-
-The demo's step `[8]` runs a **2-scenario subset** of that matrix (restored file +
-no-anchor paraphrase) across two stores, so its line reads `1 blocked, 1 quarantined,
-5 allowed`. Those `5 allowed` are other records in those stores, not additional
-attack scenarios. The demo prints this distinction explicitly; the suite totals are
-`6 blocked, 2 quarantined, 1 allowed` across 9 scenarios.
-
-Demo (`python -m redacto demo`) on the seeded fixture:
-
-| Metric | Result |
-|---|---|
-| Records seeded | 18 |
-| Confirmed descendants traversed | 5 / 5 |
-| Direct matches found | 2 (`fs:acquisition-plan.md`, `log:evt-dup-1`) |
-| Approved actions executed | 7 (5 deletes, 2 invalidations) |
-| Failed actions | 0 |
-| Residual matches after verification | 0 in all 4 reachable stores |
-| Candidates held for review | 2 (paraphrases with no lineage) |
-| Embedding calibration (0.30) | 0 false positives, 0 missed paraphrases on 10 labelled examples |
-| Preserved related records | 4 (incl. the file containing an embedded delete instruction) |
-| Unrelated records touched | 0 |
-| Final status | `NEEDS_REVIEW` (candidates pending) — receipt states scope explicitly |
-
-## Limitations
-
-- **Not universal erasure.** Backups, replicas, provider logs, caches and model
-  weights are out of reach; the receipt says so. Deleted files are unlinked rather than
-  overwritten, and SQLite physical removal can be delayed by another open WAL writer.
-- **Asking an agent to forget a secret by pasting it adds a copy** to that agent's model
-  provider conversation. Redacto cannot revoke provider-side chat history; use a managed
-  secret reference instead of pasting the value.
-- Verification detects planned record IDs and exact/normalized whole-target copies.
-  Paraphrased remnants in unlinked stores may survive undetected.
-- Re-ingestion protects exact and near copies and now quarantines embedding-similar
-  paraphrases, but a paraphrase that scores below the calibrated threshold can still
-  enter. The local embedding is lexical-semantic, not a production neural model.
-- Embedding thresholds are calibrated on a small synthetic set, not real data; a
-  production deployment must recalibrate on its own labelled examples.
-- Key rotation keeps old versions enforceable, but removing a version that active
-  tombstones still reference blocks ingestion until the key is restored. That is
-  deliberate fail-closed behaviour, not silent degradation.
-- Quarantine approval is a human/application action; approving an uncertain record
-  overrides uncertainty, but can never override a hard tombstone block.
-- Model assessment is unbenchmarked in this MVP and advisory only.
-- No editable `DRAFT` plan stage. `CANCELLED` is available before execution,
-  `FAILED` when every approved action fails (and is retryable), and `PARTIAL` when only
-  some actions fail.
-- `find_exact` is implemented centrally in discovery rather than per adapter.
-- A spaced or rewritten form of a secret, or one inside a record over 256 KB, cannot be
-  cut out precisely and still goes to review. There is no undo/trash window yet.
-- Regeneration must pass leak, extractive-grounding and per-source retention checks.
-  These conservative checks reject unsupported paraphrases; they do not establish
-  that every useful fact was retained or that allowed sources themselves are correct.
-- The Chroma adapter checks content and deletes in two calls (Chroma has no
-  transactions); it re-reads right before the delete and confirms the item is gone.
-- Two revocation modes exist in code; both are tested. Fact/secret revocation deletes
-  records containing the value (the anchor is preserved), and verification searches for
-  the value's tokens and normalized windows, including glued forms. Source/fact
-  verification also flags suspected semantic residuals separately. Neither check
-  proves absence of transformed or paraphrased disclosures.
-- JSON receipts carry an HMAC integrity signature. `redacto check-receipt <path>`
-  detects edits with the original keyring; it does not prove physical overwrite or
-  resist an attacker who can replace both receipts and signing keys.
-
-## Repository layout
-
-```text
-src/redacto/
-  config.py  fixtures.py  engine.py  status.py  receipts.py  errors.py  cli.py  process.py
-  graph/       schema.py repository.py traversal.py
-  discovery/   normalization.py exact.py relationship_assessor.py embeddings.py
-  ingestion.py  (tombstone guard, quarantine decisions, fail-closed keys)
-  evaluation.py (fixture precision/recall and policy counts)
-  policy/      classify.py plan.py authorization.py
-  adapters/    base.py registry.py filesystem.py sqlite_store.py jsonl_logs.py vector_fixture.py
-  mcp/         server.py stdio_server.py http_server.py
-skills/redacto/SKILL.md
-.claude-plugin/plugin.json
-.mcp.json
-.github/workflows/ci.yml
-scripts/       mcp_smoke.py mcp_http_smoke.py
-fixtures/      workspace/ expected_results.json
-tests/         test_graph.py test_discovery.py test_policy.py test_execution.py
-               test_verification.py test_security.py test_mcp_tools.py test_transport.py
-               test_tombstones.py test_quarantine.py test_key_rotation.py test_embeddings.py
-               test_evaluation.py test_jsonl.py test_hardening_collateral.py
-               test_recovery_and_review.py test_packaging.py test_trace_completeness.py
-               test_windows_and_lease.py
-docs/          architecture.md threat-model.md demo-script.md key-rotation.md
-               spec-compliance.md
-```
-
-## Spec compliance
-
-A section-by-section audit against `REDACTO_SPEC.md`, including deviations and
-evidence, is in [docs/spec-compliance.md](docs/spec-compliance.md). The headline:
-all P0 requirements are implemented; the remaining deviations are an editable draft
-plan stage, per-adapter `find_exact`, an undo/trash window, and Alan connector
-registration.
-
-## Remaining product work
-
-The adversarial corpus exposes remaining recall and semantic-residual misses.
-Independent annotations, a neural/multilingual provider evaluated against a separate
-corpus, and production workload measurements are still required. The local reference
-application demonstrates one complete integration; it does not protect arbitrary direct
-writers, hosted stores, replicas or provider transcripts. Production identity/roles and
-external immutable audit storage remain deployment work. See the audit remediation
-document for the boundary between implemented fixes and remaining evidence gaps.
+Synthetic regression data and labelled evaluations live under `tests/` and are
+excluded from the runtime wheel. CI defines Linux/Windows/macOS checks on Python
+3.12/3.14. A configured workflow is not evidence that every named client has been
+manually tested.
+
+Redacto does not unlearn model weights or erase inaccessible stores, provider
+transcripts, replicas or backups. Semantic similarity is advisory. Scoped receipts
+do not prove universal or semantic absence; inspect coverage and residual findings.

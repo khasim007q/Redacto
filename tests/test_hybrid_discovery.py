@@ -14,7 +14,7 @@ from redacto.discovery.embeddings import (
 )
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 from redacto.ingestion import TombstoneGuard, TombstoneMaterial
 
 NEURAL_ID = "sentence-transformers:synthetic/test@revision:chunk-mean-v1"
@@ -102,6 +102,7 @@ def test_hybrid_configuration_validates_thresholds(tmp_path, monkeypatch):
     monkeypatch.setenv("REDACTO_EMBEDDING_PROVIDER", "hybrid")
     for name in ("REDACTO_EMBEDDING_CANDIDATE_THRESHOLD", "REDACTO_EMBEDDING_QUARANTINE_THRESHOLD"):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("REDACTO_WORKSPACE_ROOT", str(tmp_path))
     settings = load_settings()
     assert (settings.embedding_candidate_threshold, settings.embedding_quarantine_threshold) == (0.55, 0.60)
     assert (settings.embedding_lexical_candidate_threshold, settings.embedding_lexical_quarantine_threshold) == (0.25, 0.30)

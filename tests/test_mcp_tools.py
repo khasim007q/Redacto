@@ -18,7 +18,7 @@ from mcp.client.stdio import stdio_client
 
 from helpers import seeded_settings
 from redacto.engine import Engine
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 ROOT = Path(__file__).resolve().parents[1]
 

@@ -17,7 +17,7 @@ from conftest import approve_and_apply
 from helpers import seeded_settings
 from redacto.adapters.base import Record
 from redacto.engine import Engine
-from redacto.fixtures import (
+from test_support.fixtures import (
     ACQUISITION_PLAN,
     EVENTS,
     SOURCE_ID,

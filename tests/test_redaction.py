@@ -12,7 +12,7 @@ from helpers import seeded_settings
 from redacto.adapters.base import REDACTION_MARK, redact_spans
 from redacto.discovery.normalization import fingerprint
 from redacto.engine import Engine
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 SECRET = "sk-live-REDACT-0123456789abcdef"
 FILLER = " ".join(f"Useful handbook sentence number {n} about deployments." for n in range(60))

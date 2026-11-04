@@ -13,7 +13,7 @@ from conftest import approve_and_apply
 from helpers import seeded_settings
 from redacto.adapters.jsonl_logs import JsonlLogAdapter
 from redacto.engine import Engine
-from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID
+from test_support.fixtures import ACQUISITION_PLAN, SOURCE_ID
 
 
 def _records(path: Path):

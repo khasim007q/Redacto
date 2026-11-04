@@ -8,6 +8,7 @@ import os
 import secrets
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
 
 from redacto.errors import RedactoError
@@ -47,7 +48,7 @@ def _absolute(value) -> Path:
     return Path(value).expanduser().resolve()
 
 
-def profile_environment(path: Path) -> dict[str, str]:
+def profile_environment(path: Path, *, transport_env: dict[str, str] | None = None) -> dict[str, str]:
     """Resolve a complete scope without inheriting cwd .env or ambient overrides."""
     profile = _read_json(path)
     required = {"version", "workspace_root", "state_dir", "mode", "options"}
@@ -57,7 +58,7 @@ def profile_environment(path: Path) -> dict[str, str]:
     if state == root or state.is_relative_to(root):
         raise RedactoError("invalid_profile", "Private state must be outside the scanned workspace.")
     mode, options = profile["mode"], profile["options"]
-    if not isinstance(mode, str) or mode not in {"files", "managed", "demo"} or not isinstance(options, dict):
+    if not isinstance(mode, str) or mode not in {"files", "managed"} or not isinstance(options, dict):
         raise RedactoError("invalid_profile", "Unsupported workspace profile mode or options.")
     if set(options) - _OPTIONS or any(not isinstance(value, str) for value in options.values()):
         raise RedactoError("invalid_profile", "Profile options contain unknown settings or invalid values.")
@@ -69,11 +70,13 @@ def profile_environment(path: Path) -> dict[str, str]:
     ):
         raise RedactoError("invalid_profile", "Profile keys must contain at least 32 characters.")
     stores = ["filesystem"]
-    store_root = root if mode == "demo" else state / "stores"
-    if mode in {"managed", "demo"}:
+    store_root = state / "stores"
+    if mode == "managed":
         stores += ["sqlite_memory", "jsonl_logs"]
-    if mode == "demo":
-        stores.append("vector_fixture")
+    transport_env = os.environ if transport_env is None else transport_env
+    transport = {name: transport_env[name] for name in (
+        "REDACTO_HTTP_HOST", "REDACTO_HTTP_PORT", "REDACTO_HTTP_TOKEN",
+        "REDACTO_HTTP_ALLOWED_HOSTS", "REDACTO_HTTP_ALLOWED_ORIGINS") if name in transport_env}
     return {
         "REDACTO_WORKSPACE_ROOT": str(root),
         "REDACTO_DB_PATH": str(state / "redacto.sqlite3"),
@@ -87,6 +90,7 @@ def profile_environment(path: Path) -> dict[str, str]:
         "REDACTO_SAFETY_MODE": "review",
         "REDACTO_DRY_RUN": "true",
         **options,
+        **transport,
     }
 
 
@@ -104,19 +108,16 @@ def _write_json(path: Path, value: dict) -> None:
 
 
 def setup_workspace(workspace: Path, *, state_dir: Path | None = None,
-                    managed_memory: bool = False, demo: bool = False) -> dict:
+                    managed_memory: bool = False) -> dict:
     """Initialize only explicitly owned state; never seed ordinary user folders."""
     from redacto.config import load_settings
-    from redacto.fixtures import seed_workspace
 
     root = workspace.expanduser().resolve()
     digest = hashlib.sha256(os.path.normcase(str(root)).encode()).hexdigest()[:16]
     state = (state_dir or Path.home() / ".redacto" / "workspaces" / digest).expanduser().resolve()
     if state == root or state.is_relative_to(root):
         raise RedactoError("invalid_configuration", "Choose a private state directory outside the scanned folder.")
-    if managed_memory and demo:
-        raise RedactoError("invalid_configuration", "Choose either demo or managed memory.")
-    mode = "demo" if demo else "managed" if managed_memory else "files"
+    mode = "managed" if managed_memory else "files"
     profile = {"version": 1, "workspace_root": str(root), "state_dir": str(state), "mode": mode, "options": {}}
     path = state / "profile.json"
     try:
@@ -136,10 +137,8 @@ def setup_workspace(workspace: Path, *, state_dir: Path | None = None,
                     raise RedactoError("state_not_empty", "Choose a new private state directory; existing unowned data is not reused.")
                 if ownership.exists() and _read_json(ownership) != profile:
                     raise RedactoError("profile_conflict", "Incomplete setup belongs to a different workspace or mode.")
-                if not demo and not root.is_dir():
+                if not root.is_dir():
                     raise RedactoError("invalid_workspace", "The workspace folder must already exist.")
-                if demo and root.exists() and any(root.iterdir()):
-                    raise RedactoError("workspace_not_empty", "Demo setup requires a new or empty folder.")
                 state.mkdir(parents=True, exist_ok=True)
                 if os.name != "nt":
                     os.chmod(state, 0o700)
@@ -154,12 +153,10 @@ def setup_workspace(workspace: Path, *, state_dir: Path | None = None,
                 try:
                     settings = load_settings(pending)
                     settings.current_hmac_key
-                    if demo:
-                        seed_workspace(settings)
-                    elif managed_memory:
+                    if managed_memory:
                         stores = state / "stores"
                         stores.mkdir(exist_ok=True)
-                        with sqlite3.connect(settings.sqlite_store_path) as conn:
+                        with closing(sqlite3.connect(settings.sqlite_store_path)) as conn, conn:
                             for table in ("memories", "response_cache"):
                                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} "
                                              "(id TEXT PRIMARY KEY, content TEXT, created_at TEXT, sensitivity TEXT)")

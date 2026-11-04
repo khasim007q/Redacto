@@ -7,7 +7,7 @@ import pytest
 from conftest import approve_and_apply
 from redacto.adapters.base import AdapterError, REDACTION_MARK
 from redacto.engine import Engine
-from redacto.local import local_settings
+from test_support.local import local_settings
 from redacto.selective import passage_offer
 
 PRIVATE = 'The private flight named "Azure Finch" launches after confidential clearance on Tuesday morning.'

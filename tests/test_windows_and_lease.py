@@ -22,7 +22,7 @@ from redacto.adapters.filesystem import FilesystemAdapter
 from redacto.adapters.jsonl_logs import JsonlLogAdapter
 from redacto.discovery.normalization import fingerprint, normalize_loose
 from redacto.engine import Engine, contains_normalized
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 from redacto.process import pid_alive
 
 SECRET = "sk-synthetic-CONFIG-4b8e2d-NEVER-STORE"

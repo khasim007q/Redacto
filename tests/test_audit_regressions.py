@@ -14,7 +14,7 @@ from redacto.adapters.filesystem import FilesystemAdapter
 from redacto.adapters.jsonl_logs import JsonlLogAdapter
 from redacto.adapters.vector_fixture import VectorFixtureAdapter
 from redacto.discovery.normalization import fingerprint
-from redacto.fixtures import SOURCE_ID, ACQUISITION_PLAN
+from test_support.fixtures import SOURCE_ID, ACQUISITION_PLAN
 from redacto.ingestion import TombstoneGuard
 from redacto.regeneration import RegenerationError, validate_regeneration
 
@@ -259,7 +259,7 @@ def test_invalid_limits_and_safety_settings_fail_closed(engine, change):
 
 
 def test_seed_can_be_repeated_after_adapter_lock_sidecars_are_created(settings):
-    from redacto.fixtures import seed_workspace
+    from test_support.fixtures import seed_workspace
 
     result = seed_workspace(settings)
     assert result["records_seeded"] > 0

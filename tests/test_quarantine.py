@@ -12,7 +12,7 @@ from helpers import seeded_settings
 from redacto.adapters.base import Record
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 PARAPHRASE = "Kestrel deal was about $42 million, I believe."
 

@@ -13,7 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from redacto.config import Settings  # noqa: E402
-from redacto.fixtures import seed_workspace  # noqa: E402
+from test_support.fixtures import seed_workspace  # noqa: E402
 
 
 def make_settings(tmp_path: Path, **overrides: Any) -> Settings:

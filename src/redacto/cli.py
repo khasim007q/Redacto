@@ -1,4 +1,4 @@
-"""Local terminal application: seed, plan approval, demo and JSON tool access.
+"""Operator CLI for workspace configuration, review, approval and revocation.
 
 The CLI is the "application" in the approval model: it is what issues the
 short-lived confirmation token. The agent-facing MCP surface cannot do this.
@@ -9,14 +9,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sqlite3
 import sys
 from pathlib import Path
 
 from redacto.config import load_settings
 from redacto.engine import Engine
 from redacto.errors import HmacKeyError, RedactoError
-from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID, seed_workspace
 from redacto.receipts import to_json, to_markdown
 
 
@@ -42,8 +40,31 @@ def _engine(args: argparse.Namespace) -> Engine:
 def cmd_setup(args: argparse.Namespace) -> int:
     from redacto.profiles import setup_workspace
 
-    _print(setup_workspace(args.workspace, state_dir=args.state_dir,
-                           managed_memory=args.managed_memory, demo=args.demo))
+    result = setup_workspace(args.workspace, state_dir=args.state_dir, managed_memory=args.managed_memory)
+    if args.client != "generic" or args.config:
+        args.profile = Path(result["profile"])
+        result["connection"] = _connect(args)
+    _print(result)
+    return 0
+
+
+def _connect(args: argparse.Namespace) -> dict:
+    from redacto.connectivity import client_config, default_config_path, register
+
+    profile = getattr(args, "profile", None) or os.environ.get("REDACTO_PROFILE")
+    url = getattr(args, "url", None)
+    resolved = Path(profile).expanduser().resolve() if profile else None
+    config = client_config(profile=resolved, client=args.client, name=args.name, url=url,
+                           token_env=getattr(args, "token_env", "REDACTO_HTTP_TOKEN"))
+    if args.print_only or (args.client == "generic" and not args.config):
+        return {"ok": True, "configuration": config}
+    workspace = load_settings(resolved).workspace_root if resolved else None
+    path = args.config or default_config_path(args.client, workspace)
+    return register(config, path, replace=args.replace)
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    _print(_connect(args))
     return 0
 
 
@@ -64,13 +85,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     _print({"ok": healthy, "stores": checks, "status": status,
             "note": "Checks configured connections only; no deletion, corpus scan or model download."})
     return 0 if healthy else 2
-
-
-def cmd_seed(args: argparse.Namespace) -> int:
-    settings = _settings(args)
-    result = seed_workspace(settings, force=getattr(args, "force", False))
-    _print(result)
-    return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -224,36 +238,6 @@ def cmd_quarantine(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_evaluate(args: argparse.Namespace) -> int:
-    from redacto.evaluation import evaluate_fixture
-
-    _print(evaluate_fixture(_engine(args)))
-    return 0
-
-
-def cmd_benchmark(args: argparse.Namespace) -> int:
-    from redacto.benchmark import run_benchmark
-
-    result = run_benchmark(Path(args.corpus), split=args.split, embedding_provider=args.embedding_provider,
-                           embedding_model=args.embedding_model, embedding_revision=args.embedding_revision,
-                           candidate_threshold=args.candidate_threshold, quarantine_threshold=args.quarantine_threshold,
-                           local_files_only=args.local_files_only)
-    if args.out:
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(to_json(result), encoding="utf-8")
-    _print({key: value for key, value in result.items() if key != "results"})
-    return 0 if result["false_deletions"] == 0 and result["failed_actions"] == 0 else 1
-
-
-def cmd_reference(args: argparse.Namespace) -> int:
-    import uvicorn
-    from redacto.reference import create_app
-
-    uvicorn.run(create_app(Path(args.root)), host="127.0.0.1", port=args.port)
-    return 0
-
-
 def cmd_check_receipt(args: argparse.Namespace) -> int:
     from redacto.receipts import check_receipt
 
@@ -290,31 +274,6 @@ def cmd_check_embeddings(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_calibrate_embeddings(args: argparse.Namespace) -> int:
-    from redacto.discovery.embeddings import default_calibration
-
-    thresholds = (
-        [float(value) for value in args.thresholds.split(",")]
-        if args.thresholds
-        else [0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
-    )
-    reports = {
-        f"{threshold:.2f}": default_calibration(threshold).as_dict()
-        for threshold in thresholds
-    }
-    summary = {
-        threshold: {
-            "false_positives": report["false_positives"],
-            "false_negatives": report["false_negatives"],
-            "true_positives": report["true_positives"],
-            "true_negatives": report["true_negatives"],
-        }
-        for threshold, report in reports.items()
-    }
-    _print({"ok": True, "thresholds": summary, "detail": reports})
-    return 0
-
-
 def cmd_keyring(args: argparse.Namespace) -> int:
     engine = _engine(args)
     _print(engine.keyring_report(retire_version=args.retire))
@@ -330,7 +289,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         raise RedactoError(
             "no_requests",
             f"No revocation has been planned in {engine.settings.db_path} yet. "
-            "Run `redacto plan --target-id <id>` (or `redacto demo`) first.",
+            "Run `redacto plan --target-id <id>` first.",
         )
     html = build_report(engine, request_id=request_id)
     out = Path(args.out)
@@ -365,144 +324,6 @@ def cmd_resolve_quarantine(args: argparse.Namespace) -> int:
     return 0
 
 
-def _demo_settings(args: argparse.Namespace):
-    """Run the demo in an isolated workspace unless asked to use the configured one."""
-    settings = _settings(args)
-    if getattr(args, "use_configured", False):
-        return settings
-    import tempfile
-    from dataclasses import replace
-
-    root = Path(tempfile.mkdtemp(prefix="redacto-demo-"))
-    workspace = root / "workspace"
-    return replace(
-        settings,
-        workspace_root=workspace,
-        db_path=root / "redacto.sqlite3",
-        sqlite_store_path=workspace / "agent_memory.sqlite3",
-        jsonl_log_path=workspace / "agent_events.jsonl",
-        vector_fixture_path=workspace / "vector_chunks.json",
-        enabled_stores=None,
-        chroma_path=None,
-        chroma_collections=(),
-        redis_url=None,
-        redis_key_patterns=(),
-    )
-
-
-def cmd_demo(args: argparse.Namespace) -> int:
-    settings = _demo_settings(args)
-    var = settings.db_path.parent
-    print("== Redacto demo ==")
-    if not getattr(args, "use_configured", False):
-        print(f"    Isolated demo workspace: {settings.workspace_root}")
-    seed = seed_workspace(settings)
-    print(f"[1] Seeded synthetic workspace: {seed['records_seeded']} records in {seed['workspace_root']}")
-    print(f"    Target: {SOURCE_ID} (confidential acquisition plan)")
-
-    engine = Engine(settings)
-    trace = engine.trace(source_id=SOURCE_ID, depth=3)
-    print("\n[2] Provenance graph")
-    print(f"    confirmed descendants: {len(trace['confirmed_descendants'])}")
-    for node in trace["confirmed_descendants"]:
-        print(f"      - {node['record_id']} (depth {node['depth']}, {node['via'][-1]['relation']})")
-    for node in trace["weak_exposure"]:
-        print(f"      ~ weak exposure only: {node['record_id']} (READ_FROM, not destructive)")
-    print(f"    candidate relationships: {len(trace['candidate_relationships'])}")
-
-    plan = engine.plan(target_id=SOURCE_ID, mode="source_revocation", depth=3)
-    print(f"\n[3] Draft plan {plan['plan_id']} (v{plan['plan_version']}) state={plan['state']}")
-    for item in plan["items"]:
-        flag = "APPROVED-ITEM" if item["approved"] else "review/preserve"
-        print(
-            f"      {item['evidence_class']:<22} {item['proposed_action']:<18} "
-            f"{item['record_id']:<32} [{flag}] risk={item['risk']:<6} "
-            f"{item.get('size_bytes', 0)}B ~{item.get('match_ratio', 0):.0%} "
-            f"{item['reason_redacted']}"
-        )
-    print(f"    estimated impact: {plan['estimated_impact']}")
-    for warning in plan["warnings"]:
-        print(f"    ! {warning}")
-
-    approval_ref = "demo-operator-approval 2026-10-26"
-    approval = engine.approve_plan(plan_id=plan["plan_id"], approval_ref=approval_ref)
-    print(f"\n[4] Application issued approval {approval['approval_id']} "
-          f"(token valid until {approval['expires_at']}, single use)")
-
-    dry = engine.apply(
-        plan_id=plan["plan_id"],
-        plan_version=plan["plan_version"],
-        approval_ref=approval_ref,
-        confirmation_token=approval["confirmation_token"],
-        dry_run=True,
-    )
-    print(f"    dry run: {dry['counts']} (no destructive operation performed)")
-
-    applied = engine.apply(
-        plan_id=plan["plan_id"],
-        plan_version=plan["plan_version"],
-        approval_ref=approval_ref,
-        confirmation_token=approval["confirmation_token"],
-        dry_run=False,
-    )
-    print(f"\n[5] Apply results: {applied['counts']} state={applied['plan_state']}")
-    for result in applied["results"]:
-        print(
-            f"      - {result.get('adapter_id')}: {result.get('operation')} "
-            f"{result.get('record_id', '')} -> {result.get('result')}"
-        )
-    for blocked in applied["review_required"]:
-        print(f"      ! review required (not deleted): {blocked['record_id']} ({blocked['evidence_class']})")
-
-    verified = engine.verify(request_id=applied["request_id"])
-    summary = verified["receipt"]
-    print(f"\n[6] Verification: {verified['status']} (receipt {verified['receipt_id']})")
-    for key, value in summary["counts"].items():
-        print(f"      {key}: {value}")
-    for store in summary["stores"]:
-        print(f"      store {store['store_id']}: {store['outcome']} (residuals {store['residual_count']})")
-
-    var.mkdir(parents=True, exist_ok=True)
-    (var / "demo_receipt.json").write_text(to_json(summary), encoding="utf-8")
-    (var / "demo_receipt.md").write_text(to_markdown(summary), encoding="utf-8")
-    print(f"\n[7] Receipt written to {var / 'demo_receipt.json'} and {var / 'demo_receipt.md'}")
-    print(f"    {summary['statement']}")
-    from redacto.report import build_report
-
-    (var / "demo_report.html").write_text(
-        build_report(engine, request_id=applied["request_id"]), encoding="utf-8"
-    )
-    print(f"    HTML report (stores, lineage, plan, timeline, receipt): {var / 'demo_report.html'}")
-
-    print("\n[8] Re-ingestion attack")
-    restored = settings.workspace_root / "acquisition-plan.md"
-    restored.write_text(ACQUISITION_PLAN, encoding="utf-8")
-    with sqlite3.connect(settings.sqlite_store_path) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO memories (id, content, created_at, sensitivity) VALUES (?, ?, ?, ?)",
-            (
-                "mem-reintroduced-paraphrase",
-                "A private firm is buying the sensor maker for about 42 million in cash.",
-                "2026-10-26T12:00:00+00:00",
-                "confidential",
-            ),
-        )
-        conn.commit()
-    reingest = engine.reingest_stores(stores=["filesystem", "sqlite_memory"])
-    print(f"    guard counts: {reingest['counts']} (active tombstones: {reingest['guard']['active_tombstones']})")
-    for finding in reingest["findings"]:
-        print(
-            f"      {finding['decision']:<12} {finding['record_id']:<34} "
-            f"{finding['reason_code']} (score {finding['match_score']})"
-        )
-    print("    Restored exact copies are blocked; paraphrases are quarantined for review, not deleted.")
-    print("    Demo subset: 2 scenarios (1 blocked, 1 quarantined).")
-    print("    Full test matrix: 9 scenarios - 6 blocked, 2 quarantined, 1 allowed")
-    print("    (tests/test_tombstones.py + tests/test_embeddings.py).")
-    print("    Learn more: README.md and docs/demo-script.md")
-    return 0
-
-
 def cmd_serve(args: argparse.Namespace) -> int:
     settings = _settings(args)
     if args.transport == "http":
@@ -529,6 +350,7 @@ def _add_target_text_args(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from redacto.connectivity import CLIENTS
     parser = argparse.ArgumentParser(prog="redacto", description="Provenance-aware revocation engine")
     parser.add_argument("--profile", type=Path, help="saved workspace profile (also REDACTO_PROFILE)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -536,22 +358,23 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup", help="connect an ordinary folder to Claude or another MCP client")
     setup.add_argument("--workspace", type=Path, required=True)
     setup.add_argument("--state-dir", type=Path, help="private state directory outside the scanned folder")
-    modes = setup.add_mutually_exclusive_group()
-    modes.add_argument("--managed-memory", action="store_true", help="create owned SQLite memory/cache and JSONL stores")
-    modes.add_argument("--demo", action="store_true", help="seed synthetic examples in a new or empty folder")
+    setup.add_argument("--managed-memory", action="store_true", help="create owned SQLite memory/cache and JSONL stores")
+    connect = sub.add_parser("connect", help="register or print a client-specific MCP connection")
+    connect.add_argument("--url", help="HTTPS MCP endpoint (HTTP permitted for loopback only)")
+    connect.add_argument("--token-env", default="REDACTO_HTTP_TOKEN")
+    connect.set_defaults(func=cmd_connect)
+    for command in (setup, connect):
+        command.add_argument("--client", choices=CLIENTS, default="generic")
+        command.add_argument("--config", type=Path, help="explicit client JSON path")
+        command.add_argument("--name", default="redacto", help="unique client server entry name")
+        command.add_argument("--replace", action="store_true", help="replace a conflicting server entry after backup")
+        command.add_argument("--print-only", action="store_true", help="print client settings without editing client files")
     setup.set_defaults(func=cmd_setup)
     sub.add_parser("doctor", help="check profile, keyring and enabled store connections").set_defaults(func=cmd_doctor)
 
-    seed = sub.add_parser("seed", help="create the synthetic fixture workspace and graph")
-    seed.add_argument(
-        "--force",
-        action="store_true",
-        help="overwrite a workspace that looks like real data (destructive)",
-    )
-    seed.set_defaults(func=cmd_seed)
     sub.add_parser("status", help="adapter health and configured scope").set_defaults(func=cmd_status)
 
-    scan = sub.add_parser("scan", help="discover candidates (read-only)")
+    scan = sub.add_parser("scan", help="discover candidates without editing source-store content")
     scan.add_argument("--target-id", required=True)
     scan.add_argument("--kind", default="source", choices=["source", "fact", "secret"])
     scan.add_argument("--stores")
@@ -560,7 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_target_text_args(scan)
     scan.set_defaults(func=cmd_scan)
 
-    trace = sub.add_parser("trace", help="explain lineage and candidates (read-only)")
+    trace = sub.add_parser("trace", help="explain lineage and candidates without editing source-store content")
     trace.add_argument("--source-id", required=True)
     trace.add_argument("--depth", type=int, default=3)
     trace.set_defaults(func=cmd_trace)
@@ -640,28 +463,6 @@ def build_parser() -> argparse.ArgumentParser:
     quarantine.add_argument("--statuses", default="pending_review")
     quarantine.set_defaults(func=cmd_quarantine)
 
-    evaluate = sub.add_parser(
-        "evaluate", help="report fixture-level precision, recall and policy counts"
-    )
-    evaluate.set_defaults(func=cmd_evaluate)
-
-    benchmark = sub.add_parser("benchmark", help="run labelled adversarial disclosure evaluation in temporary stores")
-    benchmark.add_argument("--corpus", default="benchmarks/adversarial-v1.json")
-    benchmark.add_argument("--split", choices=["all", "dev", "holdout"], default="all")
-    benchmark.add_argument("--out")
-    benchmark.add_argument("--embedding-provider", choices=["local_hashing", "sentence_transformers", "hybrid", "none"], default="local_hashing")
-    benchmark.add_argument("--embedding-model")
-    benchmark.add_argument("--embedding-revision", help="immutable model commit hash")
-    benchmark.add_argument("--candidate-threshold", type=float)
-    benchmark.add_argument("--quarantine-threshold", type=float)
-    benchmark.add_argument("--local-files-only", action="store_true", help="do not download model files")
-    benchmark.set_defaults(func=cmd_benchmark)
-
-    reference = sub.add_parser("reference-app", help="serve the local guarded memory/RAG example (requires chroma extra)")
-    reference.add_argument("--root", required=True)
-    reference.add_argument("--port", type=int, default=8766)
-    reference.set_defaults(func=cmd_reference)
-
     check = sub.add_parser("check-receipt", help="verify a JSON receipt's HMAC integrity against the configured keyring")
     check.add_argument("path")
     check.set_defaults(func=cmd_check_receipt)
@@ -669,12 +470,6 @@ def build_parser() -> argparse.ArgumentParser:
     embeddings = sub.add_parser("check-embeddings", help="check the configured embedder with public synthetic text; downloads weights only when explicitly enabled")
     embeddings.add_argument("--offline", action="store_true", help="load cached model files only")
     embeddings.set_defaults(func=cmd_check_embeddings)
-
-    calibrate = sub.add_parser(
-        "calibrate-embeddings", help="measure embedding false positives and missed paraphrases"
-    )
-    calibrate.add_argument("--thresholds", help="comma-separated cosine thresholds")
-    calibrate.set_defaults(func=cmd_calibrate_embeddings)
 
     report = sub.add_parser(
         "report", help="write a read-only HTML report: stores, lineage, plan, timeline, receipt"
@@ -704,17 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--note")
     resolve.set_defaults(func=cmd_resolve_quarantine)
 
-    demo = sub.add_parser("demo", help="run the 90-120 second end-to-end storyboard")
-    demo.add_argument(
-        "--use-configured",
-        action="store_true",
-        help="run against the REDACTO_* workspace instead of an isolated temp workspace",
-    )
-    demo.set_defaults(func=cmd_demo)
-
     serve = sub.add_parser("serve", help="run the MCP server")
     serve.add_argument("--transport", default="stdio", choices=["stdio", "http"])
     serve.set_defaults(func=cmd_serve)
+    # Accept the profile before or after a subcommand without erasing a global value.
+    for command in sub.choices.values():
+        command.add_argument("--profile", type=Path, default=argparse.SUPPRESS)
     return parser
 
 

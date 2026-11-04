@@ -10,7 +10,7 @@ from conftest import approve_and_apply
 from helpers import seeded_settings
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 TARGET_PHRASE = "all-cash transaction"
 

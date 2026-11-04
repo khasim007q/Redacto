@@ -16,7 +16,7 @@ from pathlib import Path
 
 from redacto.adapters.sqlite_store import SqliteMemoryAdapter
 from redacto.engine import Engine
-from redacto.local import local_settings
+from test_support.local import local_settings
 
 
 def run(records):

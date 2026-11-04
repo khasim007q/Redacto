@@ -13,8 +13,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from redacto.engine import Engine
-from redacto.evaluation import _prf
-from redacto.local import local_settings
+from test_support.evaluation import _prf
+from test_support.local import local_settings
 from redacto.discovery.normalization import normalize_loose
 
 

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import pytest
 
-from redacto.benchmark import run_benchmark
+from test_support.benchmark import run_benchmark
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -12,7 +12,7 @@ def test_corpus_is_reproducible_and_splits_do_not_share_facts():
     spec = importlib.util.spec_from_file_location("build_benchmark", ROOT / "scripts/build_benchmark.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    corpus = json.loads((ROOT / "benchmarks/adversarial-v1.json").read_text(encoding="utf-8"))
+    corpus = json.loads((ROOT / "tests/data/adversarial-v1.json").read_text(encoding="utf-8"))
     assert corpus == module.build_corpus()
     assert sum(len(s["records"]) for s in corpus["scenarios"]) == 400
     dev = {s["source"] for s in corpus["scenarios"] if s["split"] == "dev"}

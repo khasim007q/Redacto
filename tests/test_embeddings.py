@@ -17,7 +17,7 @@ from redacto.discovery.embeddings import (
     default_calibration,
 )
 from redacto.engine import Engine
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 from redacto.ingestion import TombstoneGuard
 
 NO_ANCHOR_PARAPHRASE = (

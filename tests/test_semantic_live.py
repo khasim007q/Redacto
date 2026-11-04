@@ -6,7 +6,7 @@ import pytest
 
 from conftest import approve_and_apply
 from redacto.discovery.embeddings import build_embedder, cosine
-from redacto.local import local_settings
+from test_support.local import local_settings
 from redacto.engine import Engine
 from dataclasses import replace
 

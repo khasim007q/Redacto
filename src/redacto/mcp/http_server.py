@@ -12,6 +12,8 @@ import uvicorn
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
+from mcp.server.transport_security import TransportSecuritySettings
 
 from redacto.config import load_settings
 from redacto.mcp.server import create_server
@@ -45,8 +47,17 @@ def build_app(settings=None):
             "REDACTO_HTTP_TOKEN must be set for HTTP transport; refusing to serve unauthenticated."
         )
     server = create_server(settings, transport="streamable-http")
-    app = server.streamable_http_app()
+    security = TransportSecuritySettings(
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *settings.http_allowed_hosts],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*", *settings.http_allowed_origins],
+    )
+    app = server.streamable_http_app(json_response=True, stateless_http=True, transport_security=security)
     app.add_middleware(BearerAuthMiddleware, token=settings.http_token)
+    if settings.http_allowed_origins:
+        app.add_middleware(CORSMiddleware, allow_origins=list(settings.http_allowed_origins),
+                           allow_methods=["GET", "POST", "DELETE"],
+                           allow_headers=["Authorization", "Content-Type", "MCP-Protocol-Version", "Mcp-Session-Id", "Last-Event-ID"],
+                           expose_headers=["Mcp-Session-Id", "MCP-Protocol-Version"], max_age=600)
     return app, settings
 
 

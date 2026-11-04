@@ -25,7 +25,7 @@ from redacto.adapters.vector_fixture import VectorFixtureAdapter
 from redacto.discovery.normalization import fingerprint
 from redacto.discovery.relationship_assessor import minimize_snippet
 from redacto.engine import Engine
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 SECRET = "sk-synthetic-LEAK-9f3a7c1e-NEVER-STORE"
 

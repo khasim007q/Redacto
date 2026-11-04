@@ -15,7 +15,7 @@ from redacto.adapters.filesystem import FilesystemAdapter
 from redacto.adapters.sqlite_store import SqliteMemoryAdapter
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 
 def test_path_traversal_is_rejected(engine):
@@ -45,10 +45,10 @@ def test_embedded_instruction_cannot_escalate_scope(engine):
     assert (engine.settings.workspace_root / "eng-notes.md").exists()
 
 
-def test_agent_role_has_no_approval_tool():
+def test_agent_role_has_no_approval_tool(tmp_path):
     from redacto.mcp.server import create_server
 
-    server = create_server()
+    server = create_server(seeded_settings(tmp_path))
     names = {tool.name for tool in asyncio.run(server.list_tools())}
     assert "redacto_apply" in names
     assert not any("approve" in name for name in names)
@@ -83,6 +83,7 @@ def test_scope_cannot_be_broadened_by_request(engine):
 
 
 def test_http_server_refuses_to_start_without_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("REDACTO_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("REDACTO_HTTP_TOKEN", "")
     monkeypatch.setenv("REDACTO_HTTP_HOST", "127.0.0.1")
     from redacto.mcp import http_server

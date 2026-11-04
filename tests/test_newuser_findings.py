@@ -16,7 +16,7 @@ from conftest import approve_and_apply
 from helpers import make_settings, seeded_settings
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID
+from test_support.fixtures import ACQUISITION_PLAN, SOURCE_ID
 
 SECRET = "sk-live-NEWUSER-0123456789abcdef"
 

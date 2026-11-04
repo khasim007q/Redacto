@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 CONFIRMED = {
     "fs:generated-summary.md",

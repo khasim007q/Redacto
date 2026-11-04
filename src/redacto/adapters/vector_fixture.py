@@ -1,7 +1,7 @@
-"""Vector-index fixture adapter.
+"""Local JSON chunk-index adapter (legacy vector_fixture store identifier).
 
-The fixture is a local JSON file of chunks with metadata. It models an index
-entry without pretending to integrate a real vector database.
+An explicitly configured JSON file contains chunks and metadata. This adapter
+does not claim to implement a hosted vector database.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from redacto.adapters.base import (
     leftover_rewrite_temps,
     rewrite_temp_prefix,
     checked_replace,
+    reject_duplicate_json_fields,
 )
 from redacto.discovery.normalization import fingerprint
 from redacto.locking import locked_store
@@ -48,15 +49,15 @@ class VectorFixtureAdapter(StoreAdapter):
             can_redact=False,
             can_invalidate=True,
             can_verify=True,
-            notes=["Local fixture only; invalidate removes the chunk entry (no real vector DB)."],
+            notes=["Local JSON chunk index only; invalidate removes the chunk entry."],
         )
 
     @locked_store
     def _load(self) -> list[dict]:
         try:
             snapshot = self._path.read_bytes()
-            payload = json.loads(snapshot.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            payload = json.loads(snapshot.decode("utf-8"), object_pairs_hook=reject_duplicate_json_fields)
+        except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
             raise AdapterError(f"vector fixture unreadable: {exc}", code="store_unreadable") from exc
         chunks = payload.get("chunks") if isinstance(payload, dict) else None
         if not isinstance(chunks, list):
@@ -114,7 +115,7 @@ class VectorFixtureAdapter(StoreAdapter):
 
         def walk(value, depth: int = 0) -> None:
             if depth > cls.MAX_WALK_DEPTH:
-                return
+                raise AdapterError("Structured record exceeds the scan depth budget.", code="record_unverifiable")
             if isinstance(value, str):
                 if value:
                     parts.append(value)

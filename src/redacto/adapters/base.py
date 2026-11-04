@@ -26,6 +26,16 @@ class AdapterError(RuntimeError):
         self.retryable = retryable
 
 
+def reject_duplicate_json_fields(pairs):
+    """Structured stores must not silently drop earlier duplicate-key values."""
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise AdapterError("Duplicate JSON keys make this record unverifiable.", code="record_unverifiable")
+        result[name] = value
+    return result
+
+
 def checked_replace(temp: str, path: Path, unchanged, *, conflict_code: str = "content_changed") -> None:
     """Retry transient Windows sharing failures, rechecking before EVERY attempt.
 

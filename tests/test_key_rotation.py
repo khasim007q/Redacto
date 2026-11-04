@@ -11,7 +11,7 @@ from conftest import approve_and_apply
 from helpers import seeded_settings
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID
+from test_support.fixtures import ACQUISITION_PLAN, SOURCE_ID
 
 OLD_KEY = "unit-test-fixture-key"
 NEW_KEY = "rotated-key-v2-not-a-secret"
@@ -172,7 +172,7 @@ def test_verification_degrades_honestly_when_target_key_is_missing(tmp_path):
 
 def test_related_fingerprints_are_versioned_across_rotation(tmp_path):
     from redacto.discovery.normalization import fingerprint
-    from redacto.fixtures import GENERATED_SUMMARY
+    from test_support.fixtures import GENERATED_SUMMARY
 
     settings = seeded_settings(tmp_path)
     engine = Engine(settings)
@@ -204,7 +204,7 @@ def test_related_fingerprints_are_versioned_across_rotation(tmp_path):
 
 def test_missing_related_key_version_fails_closed(tmp_path):
     from redacto.discovery.normalization import fingerprint
-    from redacto.fixtures import GENERATED_SUMMARY
+    from test_support.fixtures import GENERATED_SUMMARY
 
     settings = seeded_settings(tmp_path)
     engine = Engine(settings)
@@ -246,6 +246,7 @@ def test_invalid_key_versions_are_rejected(tmp_path, monkeypatch):
 
     monkeypatch.setenv("REDACTO_HMAC_KEYS", '{"-1": "bad", "1": "ok"}')
     monkeypatch.setenv("REDACTO_HMAC_KEY_VERSION", "1")
+    monkeypatch.setenv("REDACTO_WORKSPACE_ROOT", str(tmp_path))
     settings = load_settings()
     assert settings.keyring_error is not None
     assert ">= 1" in settings.keyring_error
@@ -296,11 +297,12 @@ def test_broken_keyring_status_does_not_crash(tmp_path):
     )
 
 
-def test_non_canonical_key_versions_are_rejected(monkeypatch):
+def test_non_canonical_key_versions_are_rejected(monkeypatch, tmp_path):
     from redacto.config import load_settings
 
     monkeypatch.setenv("REDACTO_HMAC_KEYS", '{"01": "a", "1": "b"}')
     monkeypatch.setenv("REDACTO_HMAC_KEY_VERSION", "1")
+    monkeypatch.setenv("REDACTO_WORKSPACE_ROOT", str(tmp_path))
     settings = load_settings()
     assert settings.keyring_error is not None
     assert "canonical" in settings.keyring_error

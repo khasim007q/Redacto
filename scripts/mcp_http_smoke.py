@@ -1,18 +1,12 @@
-"""Streamable HTTP smoke test with bearer auth using a real MCP client.
-
-Run: .venv\\Scripts\\python.exe scripts\\mcp_http_smoke.py
-Starts the server on localhost, proves 401 without a token, then discovers and
-calls redacto_status with a bearer token over MCP's Streamable HTTP transport.
-"""
-
-from __future__ import annotations
-
+"""Runtime-only HTTP MCP interoperability check in an isolated ordinary folder."""
 import asyncio
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -20,82 +14,63 @@ import httpx
 import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-
-ROOT = Path(__file__).resolve().parents[1]
-HOST, PORT = "127.0.0.1", 8791
-TOKEN = "smoke-test-token-not-a-secret"
-URL = f"http://{HOST}:{PORT}/mcp"
+from redacto.profiles import setup_workspace
 
 
-def _port_ready() -> bool:
-    with socket.socket() as sock:
-        sock.settimeout(0.4)
-        return sock.connect_ex((HOST, PORT)) == 0
-
-
-def _start_server() -> subprocess.Popen:
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(ROOT / "src"),
-        "REDACTO_HTTP_HOST": HOST,
-        "REDACTO_HTTP_PORT": str(PORT),
-        "REDACTO_HTTP_TOKEN": TOKEN,
-        "REDACTO_DB_PATH": str(ROOT / "var" / "http-smoke.sqlite3"),
-        "REDACTO_WORKSPACE_ROOT": str(ROOT / "fixtures" / "workspace"),
-    }
-    return subprocess.Popen(
-        [sys.executable, "-m", "redacto.cli", "serve", "--transport", "http"],
-        env=env,
-        cwd=str(ROOT),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
-    )
-
-
-async def _mcp_call() -> dict:
-    client = httpx2.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"})
-    async with client:
-        async with streamable_http_client(URL, http_client=client) as streams:
-            read_stream, write_stream = streams
-            async with ClientSession(read_stream, write_stream) as session:
+async def inspect(url, token):
+    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}) as http:
+        async with streamable_http_client(url, http_client=http) as (read, write):
+            async with ClientSession(read, write) as session:
                 await session.initialize()
-                tools = await session.list_tools()
-                names = [tool.name for tool in tools.tools]
-                print("tools:", names)
+                tools = {tool.name for tool in (await session.list_tools()).tools}
                 result = await session.call_tool("redacto_status", {})
-                structured = getattr(result, "structuredContent", None)
-                payload = structured or json.loads(result.content[0].text)
-                return {"tool_names": names, "status": payload}
+                data = getattr(result, "structured_content", None) or json.loads(result.content[0].text)
+                assert len(tools) == 8 and "redacto_approve" not in tools
+                assert data["reachable_adapter_count"] == 1
 
 
-def main() -> int:
-    process = _start_server()
-    try:
-        for _ in range(60):
-            if _port_ready():
-                break
-            time.sleep(0.25)
-        else:
-            print("FAIL: server did not start")
-            return 1
-
-        unauthenticated = httpx.post(URL, json={}, timeout=5)
-        print("unauthenticated status code:", unauthenticated.status_code)
-        if unauthenticated.status_code != 401:
-            print("FAIL: unauthenticated request was not rejected")
-            return 1
-
-        result = asyncio.run(_mcp_call())
-        ok = "redacto_status" in result["tool_names"] and result["status"]["service"] == "redacto"
-        print(json.dumps(result["status"], indent=2)[:1200])
-        print("RESULT:", "PASS" if ok else "FAIL")
-        return 0 if ok else 1
-    finally:
-        process.terminate()
+def main():
+    with tempfile.TemporaryDirectory(prefix="redacto HTTP compatibility ") as directory:
+        root = Path(directory)
+        workspace = root / "notes"
+        workspace.mkdir()
+        profile = setup_workspace(workspace, state_dir=root / "private state")["profile"]
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        token = secrets.token_urlsafe(32)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("REDACTO_") and k not in {"PYTHONPATH", "PYTHONHOME"}}
+        env.update(REDACTO_PROFILE=profile, REDACTO_HTTP_TOKEN=token, REDACTO_HTTP_PORT=str(port))
+        process = subprocess.Popen([sys.executable, "-m", "redacto", "serve", "--transport", "http"],
+                                   cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        url = f"http://127.0.0.1:{port}/mcp"
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:  # pragma: no cover
-            process.kill()
+            for _ in range(100):
+                if process.poll() is not None:
+                    raise RuntimeError("HTTP server exited before readiness")
+                try:
+                    response = httpx.post(url, json={}, timeout=0.5)
+                    if response.status_code == 401:
+                        break
+                except httpx.TransportError:
+                    pass
+                time.sleep(0.1)
+            else:
+                raise RuntimeError("HTTP server did not become ready")
+            async def multiple_clients():
+                await asyncio.gather(inspect(url, token), inspect(url, token))
+            asyncio.run(multiple_clients())
+            print(json.dumps({"result": "PASS", "independent_clients": 2,
+                              "anonymous_status": response.status_code,
+                              "cwd_has_pyproject": (root / "pyproject.toml").exists(), "profile_http": True}))
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+    return 0
 
 
 if __name__ == "__main__":

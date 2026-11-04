@@ -1,6 +1,6 @@
 """Transport-independent Redacto engine.
 
-All MCP tools, the CLI and the demo call this class, so scope checks, policy and
+All MCP tools and the operator CLI call this class, so scope checks, policy and
 authorization cannot be bypassed by a different entry point.
 """
 
@@ -188,7 +188,7 @@ class Engine:
             "unknown_record",
             "The target record is not in the configured provenance graph and was not "
             "found in any configured store. Check the store paths and the target id.",
-            {"record_id": record_id, "known_example": "fs:acquisition-plan.md"},
+            {"record_id": record_id},
         )
 
     def _discover_record(self, record_id: str) -> dict[str, Any] | None:
@@ -202,6 +202,12 @@ class Engine:
             capabilities = self._record_capabilities(slot.adapter_id, slot)
             for candidate in records:
                 if candidate.record_id == record_id:
+                    if self._record_is_oversized(candidate):
+                        raise RedactoError("record_restricted", "The requested record exceeds the guard size limit.")
+                    decision, _ = self._guard_record(self.guard(), candidate)
+                    if decision.decision != ALLOWED:
+                        raise RedactoError("record_restricted", "The requested record is revoked or requires review.",
+                                           {"decision": decision.decision, "reason_code": decision.reason_code})
                     self._upsert_scanned(candidate, capabilities)
                     return self.repo.get_record(record_id)
         return None

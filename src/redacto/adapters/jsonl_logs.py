@@ -32,6 +32,22 @@ from redacto.locking import locked_store
 class _LogChanged(Exception):
     """The log was rewritten (not just appended to) while an edit was prepared."""
 
+class _JsonObject(dict):
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.pairs = pairs
+
+
+def _decode_line(line: str) -> dict:
+    try:
+        value = json.loads(line, object_pairs_hook=_JsonObject)
+        return value if isinstance(value, dict) else {"content": line}
+    except json.JSONDecodeError:
+        return {"content": line}
+    except RecursionError as exc:
+        raise AdapterError("JSON nesting cannot be safely assessed.", code="record_unverifiable") from exc
+
+
 class JsonlLogAdapter(StoreAdapter):
     adapter_id = "jsonl_logs"
     store_id = "jsonl_logs"
@@ -62,20 +78,13 @@ class JsonlLogAdapter(StoreAdapter):
         except (OSError, UnicodeError) as exc:
             raise AdapterError(f"jsonl log unreadable: {exc}", code="store_unreadable") from exc
 
-    def _events(self) -> list[dict]:
-        events: list[dict] = []
+    def _events(self) -> list[tuple[dict, int, str]]:
+        events = []
         for index, line in enumerate(self._lines()):
             if not line.strip():
                 continue
-            try:
-                payload = json.loads(line)
-                if not isinstance(payload, dict):
-                    payload = {"_malformed": True, "content": line}
-            except json.JSONDecodeError:
-                payload = {"_malformed": True, "content": line}
-            payload["_line_index"] = index
-            payload["_event_id"] = self._event_id(payload, index, line)
-            events.append(payload)
+            payload = _decode_line(line)
+            events.append((payload, index, self._event_id(payload, index, line)))
         return events
 
     def _event_id(self, payload: dict, index: int, line: str) -> str:
@@ -85,8 +94,6 @@ class JsonlLogAdapter(StoreAdapter):
         # Stable across line shifts and independent of the line number.
         return "sha-" + fingerprint(line, self._key)[:24]
 
-    # Values that are Redacto's own bookkeeping, never user content.
-    _INTERNAL_KEYS = {"_line_index", "_event_id", "_malformed"}
     # Event metadata. Scanned for secrets in `_content`, but excluded from the
     # primary text used for match-ratio sizing.
     _METADATA_KEYS = {
@@ -107,14 +114,14 @@ class JsonlLogAdapter(StoreAdapter):
         Dict *keys* are included, so `args: {"id": "<secret>"}` is visible. Identity
         fields such as `event_id`, `kind`, `ts` and `sensitivity` are included too: a
         secret stored in one of them is still a secret on disk. Only Redacto's own
-        private markers are skipped.
+        bookkeeping is held outside the payload, so user keys cannot hide values.
         """
         parts: list[str] = []
         seen: set[int] = set()
 
         def walk(value, depth: int = 0) -> None:
             if depth > cls.MAX_WALK_DEPTH:
-                return
+                raise AdapterError("JSON nesting exceeds the scan depth budget.", code="record_unverifiable")
             if isinstance(value, str):
                 if value:
                     parts.append(value)
@@ -125,10 +132,8 @@ class JsonlLogAdapter(StoreAdapter):
                     return
                 seen.add(marker)
             if isinstance(value, dict):
-                for key, item in value.items():
+                for key, item in (value.pairs if isinstance(value, _JsonObject) else value.items()):
                     key_text = str(key)
-                    if key_text in cls._INTERNAL_KEYS:
-                        continue
                     if key_text:
                         parts.append(key_text)
                     walk(item, depth + 1)
@@ -161,7 +166,7 @@ class JsonlLogAdapter(StoreAdapter):
 
         def walk(value, depth: int = 0) -> None:
             if depth > cls.MAX_WALK_DEPTH:
-                return
+                raise AdapterError("JSON nesting exceeds the scan depth budget.", code="record_unverifiable")
             if isinstance(value, str):
                 if value:
                     parts.append(value)
@@ -172,9 +177,7 @@ class JsonlLogAdapter(StoreAdapter):
                     return
                 seen.add(marker)
             if isinstance(value, dict):
-                for key, item in value.items():
-                    if str(key) in cls._INTERNAL_KEYS:
-                        continue
+                for key, item in (value.pairs if isinstance(value, _JsonObject) else value.items()):
                     # Event metadata is only metadata at the top level; a nested
                     # `args.id` is a tool-call argument, i.e. payload.
                     if depth == 0 and str(key) in cls._METADATA_KEYS:
@@ -189,13 +192,13 @@ class JsonlLogAdapter(StoreAdapter):
         walk(payload)
         return "\n".join(parts)
 
-    def _to_record(self, payload: dict) -> Record:
-        event_id = str(payload["_event_id"])
+    def _to_record(self, event: tuple[dict, int, str]) -> Record:
+        payload, line_index, event_id = event
         return Record(
             record_id=f"log:{event_id}",
             record_type="log",
             store_id=self.store_id,
-            locator={"event_id": event_id, "line": str(payload["_line_index"])},
+            locator={"event_id": event_id, "line": str(line_index)},
             content=self._content(payload),
             core_content=self._primary_text(payload),
             sensitivity=[str(payload.get("sensitivity"))] if payload.get("sensitivity") else ["unknown"],
@@ -236,12 +239,7 @@ class JsonlLogAdapter(StoreAdapter):
         for index, line in enumerate(raw_lines):
             if not line.strip():
                 continue
-            try:
-                payload = json.loads(line)
-                if not isinstance(payload, dict):
-                    payload = {"_malformed": True, "content": line}
-            except json.JSONDecodeError:
-                payload = {"_malformed": True, "content": line}
+            payload = _decode_line(line)
             if self._event_id(payload, index, line) == event_id:
                 matches.append(index)
         if not matches:
@@ -259,12 +257,7 @@ class JsonlLogAdapter(StoreAdapter):
         target = preferred_line if preferred_line in matches else matches[0]
         if expected_fingerprint:
             line = raw_lines[target]
-            try:
-                payload = json.loads(line)
-                if not isinstance(payload, dict):
-                    payload = {"_malformed": True, "content": line}
-            except json.JSONDecodeError:
-                payload = {"_malformed": True, "content": line}
+            payload = _decode_line(line)
             if fingerprint(self._content(payload), key or self._key) != expected_fingerprint:
                 raise AdapterError(
                     "record content changed since planning", code="content_changed"
@@ -272,12 +265,7 @@ class JsonlLogAdapter(StoreAdapter):
         def remove(line: str) -> None:
             # Recheck on EVERY retry, including after a concurrent edit that
             # retained event_id. The earlier check alone can delete new content.
-            try:
-                payload = json.loads(line)
-                if not isinstance(payload, dict):
-                    payload = {"content": line}
-            except json.JSONDecodeError:
-                payload = {"content": line}
+            payload = _decode_line(line)
             if expected_fingerprint and fingerprint(self._content(payload), key or self._key) != expected_fingerprint:
                 raise AdapterError("record content changed since planning", code="content_changed")
             return None
@@ -316,10 +304,10 @@ class JsonlLogAdapter(StoreAdapter):
                 payload = json.loads(line, object_pairs_hook=unique_object)
                 parsed_object = isinstance(payload, dict)
             except json.JSONDecodeError:
-                payload = {"_malformed": True, "content": line}
+                payload = {"content": line}
                 parsed_object = False
             if not parsed_object:
-                payload = {"_malformed": True, "content": line}
+                payload = {"content": line}
             if expected_fingerprint and (
                 fingerprint(self._content(payload), signing_key) != expected_fingerprint
             ):
@@ -380,12 +368,7 @@ class JsonlLogAdapter(StoreAdapter):
             for index, line in enumerate(raw_lines):
                 if not line.strip():
                     continue
-                try:
-                    payload = json.loads(line)
-                    if not isinstance(payload, dict):
-                        payload = {"_malformed": True, "content": line}
-                except json.JSONDecodeError:
-                    payload = {"_malformed": True, "content": line}
+                payload = _decode_line(line)
                 if self._event_id(payload, index, line) == event_id:
                     matches.append(index)
             if not matches:

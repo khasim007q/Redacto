@@ -10,8 +10,8 @@ from conftest import approve_and_apply
 from helpers import seeded_settings
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.evaluation import evaluate_fixture
-from redacto.fixtures import SOURCE_ID
+from test_support.evaluation import evaluate_fixture
+from test_support.fixtures import SOURCE_ID
 
 
 def test_evaluation_reports_full_fixture_coverage(tmp_path: Path):

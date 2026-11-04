@@ -14,7 +14,7 @@ from redacto.discovery.exact import ExactMatcher, extract_entities, shares_entit
 from redacto.discovery.normalization import fingerprint, normalize_loose
 from redacto.discovery.relationship_assessor import CandidateContext, NullAssessor, minimize_snippet
 from redacto.engine import Engine
-from redacto.fixtures import ACQUISITION_PLAN, SOURCE_ID
+from test_support.fixtures import ACQUISITION_PLAN, SOURCE_ID
 
 
 def _record(content: str, record_id: str = "x:1") -> Record:
@@ -196,7 +196,7 @@ def test_spaced_secret_is_detected_by_compact_variant():
 def test_spaced_secret_file_is_a_direct_match(tmp_path):
     from helpers import seeded_settings
     from redacto.engine import Engine
-    from redacto.fixtures import SOURCE_ID
+    from test_support.fixtures import SOURCE_ID
 
     settings = seeded_settings(tmp_path)
     secret = "sk-test-ABCDEF123456"
@@ -256,7 +256,7 @@ def test_non_http_assessor_url_is_disabled():
 def test_engine_guards_a_raising_custom_assessor(tmp_path, monkeypatch):
     from helpers import seeded_settings
     from redacto.engine import Engine
-    from redacto.fixtures import SOURCE_ID
+    from test_support.fixtures import SOURCE_ID
 
     class RaisingAssessor:
         model_id = "raising-model"

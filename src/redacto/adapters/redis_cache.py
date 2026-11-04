@@ -19,6 +19,7 @@ from typing import Any, Iterable, Sequence
 
 from redacto.adapters.base import AdapterError, Capabilities, Record, StoreAdapter
 from redacto.adapters.vector_fixture import VectorFixtureAdapter
+from redacto.adapters.base import reject_duplicate_json_fields
 from redacto.discovery.normalization import fingerprint
 
 READABLE_TYPES = {"string", "hash", "list", "set", "zset", "stream"}
@@ -106,7 +107,9 @@ class RedisCacheAdapter(StoreAdapter):
         if kind == "string":
             raw = self._text(client.get(key))
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(raw, object_pairs_hook=reject_duplicate_json_fields)
+            except RecursionError as exc:
+                raise AdapterError("JSON cache nesting cannot be safely assessed.", code="record_unverifiable") from exc
             except (json.JSONDecodeError, ValueError):
                 parsed = None
             value = parsed if isinstance(parsed, (dict, list)) else raw

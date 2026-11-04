@@ -14,7 +14,7 @@ from conftest import approve_and_apply
 from redacto.adapters.base import Record
 from redacto.adapters.jsonl_logs import JsonlLogAdapter
 from redacto.adapters.vector_fixture import VectorFixtureAdapter
-from redacto.fixtures import SOURCE_ID, ACQUISITION_PLAN
+from test_support.fixtures import SOURCE_ID, ACQUISITION_PLAN
 from redacto.locking import resource_lock
 
 

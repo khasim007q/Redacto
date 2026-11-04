@@ -4,7 +4,15 @@ Tombstones are derived from a keyed hash. Rotating that key naively would silent
 disable protection for every existing tombstone. Redacto therefore uses a
 **versioned key ring**, and it fails closed when a required version is missing.
 
-## Configuration
+## Saved profiles
+
+For a generated profile, edit its private `keys.json`: retain previous entries in
+`keys`, add a random new version, then raise `current_version`. Profile scope/key
+settings take precedence over ambient environment variables. Run `redacto keyring
+--profile PATH` before retiring a version; retain keys required by tombstones,
+receipts, requests and plan items. Protect and back up this file separately.
+
+## Environment-only configuration
 
 ```dotenv
 # Current version used for NEW material.

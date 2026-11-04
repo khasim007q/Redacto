@@ -9,7 +9,7 @@ import pytest
 from helpers import seeded_settings
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID, seed_workspace
+from test_support.fixtures import SOURCE_ID, seed_workspace
 
 
 def _all_bytes(settings) -> bytes:
@@ -54,20 +54,6 @@ def test_seed_does_not_write_outside_the_graph_dir(tmp_path):
         settings.workspace_root.parent == settings.db_path.parent
     )
     assert (settings.db_path.parent / "expected_results.json").is_file()
-
-
-def test_demo_uses_an_isolated_workspace_by_default(tmp_path, monkeypatch, capsys):
-    from redacto import cli
-
-    settings = seeded_settings(tmp_path)
-    (settings.workspace_root / "my-notes.md").write_text("mine", encoding="utf-8")
-    before = _all_bytes(settings)
-    monkeypatch.setattr(cli, "load_settings", lambda: settings)
-    args = cli.build_parser().parse_args(["demo"])
-    demo_settings = cli._demo_settings(args)
-    assert demo_settings.workspace_root != settings.workspace_root
-    assert demo_settings.db_path != settings.db_path
-    assert _all_bytes(settings) == before
 
 
 # ----------------------------------------------------------------- CLI + env
@@ -124,6 +110,7 @@ def test_dotenv_is_loaded_without_overriding_the_environment(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("REDACTO_SAFETY_MODE", raising=False)
     monkeypatch.setenv("REDACTO_HTTP_PORT", "8000")
+    monkeypatch.setenv("REDACTO_WORKSPACE_ROOT", str(tmp_path))
     settings = load_settings()
     assert settings.safety_mode == "dry_run_only"
     assert settings.http_port == 8000
@@ -201,12 +188,12 @@ def test_clean_temps_lists_then_deletes_only_old_copies(tmp_path):
     assert new.exists()
 
 
-def test_verify_tool_is_not_annotated_read_only():
+def test_verify_tool_is_not_annotated_read_only(tmp_path):
     import asyncio
 
     from redacto.mcp.server import create_server
 
-    server = create_server(transport="test")
+    server = create_server(seeded_settings(tmp_path), transport="test")
     tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
     assert tools["redacto_verify"].annotations.read_only_hint is False
     assert tools["redacto_verify"].annotations.destructive_hint is False

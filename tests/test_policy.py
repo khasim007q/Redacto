@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 from redacto.policy import classify
 from redacto.policy.plan import build_plan_items, compute_plan_hash, estimated_impact
 

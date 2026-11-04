@@ -13,7 +13,7 @@ from helpers import seeded_settings
 from redacto.adapters.base import AdapterError
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 
 def test_apply_rejects_missing_or_wrong_approval(engine):
@@ -188,7 +188,7 @@ def test_unknown_stores_are_rejected(engine):
 
 
 def test_seed_reseeds_cleanly(tmp_path):
-    from redacto.fixtures import seed_workspace
+    from test_support.fixtures import seed_workspace
 
     settings = seeded_settings(tmp_path)
     engine = Engine(settings)

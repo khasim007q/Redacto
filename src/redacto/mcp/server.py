@@ -17,6 +17,7 @@ DESTRUCTIVE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idemp
 # Verify never touches a store, but it writes a receipt and activates the tombstones
 # that block re-ingestion, so it is not read-only.
 RECORDS_RECEIPT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
+RECORDS_METADATA = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
 
 
 def _guard(callable_fn) -> dict[str, Any]:
@@ -51,7 +52,7 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
         "redacto",
         version="0.1.0",
         instructions=(
-            "Provenance-aware revocation. scan/trace/plan never modify a store; verify only "
+            "Provenance-aware revocation. scan/trace/plan never edit source-store content but may write graph metadata; verify only "
             "writes a receipt and activates tombstones. apply is "
             "destructive and requires an approved plan version plus an application-issued "
             "confirmation token; the agent cannot approve a plan. Never claim universal "
@@ -66,9 +67,9 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
 
         Read-only. Never returns secrets, tokens, record content or file contents.
         """
-        return engine.status(transport=transport)
+        return _guard(lambda: engine.status(transport=transport))
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(annotations=RECORDS_METADATA)
     def redacto_scan(
         target_id: str,
         target_kind: str = "source",
@@ -77,7 +78,7 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
         use_model: bool = True,
         target_text: str | None = None,
     ) -> dict[str, Any]:
-        """Find candidates for a revocation target. Read-only: no record is modified.
+        """Find candidates without editing source stores; persists discovery metadata.
 
         target_kind: source | fact | secret. target_text is used only for fact/secret
         targets, is never persisted, and is only ever matched transiently.
@@ -119,9 +120,9 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
             lambda: engine.quarantine(statuses=tuple(statuses) if statuses else ("pending_review",))
         )
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(annotations=RECORDS_METADATA)
     def redacto_trace(source_record_id: str, depth: int = 3) -> dict[str, Any]:
-        """Explain recorded lineage and candidates for a source record. Read-only.
+        """Explain lineage and candidates; may register a previously unknown source.
 
         Confirmed descendants (instrumented/human-verified edges) are returned separately
         from weak READ_FROM exposure links and advisory candidate relationships.
@@ -130,7 +131,7 @@ def create_server(settings: Settings | None = None, *, transport: str = "stdio")
             lambda: {"ok": True, **engine.trace(source_id=source_record_id, depth=depth)}
         )
 
-    @mcp.tool(annotations=READ_ONLY)
+    @mcp.tool(annotations=RECORDS_METADATA)
     def redacto_plan(
         target_id: str,
         mode: str = "source_revocation",

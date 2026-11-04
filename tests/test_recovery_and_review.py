@@ -11,7 +11,7 @@ from helpers import seeded_settings
 from redacto.adapters.base import AdapterError
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 
 RUNBOOK = "\n".join(
     f"- Runbook step {i}: rotate staging certs, restart worker pool {i}, check Grafana panel {i}."

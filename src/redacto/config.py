@@ -75,8 +75,12 @@ class Settings:
     embedding_lexical_candidate_threshold: float = 0.25
     embedding_lexical_quarantine_threshold: float = 0.30
     enabled_stores: tuple[str, ...] | None = None
+    http_allowed_hosts: tuple[str, ...] = ()
+    http_allowed_origins: tuple[str, ...] = ()
 
     def __post_init__(self):
+        if not 1 <= self.http_port <= 65535:
+            raise RedactoError("invalid_configuration", "HTTP port must be between 1 and 65535.")
         known = {"filesystem", "sqlite_memory", "jsonl_logs", "vector_fixture", "chroma", "redis_cache"}
         if self.enabled_stores is not None and (
             not self.enabled_stores or set(self.enabled_stores) - known
@@ -218,7 +222,7 @@ def _load_keyring(default_key: str, env: Mapping[str, str] = os.environ) -> tupl
     return keys, current_version, None
 
 
-def _load_dotenv(path: Path) -> None:
+def _load_dotenv(path: Path, env: dict[str, str]) -> None:
     """Load a simple KEY=VALUE .env without overriding real environment values."""
     if not path.is_file():
         return
@@ -235,8 +239,8 @@ def _load_dotenv(path: Path) -> None:
         value = value.strip()
         if value and value[0] in {"'", '"'} and value[-1] == value[0]:
             value = value[1:-1]
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key and key not in env:
+            env[key] = value
 
 
 def load_settings(profile: str | Path | None = None) -> Settings:
@@ -248,31 +252,35 @@ def load_settings(profile: str | Path | None = None) -> Settings:
 
 def _load_settings(profile: str | Path | None = None) -> Settings:
     base = Path.cwd()
-    profile = profile or os.environ.get("REDACTO_PROFILE")
+    env = dict(os.environ)
+    profile = profile or env.get("REDACTO_PROFILE")
+    if not profile:
+        _load_dotenv(base / ".env", env)
+        profile = env.get("REDACTO_PROFILE")
     if profile:
         from redacto.profiles import profile_environment
 
-        env = profile_environment(Path(profile))
+        env = profile_environment(Path(profile), transport_env=env)
     else:
-        _load_dotenv(base / ".env")
-        env = os.environ
+        if not env.get("REDACTO_WORKSPACE_ROOT"):
+            raise RedactoError("configuration_required", "Run redacto setup --workspace <folder>, then pass --profile or REDACTO_PROFILE.")
     model_provider = env.get("REDACTO_MODEL_PROVIDER", "none").strip().lower()
     embedding_provider = env.get("REDACTO_EMBEDDING_PROVIDER", "local_hashing").strip().lower()
     neural = embedding_provider in {"sentence_transformers", "sentence-transformers", "hybrid"}
     hmac_keys, hmac_key_version, keyring_error = _load_keyring(
-        env.get("REDACTO_HMAC_KEY", "dev-only-synthetic-fixture-key"), env
+        env.get("REDACTO_HMAC_KEY", ""), env
     )
     return Settings(
         db_path=_env_path("REDACTO_DB_PATH", str(base / "var" / "redacto.sqlite3"), env),
-        workspace_root=_env_path("REDACTO_WORKSPACE_ROOT", str(base / "fixtures" / "workspace"), env),
+        workspace_root=_env_path("REDACTO_WORKSPACE_ROOT", str(base), env),
         sqlite_store_path=_env_path(
-            "REDACTO_SQLITE_PATH", str(base / "fixtures" / "workspace" / "agent_memory.sqlite3"), env
+            "REDACTO_SQLITE_PATH", str(base / "var" / "memory.sqlite3"), env
         ),
         jsonl_log_path=_env_path(
-            "REDACTO_JSONL_PATH", str(base / "fixtures" / "workspace" / "agent_events.jsonl"), env
+            "REDACTO_JSONL_PATH", str(base / "var" / "events.jsonl"), env
         ),
         vector_fixture_path=_env_path(
-            "REDACTO_VECTOR_PATH", str(base / "fixtures" / "workspace" / "vector_chunks.json"), env
+            "REDACTO_VECTOR_PATH", str(base / "var" / "chunks.json"), env
         ),
         hmac_keys=hmac_keys,
         hmac_key_version=hmac_key_version,
@@ -308,6 +316,12 @@ def _load_settings(profile: str | Path | None = None) -> Settings:
         chroma_collections=_env_list("REDACTO_CHROMA_COLLECTIONS", env),
         redis_url=env.get("REDACTO_REDIS_URL") or None,
         redis_key_patterns=_env_list("REDACTO_REDIS_KEY_PATTERNS", env),
-        enabled_stores=_env_list("REDACTO_STORES", env) if "REDACTO_STORES" in env else None,
+        enabled_stores=(_env_list("REDACTO_STORES", env) if "REDACTO_STORES" in env else tuple(
+            ["filesystem"] + [store for setting, store in (
+                ("REDACTO_SQLITE_PATH", "sqlite_memory"), ("REDACTO_JSONL_PATH", "jsonl_logs"),
+                ("REDACTO_VECTOR_PATH", "vector_fixture"), ("REDACTO_CHROMA_PATH", "chroma"),
+                ("REDACTO_REDIS_URL", "redis_cache")) if env.get(setting)])),
+        http_allowed_hosts=_env_list("REDACTO_HTTP_ALLOWED_HOSTS", env),
+        http_allowed_origins=_env_list("REDACTO_HTTP_ALLOWED_ORIGINS", env),
         regenerate_derivatives=_env_bool("REDACTO_REGENERATE", False, env),
     )

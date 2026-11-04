@@ -98,7 +98,6 @@ def test_setup_refuses_conflicting_scope_and_state_inside_workspace(tmp_path):
 
 
 def test_setup_does_not_adopt_unowned_state_and_profile_launch_never_autoseeds(tmp_path, monkeypatch):
-    from redacto.mcp.stdio_server import _seed_demo_if_missing
 
     user = tmp_path / "user"
     user.mkdir()
@@ -112,22 +111,7 @@ def test_setup_does_not_adopt_unowned_state_and_profile_launch_never_autoseeds(t
     Path(result["workspace_root"]).rmdir()
     monkeypatch.setenv("REDACTO_PROFILE", result["profile"])
     monkeypatch.setenv("REDACTO_DEMO_SEED_IF_MISSING", "true")
-    _seed_demo_if_missing()
     assert not Path(result["workspace_root"]).exists()
-
-
-def test_demo_is_explicit_and_refuses_nonempty_user_folders(tmp_path):
-    root = tmp_path / "demo"
-    result = setup_workspace(root, state_dir=tmp_path / "demo-state", demo=True)
-    assert (root / "acquisition-plan.md").is_file()
-    assert len(build_adapters(load_settings(result["profile"]))) == 4
-    user = tmp_path / "user"
-    user.mkdir()
-    (user / "mine.txt").write_text("my file", encoding="utf-8")
-    with pytest.raises(RedactoError) as error:
-        setup_workspace(user, state_dir=tmp_path / "other-state", demo=True)
-    assert error.value.code == "workspace_not_empty"
-    assert (user / "mine.txt").read_text(encoding="utf-8") == "my file"
 
 
 def test_doctor_and_enabled_store_loss_are_honest(tmp_path, capsys):
@@ -210,6 +194,7 @@ def test_sdk_checks_dependencies_before_writing_and_filters_direct_bypass(tmp_pa
     with pytest.raises(RedactoError) as error:
         client.read("fs:bypass.md")
     assert error.value.code == "record_restricted"
+    assert client.engine.repo.get_record("fs:bypass.md") is None
     assert client.engine.reingest_stores()["counts"]["blocked"] >= 1
 
 

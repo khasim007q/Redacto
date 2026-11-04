@@ -6,7 +6,7 @@ from dataclasses import replace
 from conftest import approve_and_apply
 from redacto.discovery.normalization import fingerprint
 from redacto.engine import Engine
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 from redacto.ingestion import TombstoneGuard
 
 PAYLOAD = "A private firm is buying the sensor maker for about 42 million in cash."

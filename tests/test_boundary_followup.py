@@ -9,7 +9,7 @@ from conftest import approve_and_apply
 from redacto.adapters.base import AdapterError, Record
 from redacto.engine import Engine
 from redacto.errors import RedactoError
-from redacto.fixtures import SOURCE_ID
+from test_support.fixtures import SOURCE_ID
 from redacto.receipts import check_receipt, sign_receipt
 
 
@@ -149,29 +149,6 @@ def test_chroma_refuses_unlabelled_or_different_model_even_with_same_dimension(t
         assert list(adapter.list_records())[0].core_content == "keep"
     finally:
         client.close()
-
-
-def test_reference_retrieval_filters_metadata_and_identifier_bypasses(tmp_path):
-    pytest.importorskip("chromadb")
-    from redacto.reference import MemoryApplication
-    from redacto.discovery.embeddings import HashingEmbeddingProvider
-
-    app = MemoryApplication(tmp_path)
-    try:
-        app.document("public", "The public SDK supports Linux.")
-        secret = "credential9fA81bd19"
-        plan = app.engine.plan(target_id="fs:public.md", target_kind="secret", target_text=secret, mode="fact_revocation")
-        approve_and_apply(app.engine, plan)
-        text = "This public document has harmless contents."
-        vector = HashingEmbeddingProvider().embed(text)
-        app._index.upsert(ids=["metadata-bypass", secret], documents=[text, text], embeddings=[vector, vector],
-                          metadatas=[{"token": secret}, {"note": "public"}])
-        result = app.query("public SDK", limit=10)
-        assert result["record_ids"] == ["chroma:context/public"]
-        assert result["answer"] == "The public SDK supports Linux."
-        assert app.reconcile()["counts"]["blocked"] >= 2
-    finally:
-        app.close()
 
 
 def test_advisory_model_cannot_remove_a_deterministic_review_candidate(engine, monkeypatch):
